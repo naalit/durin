@@ -7,7 +7,7 @@ impl<'a> Display for PrettyVal<'a> {
         let PrettyVal(m, v) = *self;
         match m.get(v).as_ref().unwrap() {
             Node::Const(c) => write!(f, "{}", c),
-            Node::Param(a, b) => write!(f, "{}.{}", a.pretty(m), b),
+            // Node::Param(a, b) => write!(f, "{}.{}", a.pretty(m), b),
             _ => match &m.names[v.num()] {
                 Some(x) => write!(f, "{}", x),
                 None => write!(f, "%{}", v.num()),
@@ -38,12 +38,28 @@ impl Module {
                 }) => {
                     write!(buf, "\nfun {} (", self.name_or(num)).unwrap();
                     for (pnum, pty) in params.iter().enumerate() {
+                        let name = {
+                            let name: Vec<_> = self.uses[num]
+                                .iter()
+                                .filter(|&&x| {
+                                    if let Some(Node::Param(_, i)) = self.get(x) {
+                                        *i as usize == pnum
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .collect();
+                            if name.len() == 1 {
+                                self.name_or(name[0].num())
+                            } else {
+                                format!("{}.{}", self.name_or(num), pnum)
+                            }
+                        };
                         write!(
                             buf,
-                            "{}{}.{} : {}",
+                            "{}{} : {}",
                             if pnum == 0 { "" } else { ", " },
-                            self.name_or(num),
-                            pnum,
+                            name,
                             pty.pretty(self)
                         )
                         .unwrap();
