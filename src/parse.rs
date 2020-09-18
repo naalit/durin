@@ -85,7 +85,7 @@ impl<'a> Parser<'a> {
         match self.names.get(name) {
             Some(&(x, _)) => x,
             None => {
-                let v = self.module.reserve();
+                let v = self.module.reserve(Some(name.to_owned()));
                 self.names.insert(name, (v, self.pos));
                 v
             } // panic!("Name '{}' not found at position {}", name, self.pos),
@@ -94,9 +94,10 @@ impl<'a> Parser<'a> {
 
     fn expr(&mut self) -> Val {
         if self.matches("fun") {
-            self.module.add(Node::Const(Constant::FunType))
+            self.module.add(Node::Const(Constant::FunType), None)
         } else if self.matches("I32") {
-            self.module.add(Node::Const(Constant::IntType(Width::W32)))
+            self.module
+                .add(Node::Const(Constant::IntType(Width::W32)), None)
         } else {
             self.var()
         }
@@ -114,11 +115,16 @@ impl<'a> Parser<'a> {
             let name = self.name();
             self.skip_whitespace();
             // Functions can be recursive
-            let val = self.names.get(name).map(|&(x, _)| x).unwrap_or_else(|| {
-                let v = self.module.reserve();
-                self.names.insert(name, (v, self.pos));
-                v
-            });
+            let val = self
+                .names
+                .get(name)
+                .filter(|&&(x, _)| self.module.get(x).is_none())
+                .map(|&(x, _)| x)
+                .unwrap_or_else(|| {
+                    let v = self.module.reserve(Some(name.to_owned()));
+                    self.names.insert(name, (v, self.pos));
+                    v
+                });
 
             let mut params = SmallVec::new();
             // Arguments are optional, if present look like `(x : I32, y : fun)`
@@ -133,7 +139,9 @@ impl<'a> Parser<'a> {
                     self.skip_whitespace();
 
                     let i = params.len();
-                    let val = self.module.add(Node::Param(val, i as _));
+                    let val = self
+                        .module
+                        .add(Node::Param(val, i as _), Some(name.to_owned()));
                     self.names.insert(name, (val, self.pos));
                     params.push(ty);
                     if self.matches(")") {

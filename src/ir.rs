@@ -3,32 +3,43 @@ use smallvec::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Val(usize);
+impl Val {
+    pub fn num(self) -> usize {
+        self.0
+    }
+}
 pub type Ty = Val;
 
 #[derive(Default, Debug)]
 pub struct Module {
     pub nodes: Vec<Option<Node>>,
     pub uses: Vec<Vec<Val>>,
+    pub names: Vec<Option<String>>,
 }
 impl Module {
     pub fn get(&self, i: Val) -> Option<&Node> {
-        self.nodes.get(i.0).map(|x| x.as_ref()).flatten()
+        self.nodes.get(i.num()).map(|x| x.as_ref()).flatten()
     }
 
     pub fn uses(&self, i: Val) -> &Vec<Val> {
-        self.uses.get(i.0).unwrap()
+        self.uses.get(i.num()).unwrap()
+    }
+
+    pub fn name(&self, i: Val) -> Option<&String> {
+        self.names.get(i.num()).map(|x| x.as_ref()).flatten()
     }
 
     // TODO deduplicate constants, or just everything (implicit CSE)
-    pub fn add(&mut self, x: Node) -> Val {
+    pub fn add(&mut self, x: Node, n: Option<String>) -> Val {
         let args = x.args();
         let v = Val(self.nodes.len());
         self.nodes.push(Some(x));
         self.uses.push(Vec::new());
+        self.names.push(n);
 
         // Add uses for the things the new value uses
         for i in args {
-            self.uses[i.0].push(v);
+            self.uses[i.num()].push(v);
         }
 
         v
@@ -36,30 +47,31 @@ impl Module {
 
     /// Reserves space for a value. Used for forward references.
     /// Fill the value later with `replace()`.
-    pub fn reserve(&mut self) -> Val {
+    pub fn reserve(&mut self, n: Option<String>) -> Val {
         let v = Val(self.nodes.len());
         self.nodes.push(None);
         self.uses.push(Vec::new());
+        self.names.push(n);
         v
     }
 
     pub fn replace(&mut self, v: Val, x: Node) {
         // Since there aren't usually many arguments, it's simplest to just remove old uses and add new ones
-        let old_args = self.nodes[v.0]
+        let old_args = self.nodes[v.num()]
             .as_ref()
             .map_or(SmallVec::new(), |x| x.args());
         let new_args = x.args();
 
         for i in old_args {
-            let u = &mut self.uses[i.0];
+            let u = &mut self.uses[i.num()];
             let i = u.iter().position(|&x| x == v).unwrap();
             u.swap_remove(i);
         }
         for i in new_args {
-            self.uses[i.0].push(v);
+            self.uses[i.num()].push(v);
         }
 
-        self.nodes[v.0] = Some(x);
+        self.nodes[v.num()] = Some(x);
     }
 }
 
@@ -168,28 +180,33 @@ mod display {
         }
     }
 
-    impl std::fmt::Display for Node {
+    // impl std::fmt::Display for Node {
+    //     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    //         match self {
+    //             Node::Fun(Function {
+    //                 params,
+    //                 callee,
+    //                 call_args,
+    //             }) => write!(
+    //                 f,
+    //                 "fun({}) => {}({})",
+    //                 DisplayVec(params),
+    //                 callee,
+    //                 DisplayVec(call_args)
+    //             ),
+    //             Node::Param(fun, i) => write!(f, "param {}[{}]", fun, i),
+    //             Node::Const(c) => write!(f, "{}", c),
+    //             Node::BinOp(op, a, b) => write!(f, "{:?} {} {:?}", a, op, b),
+    //         }
+    //     }
+    // }
+    impl std::fmt::Display for Constant {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             match self {
-                Node::Fun(Function {
-                    params,
-                    callee,
-                    call_args,
-                }) => write!(
-                    f,
-                    "fun({}) => {}({})",
-                    DisplayVec(params),
-                    callee,
-                    DisplayVec(call_args)
-                ),
-                Node::Param(fun, i) => write!(f, "param {}[{}]", fun, i),
-                Node::Const(c) => match c {
-                    Constant::TypeType => write!(f, "Type"),
-                    Constant::IntType(w) => write!(f, "I{}", w),
-                    Constant::FunType => write!(f, "fun"),
-                    Constant::Int(_, i) => write!(f, "{}", i),
-                },
-                Node::BinOp(op, a, b) => write!(f, "{:?} {} {:?}", a, op, b),
+                Constant::TypeType => write!(f, "Type"),
+                Constant::IntType(w) => write!(f, "I{}", w),
+                Constant::FunType => write!(f, "fun"),
+                Constant::Int(_, i) => write!(f, "{}", i),
             }
         }
     }
@@ -211,11 +228,6 @@ mod display {
                 BinOp::IMul => write!(f, "*"),
                 BinOp::IDiv => write!(f, "/"),
             }
-        }
-    }
-    impl std::fmt::Display for Val {
-        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            write!(f, "%{}", self.0)
         }
     }
 }

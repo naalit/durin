@@ -1,4 +1,4 @@
+
 fun f (x : I32, r: fun) = g x;
 
-fun g (x : I32)
-  = r x;
+fun g (y : I32) = r y;

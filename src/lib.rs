@@ -1,6 +1,7 @@
 use smallvec::*;
 use std::collections::HashMap;
 
+mod emit;
 pub mod ir;
 pub mod parse;
 use ir::*;
@@ -27,7 +28,7 @@ impl Val {
             x
         } else {
             if let Some(new) = m.get(self).cloned().map(|x| x.mangle(m, map)) {
-                m.add(new)
+                m.add(new, m.name(self).cloned())
             } else {
                 // Assume it doesn't use things in `map`, I guess?
                 self
@@ -46,17 +47,19 @@ pub fn lift(m: &mut Module, vfun: Val, to_lift: Val) -> Val {
     };
 
     // Add the new parameter
+    let lift_name = m.name(to_lift).cloned();
+    let fname = m.name(vfun).cloned();
     let ty = m
         .get(to_lift)
         .unwrap()
         .ty(m)
-        .right_or_else(|x| m.add(Node::Const(x)));
+        .right_or_else(|x| m.add(Node::Const(x), None));
     let nparams = fun.params.len();
     fun.params.push(ty);
 
     // Update references to the old function's parameters in the body of `fun` to the new parameters
-    let fnew = m.reserve();
-    let lifted = m.add(Node::Param(fnew, nparams as u8));
+    let fnew = m.reserve(fname);
+    let lifted = m.add(Node::Param(fnew, nparams as u8), lift_name);
     let mut map = HashMap::new();
     // We're modifying `m` in the loop, so we need to `clone()` here
     for i in m.uses(vfun).clone() {
@@ -80,7 +83,7 @@ pub fn lift(m: &mut Module, vfun: Val, to_lift: Val) -> Val {
             _ => None,
         };
         if let Some(new) = new {
-            let new = m.add(new);
+            let new = m.add(new, m.name(i).cloned());
             map.insert(i, new);
         }
     }
@@ -102,16 +105,19 @@ mod tests {
     fn test_lifting() {
         let mut m = Module::default();
         let (before, to_lift) = {
-            let u32_t = m.add(Node::Const(Constant::IntType(Width::W32)));
-            let enclosing = m.reserve();
+            let u32_t = m.add(Node::Const(Constant::IntType(Width::W32)), None);
+            let enclosing = m.reserve(None);
             // TODO working forward references
-            let param_0 = m.add(Node::Param(enclosing, 0));
+            let param_0 = m.add(Node::Param(enclosing, 0), None);
 
-            let before = m.add(Node::Fun(Function {
-                params: SmallVec::new(),
-                callee: enclosing,
-                call_args: smallvec![param_0],
-            }));
+            let before = m.add(
+                Node::Fun(Function {
+                    params: SmallVec::new(),
+                    callee: enclosing,
+                    call_args: smallvec![param_0],
+                }),
+                None,
+            );
             m.replace(
                 enclosing,
                 Node::Fun(Function {
@@ -124,12 +130,12 @@ mod tests {
         };
 
         // So we can see in the output where the lifting happened
-        m.add(Node::Const(Constant::Int(Width::W64, 111111111111)));
+        m.add(Node::Const(Constant::Int(Width::W64, 111111111111)), None);
 
         let after = lift(&mut m, before, to_lift);
-        for (i, n) in m.nodes.iter().enumerate() {
-            println!("%{} = {}", i, n.as_ref().unwrap());
-        }
+        // for (i, n) in m.nodes.iter().enumerate() {
+        //     println!("%{} = {}", i, n.as_ref().unwrap());
+        // }
         // panic!("look right?");
     }
 }
