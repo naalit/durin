@@ -15,6 +15,32 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
+    /// This implements a basic version of what rustc or clang error messages look like
+    fn error(&self, message: impl Into<String>) -> ! {
+        let mut lnum = 0;
+        let mut lpos = 0;
+        let line = self
+            .input
+            .lines()
+            .find(|x| {
+                if lpos + x.len() > self.pos {
+                    true
+                } else {
+                    lnum += 1;
+                    lpos += x.len();
+                    false
+                }
+            })
+            .unwrap();
+        let col = self.pos - lpos;
+        eprintln!("Syntax error: {}", message.into());
+        eprintln!("    --> {}:{}", lnum, col);
+        eprintln!("     |");
+        eprintln!("{:4} | {}", lnum, line);
+        eprintln!("     | {:>width$}", "^", width = col - 1);
+        panic!("Syntax error")
+    }
+
     pub fn new(input: &'a str) -> Self {
         Parser {
             chars: input.chars().peekable(),
@@ -50,7 +76,7 @@ impl<'a> Parser<'a> {
     /// Consumes `s`, panicking if it doesn't match
     fn expect(&mut self, s: &str) {
         if !self.matches(s) {
-            panic!("Expected {:?} at position {}", s, self.pos)
+            self.error(format!("Expected {:?}", s))
         }
     }
 
@@ -67,15 +93,16 @@ impl<'a> Parser<'a> {
     fn name(&mut self) -> &'a str {
         let start = self.pos;
         while let Some(c) = self.peek() {
-            // Durin allows all non-whitespace characters in names, except ")", ":", ";", and ",", since those are ambiguous
-            if !c.is_whitespace() && c != ')' && c != ':' && c != ',' && c != ';' {
+            // Durin allows all non-whitespace characters in names, except "(", ")", ":", ";", and ",", since those are ambiguous
+            if !c.is_whitespace() && c != '(' && c != ')' && c != ':' && c != ',' && c != ';' {
                 self.next();
             } else {
                 break;
             }
         }
         if self.pos == start {
-            panic!("Expected name at position {}", start)
+            self.pos = start;
+            self.error(format!("Expected name"))
         }
         &self.input[start..self.pos]
     }
@@ -92,12 +119,68 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Basically the same operators as Pika are (will be) supported
+    fn binop(&mut self) -> BinOp {
+        match self.peek().unwrap() {
+            '=' if self.matches("==") => BinOp::IEq,
+            '*' if self.matches("**") => self.error("Exponentiation not supported yet"),
+            '*' => {
+                self.next();
+                BinOp::IMul
+            }
+            '+' => {
+                self.next();
+                BinOp::IAdd
+            }
+            '-' => {
+                self.next();
+                BinOp::ISub
+            }
+            '/' => {
+                self.next();
+                BinOp::IDiv
+            }
+            _ => self.error("Expected operator"),
+        }
+    }
+
     fn expr(&mut self) -> Val {
-        if self.matches("fun") {
+        if self.matches("(") {
+            // A binop
+            let lhs = self.expr();
+            self.skip_whitespace();
+            let op = self.binop();
+            self.skip_whitespace();
+            let rhs = self.expr();
+            self.skip_whitespace();
+            self.expect(")");
+            self.module.add(Node::BinOp(op, lhs, rhs), None)
+        } else if self.matches("fun") {
             self.module.add(Node::Const(Constant::FunType), None)
         } else if self.matches("I32") {
             self.module
                 .add(Node::Const(Constant::IntType(Width::W32)), None)
+        } else if self.peek().unwrap().is_digit(10) || self.peek().unwrap() == '-' {
+            let mut s = String::new();
+            while self.peek().unwrap() != 'i' {
+                if self.peek().unwrap().is_digit(10) || self.peek().unwrap() == '-' {
+                    s.push(self.next().unwrap());
+                } else {
+                    self.error("Expected int width suffix: one of i1, i8, i16, i32, i64");
+                }
+            }
+            self.next();
+            let w = match () {
+                _ if self.matches("64") => Width::W64,
+                _ if self.matches("32") => Width::W32,
+                _ if self.matches("16") => Width::W16,
+                _ if self.matches("8") => Width::W8,
+                _ if self.matches("1") => Width::W1,
+                _ => self.error("Expected int width suffix: one of i1, i8, i16, i32, i64"),
+            };
+            use std::str::FromStr;
+            let i = i64::from_str(&s).unwrap_or_else(|e| self.error(format!("{}", e)));
+            self.module.add(Node::Const(Constant::Int(w, i)), None)
         } else {
             self.var()
         }
@@ -162,7 +245,7 @@ impl<'a> Parser<'a> {
 
             let mut call_args = SmallVec::new();
             while !self.matches(";") {
-                call_args.push(self.var());
+                call_args.push(self.expr());
                 self.skip_whitespace();
             }
 
@@ -176,9 +259,10 @@ impl<'a> Parser<'a> {
             )
         }
 
-        for (name, (val, pos)) in self.names {
-            if self.module.get(val).is_none() {
-                panic!("Name '{}' not found at position {}", name, pos);
+        for (name, (val, pos)) in &self.names {
+            if self.module.get(*val).is_none() {
+                self.pos = *pos;
+                self.error(format!("Name '{}' not found", name));
             }
         }
 

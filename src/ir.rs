@@ -118,7 +118,7 @@ impl Node {
                 }
                 Constant::Int(w, _) => Either::Left(Constant::IntType(*w)),
             },
-            // Comparison operations will need a special case here
+            Node::BinOp(BinOp::IEq, _, _) => Either::Left(Constant::IntType(Width::W1)),
             Node::BinOp(_, a, _) => m.get(*a).unwrap().ty(m),
         }
     }
@@ -134,6 +134,7 @@ pub struct Function {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Width {
+    W1,
     W8,
     W16,
     W32,
@@ -146,7 +147,7 @@ pub enum Constant {
     TypeType,
     IntType(Width),
     FunType,
-    Int(Width, u64),
+    Int(Width, i64),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -155,6 +156,7 @@ pub enum BinOp {
     ISub,
     IMul,
     IDiv,
+    IEq,
 }
 
 mod display {
@@ -213,6 +215,7 @@ mod display {
     impl std::fmt::Display for Width {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             match self {
+                Width::W1 => write!(f, "1"),
                 Width::W8 => write!(f, "8"),
                 Width::W16 => write!(f, "16"),
                 Width::W32 => write!(f, "32"),
@@ -223,6 +226,7 @@ mod display {
     impl std::fmt::Display for BinOp {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             match self {
+                BinOp::IEq => write!(f, "=="),
                 BinOp::IAdd => write!(f, "+"),
                 BinOp::ISub => write!(f, "-"),
                 BinOp::IMul => write!(f, "*"),

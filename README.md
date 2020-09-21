@@ -10,3 +10,5 @@ Durin will soon have an LLVM backend, and support passing things around unboxed 
 Since it's dependently typed, it actually passes around types at runtime (as sizes, like [Sixten](https://github.com/ollef/sixten)), so a polymorphic function can work with, for example, unboxed arrays of any type without needing monomorphization, boxing, or extra information in values.
 It will figure out what needs to be boxed (and how much - some things need to be boxed but don't need GC)
 after monomorphization and inlining, so it should be able to box as little as possible.
+
+Durin is designed as the backend for [Pika](https://github.com/tolziplohu/pika), but it should work with other typed functional languages as well.

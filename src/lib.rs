@@ -133,6 +133,7 @@ mod tests {
         m.add(Node::Const(Constant::Int(Width::W64, 111111111111)), None);
 
         let after = lift(&mut m, before, to_lift);
+        println!("{}", m.emit());
         // for (i, n) in m.nodes.iter().enumerate() {
         //     println!("%{} = {}", i, n.as_ref().unwrap());
         // }
