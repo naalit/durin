@@ -78,8 +78,8 @@ impl Module {
                         buf,
                         "val {} = {} {} {};",
                         self.name_or(num),
-                        op,
                         a.pretty(self),
+                        op,
                         b.pretty(self)
                     )
                     .unwrap();

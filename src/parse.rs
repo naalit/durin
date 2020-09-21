@@ -37,7 +37,7 @@ impl<'a> Parser<'a> {
         eprintln!("    --> {}:{}", lnum, col);
         eprintln!("     |");
         eprintln!("{:4} | {}", lnum, line);
-        eprintln!("     | {:>width$}", "^", width = col - 1);
+        eprintln!("     | {:>width$}", "^", width = col + 1);
         panic!("Syntax error")
     }
 
@@ -108,14 +108,17 @@ impl<'a> Parser<'a> {
     }
 
     fn var(&mut self) -> Val {
+        let pos = self.pos;
         let name = self.name();
         match self.names.get(name) {
             Some(&(x, _)) => x,
             None => {
+                // We implicitly forward-declare variables we can't find (like C), then add their definitions later
+                // If we get to the end of the file and a variable hasn't been defined, we give an error
                 let v = self.module.reserve(Some(name.to_owned()));
-                self.names.insert(name, (v, self.pos));
+                self.names.insert(name, (v, pos));
                 v
-            } // panic!("Name '{}' not found at position {}", name, self.pos),
+            }
         }
     }
 
@@ -192,6 +195,34 @@ impl<'a> Parser<'a> {
             if self.peek().is_none() {
                 break;
             }
+
+            if self.matches("val") {
+                // Parse a local
+                self.skip_whitespace();
+                let name = self.name();
+                // Vals can be forward-declared too
+                let val = self
+                    .names
+                    .get(name)
+                    .filter(|&&(x, _)| self.module.get(x).is_none())
+                    .map(|&(x, _)| x)
+                    .unwrap_or_else(|| {
+                        let v = self.module.reserve(Some(name.to_owned()));
+                        self.names.insert(name, (v, self.pos));
+                        v
+                    });
+                self.skip_whitespace();
+                self.expect("=");
+                self.skip_whitespace();
+                let val2 = self.expr();
+                self.module
+                    .replace(val, self.module.get(val2).unwrap().clone());
+                self.skip_whitespace();
+                self.expect(";");
+                continue;
+            }
+
+            // Parse a function
             self.expect("fun");
             self.skip_whitespace();
 
