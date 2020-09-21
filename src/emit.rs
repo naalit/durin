@@ -30,59 +30,61 @@ impl Module {
     pub fn emit(&self) -> String {
         let mut buf = String::new();
         for (num, node) in self.nodes.iter().enumerate() {
-            match node.as_ref().unwrap() {
-                Node::Fun(Function {
-                    params,
-                    callee,
-                    call_args,
-                }) => {
-                    write!(buf, "\nfun {} (", self.name_or(num)).unwrap();
-                    for (pnum, pty) in params.iter().enumerate() {
-                        let name = {
-                            let name: Vec<_> = self.uses[num]
-                                .iter()
-                                .filter(|&&x| {
-                                    if let Some(Node::Param(_, i)) = self.get(x) {
-                                        *i as usize == pnum
-                                    } else {
-                                        false
-                                    }
-                                })
-                                .collect();
-                            if name.len() == 1 {
-                                self.name_or(name[0].num())
-                            } else {
-                                format!("{}.{}", self.name_or(num), pnum)
-                            }
-                        };
-                        write!(
+            if let Some(node) = node.to_option() {
+                match node {
+                    Node::Fun(Function {
+                        params,
+                        callee,
+                        call_args,
+                    }) => {
+                        write!(buf, "\nfun {} (", self.name_or(num)).unwrap();
+                        for (pnum, pty) in params.iter().enumerate() {
+                            let name = {
+                                let name: Vec<_> = self.uses[num]
+                                    .iter()
+                                    .filter(|&&x| {
+                                        if let Some(Node::Param(_, i)) = self.get(x) {
+                                            *i as usize == pnum
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .collect();
+                                if name.len() == 1 {
+                                    self.name_or(name[0].num())
+                                } else {
+                                    format!("{}.{}", self.name_or(num), pnum)
+                                }
+                            };
+                            write!(
+                                buf,
+                                "{}{} : {}",
+                                if pnum == 0 { "" } else { ", " },
+                                name,
+                                pty.pretty(self)
+                            )
+                            .unwrap();
+                        }
+                        write!(buf, ") = {}", callee.pretty(self)).unwrap();
+                        for v in call_args {
+                            write!(buf, " {}", v.pretty(self)).unwrap();
+                        }
+                        writeln!(buf, ";").unwrap();
+                    }
+                    Node::Param(_, _) | Node::Const(_) => {
+                        // Nothing, since constants and params are inlined
+                    }
+                    Node::BinOp(op, a, b) => {
+                        writeln!(
                             buf,
-                            "{}{} : {}",
-                            if pnum == 0 { "" } else { ", " },
-                            name,
-                            pty.pretty(self)
+                            "val {} = ({} {} {});",
+                            self.name_or(num),
+                            a.pretty(self),
+                            op,
+                            b.pretty(self)
                         )
                         .unwrap();
                     }
-                    write!(buf, ") = {}", callee.pretty(self)).unwrap();
-                    for v in call_args {
-                        write!(buf, " {}", v.pretty(self)).unwrap();
-                    }
-                    writeln!(buf, ";").unwrap();
-                }
-                Node::Param(_, _) | Node::Const(_) => {
-                    // Nothing, since constants and params are inlined
-                }
-                Node::BinOp(op, a, b) => {
-                    writeln!(
-                        buf,
-                        "val {} = {} {} {};",
-                        self.name_or(num),
-                        a.pretty(self),
-                        op,
-                        b.pretty(self)
-                    )
-                    .unwrap();
                 }
             }
         }

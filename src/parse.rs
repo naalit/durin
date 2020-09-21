@@ -215,8 +215,8 @@ impl<'a> Parser<'a> {
                 self.expect("=");
                 self.skip_whitespace();
                 let val2 = self.expr();
-                self.module
-                    .replace(val, self.module.get(val2).unwrap().clone());
+                let node = self.module.remove(val2).unwrap();
+                self.module.replace(val, node);
                 self.skip_whitespace();
                 self.expect(";");
                 continue;

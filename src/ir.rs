@@ -10,15 +10,50 @@ impl Val {
 }
 pub type Ty = Val;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Slot {
+    Full(Node),
+    Reserved,
+    Open,
+}
+impl Slot {
+    pub fn to_option(&self) -> Option<&Node> {
+        if let Slot::Full(n) = self {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
+    pub fn into_option(self) -> Option<Node> {
+        if let Slot::Full(n) = self {
+            Some(n)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct Module {
-    pub nodes: Vec<Option<Node>>,
+    pub nodes: Vec<Slot>,
     pub uses: Vec<Vec<Val>>,
     pub names: Vec<Option<String>>,
 }
 impl Module {
+    /// Removes a node from the module. Panics if that node is used by anything.
+    pub fn remove(&mut self, i: Val) -> Option<Node> {
+        if !self.uses[i.num()].is_empty() {
+            panic!("Error: cannot delete node with uses!")
+        }
+        self.uses[i.num()] = Vec::new();
+        self.names[i.num()] = None;
+        // Why isn't there a Vec::replace()?
+        std::mem::replace(&mut self.nodes[i.num()], Slot::Open).into_option()
+    }
+
     pub fn get(&self, i: Val) -> Option<&Node> {
-        self.nodes.get(i.num()).map(|x| x.as_ref()).flatten()
+        self.nodes.get(i.num()).map(|x| x.to_option()).flatten()
     }
 
     pub fn uses(&self, i: Val) -> &Vec<Val> {
@@ -33,7 +68,7 @@ impl Module {
     pub fn add(&mut self, x: Node, n: Option<String>) -> Val {
         let args = x.args();
         let v = Val(self.nodes.len());
-        self.nodes.push(Some(x));
+        self.nodes.push(Slot::Full(x));
         self.uses.push(Vec::new());
         self.names.push(n);
 
@@ -49,7 +84,7 @@ impl Module {
     /// Fill the value later with `replace()`.
     pub fn reserve(&mut self, n: Option<String>) -> Val {
         let v = Val(self.nodes.len());
-        self.nodes.push(None);
+        self.nodes.push(Slot::Reserved);
         self.uses.push(Vec::new());
         self.names.push(n);
         v
@@ -58,7 +93,7 @@ impl Module {
     pub fn replace(&mut self, v: Val, x: Node) {
         // Since there aren't usually many arguments, it's simplest to just remove old uses and add new ones
         let old_args = self.nodes[v.num()]
-            .as_ref()
+            .to_option()
             .map_or(SmallVec::new(), |x| x.args());
         let new_args = x.args();
 
@@ -71,7 +106,7 @@ impl Module {
             self.uses[i.num()].push(v);
         }
 
-        self.nodes[v.num()] = Some(x);
+        self.nodes[v.num()] = Slot::Full(x);
     }
 }
 
@@ -182,33 +217,13 @@ mod display {
         }
     }
 
-    // impl std::fmt::Display for Node {
-    //     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-    //         match self {
-    //             Node::Fun(Function {
-    //                 params,
-    //                 callee,
-    //                 call_args,
-    //             }) => write!(
-    //                 f,
-    //                 "fun({}) => {}({})",
-    //                 DisplayVec(params),
-    //                 callee,
-    //                 DisplayVec(call_args)
-    //             ),
-    //             Node::Param(fun, i) => write!(f, "param {}[{}]", fun, i),
-    //             Node::Const(c) => write!(f, "{}", c),
-    //             Node::BinOp(op, a, b) => write!(f, "{:?} {} {:?}", a, op, b),
-    //         }
-    //     }
-    // }
     impl std::fmt::Display for Constant {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             match self {
                 Constant::TypeType => write!(f, "Type"),
                 Constant::IntType(w) => write!(f, "I{}", w),
                 Constant::FunType => write!(f, "fun"),
-                Constant::Int(_, i) => write!(f, "{}", i),
+                Constant::Int(w, i) => write!(f, "{}i{}", i, w),
             }
         }
     }

@@ -1,5 +1,5 @@
 #[test]
-fn test_parse() {
+fn test_basic() {
     let input = include_str!("basic.du");
     let m = durin::parse::Parser::new(input).parse();
     assert_eq!(input.trim(), m.emit().trim());
