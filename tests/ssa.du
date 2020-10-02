@@ -1,0 +1,2 @@
+fun one (f: fun, r: fun) = f two;
+fun two (i: I32) = r i;

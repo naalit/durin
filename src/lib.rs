@@ -1,6 +1,7 @@
 use smallvec::*;
 use std::collections::HashMap;
 
+pub mod backend;
 mod emit;
 pub mod ir;
 pub mod parse;

@@ -108,6 +108,49 @@ impl Module {
 
         self.nodes[v.num()] = Slot::Full(x);
     }
+
+    pub fn top_level<'a>(&'a self) -> impl Iterator<Item = Val> + 'a {
+        (0..self.nodes.len()).map(|x| Val(x)).filter(move |x| {
+            fn has_param(m: &Module, x: Val, not: Val) -> bool {
+                match m.get(x) {
+                    None => true,
+                    Some(Node::Param(p, _)) => *p != not,
+                    Some(Node::Fun(_)) if x != not => false,
+                    Some(n) => n.args().iter().any(|x| has_param(m, *x, not)),
+                }
+            }
+            !has_param(self, *x, *x)
+        })
+    }
+
+    pub fn vals<'a>(&'a self) -> impl Iterator<Item = Val> + 'a {
+        (0..self.nodes.len())
+            .map(|x| Val(x))
+            .filter(move |x| self.get(*x).is_some())
+    }
+
+    /// Returns a list of everything that depends on `v`, transitively.
+    pub fn scope(&self, v: Val) -> Vec<Val> {
+        use std::collections::HashSet;
+
+        let mut vec = vec![v];
+        let mut ix = 0;
+        let mut seen = HashSet::new();
+        seen.insert(v);
+
+        // Instead of using a stack, we use one vec that we go through in order, since we're going to return it too
+        while let Some(&v) = vec.get(ix) {
+            for &i in self.uses(v) {
+                if !seen.contains(&i) {
+                    seen.insert(i);
+                    vec.push(i);
+                }
+            }
+            ix += 1;
+        }
+
+        vec
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,26 +239,6 @@ pub enum BinOp {
 
 mod display {
     use super::*;
-
-    /// Displays [a, b, c as "a, b, c" using the Display impl of `T`
-    pub struct DisplayVec<T>(T);
-    impl<T> std::fmt::Display for DisplayVec<T>
-    where
-        T: IntoIterator + Clone,
-        T::Item: std::fmt::Display,
-    {
-        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            let mut first = true;
-            for i in self.0.clone() {
-                if !first {
-                    write!(f, ", ")?;
-                }
-                first = false;
-                write!(f, "{}", i)?;
-            }
-            Ok(())
-        }
-    }
 
     impl std::fmt::Display for Constant {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {

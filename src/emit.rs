@@ -1,7 +1,7 @@
 use crate::ir::*;
 use std::fmt::{self, Display, Write};
 
-struct PrettyVal<'a>(&'a Module, Val);
+pub struct PrettyVal<'a>(&'a Module, Val);
 impl<'a> Display for PrettyVal<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let PrettyVal(m, v) = *self;
@@ -17,13 +17,13 @@ impl<'a> Display for PrettyVal<'a> {
 }
 
 impl Val {
-    fn pretty(self, m: &Module) -> PrettyVal {
+    pub fn pretty(self, m: &Module) -> PrettyVal {
         PrettyVal(m, self)
     }
 }
 
 impl Module {
-    fn name_or(&self, n: usize) -> String {
+    pub fn name_or(&self, n: usize) -> String {
         self.names[n].clone().unwrap_or_else(|| format!("%{}", n))
     }
 
