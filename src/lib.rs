@@ -16,6 +16,10 @@ impl Node {
                 f.call_args.iter_mut().for_each(|x| *x = x.mangle(m, map));
                 Node::Fun(f)
             }
+            Node::FunType(mut v) => {
+                v.iter_mut().for_each(|x| *x = x.mangle(m, map));
+                Node::FunType(v)
+            }
             Node::Param(f, i) => Node::Param(f.mangle(m, map), i),
             Node::BinOp(op, a, b) => Node::BinOp(op, a.mangle(m, map), b.mangle(m, map)),
             // Constants can't use other values
@@ -53,6 +57,7 @@ pub fn lift(m: &mut Module, vfun: Val, to_lift: Val) -> Val {
     let ty = m
         .get(to_lift)
         .unwrap()
+        .clone()
         .ty(m)
         .right_or_else(|x| m.add(Node::Const(x), None));
     let nparams = fun.params.len();

@@ -156,6 +156,7 @@ impl Module {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Node {
     Fun(Function),
+    FunType(SmallVec<[Val; 4]>),
     /// The `Val` should point to a function
     Param(Val, u8),
     Const(Constant),
@@ -174,15 +175,19 @@ impl Node {
                 .copied()
                 .chain(std::iter::once(*callee))
                 .collect(),
+            Node::FunType(v) => v.clone(),
             Node::Param(f, _) => smallvec![*f],
             Node::BinOp(_, a, b) => smallvec![*a, *b],
             Node::Const(_) => SmallVec::new(),
         }
     }
 
-    pub fn ty(&self, m: &Module) -> Either<Constant, Ty> {
+    pub fn ty(&self, m: &mut Module) -> Either<Constant, Ty> {
         match self {
-            Node::Fun(_) => Either::Left(Constant::FunType),
+            Node::Fun(f) => {
+                Either::Right(m.add(Node::FunType(f.params.as_slice().to_smallvec()), None))
+            }
+            Node::FunType(_) => Either::Left(Constant::TypeType),
             Node::Param(f, i) => {
                 if let Node::Fun(f) = m.get(*f).unwrap() {
                     Either::Right(f.params[*i as usize])
@@ -191,13 +196,11 @@ impl Node {
                 }
             }
             Node::Const(c) => match c {
-                Constant::TypeType | Constant::IntType(_) | Constant::FunType => {
-                    Either::Left(Constant::TypeType)
-                }
+                Constant::TypeType | Constant::IntType(_) => Either::Left(Constant::TypeType),
                 Constant::Int(w, _) => Either::Left(Constant::IntType(*w)),
             },
             Node::BinOp(BinOp::IEq, _, _) => Either::Left(Constant::IntType(Width::W1)),
-            Node::BinOp(_, a, _) => m.get(*a).unwrap().ty(m),
+            Node::BinOp(_, a, _) => m.get(*a).unwrap().clone().ty(m),
         }
     }
 }
@@ -224,7 +227,6 @@ pub enum Width {
 pub enum Constant {
     TypeType,
     IntType(Width),
-    FunType,
     Int(Width, i64),
 }
 
@@ -245,7 +247,6 @@ mod display {
             match self {
                 Constant::TypeType => write!(f, "Type"),
                 Constant::IntType(w) => write!(f, "I{}", w),
-                Constant::FunType => write!(f, "fun"),
                 Constant::Int(w, i) => write!(f, "{}i{}", i, w),
             }
         }

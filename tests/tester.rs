@@ -22,3 +22,13 @@ fn test_ssa() {
     println!("{}", b.body);
     panic!("ah");
 }
+
+#[test]
+fn test_ssa2() {
+    let input = include_str!("ssa.du");
+    let m = durin::parse::Parser::new(input).parse();
+    let mut b = durin::backend::SimpleSSA::default();
+    m.codegen(&mut b);
+    println!("{}", b.body);
+    panic!("ah");
+}

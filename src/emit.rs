@@ -7,6 +7,18 @@ impl<'a> Display for PrettyVal<'a> {
         let PrettyVal(m, v) = *self;
         match m.get(v).as_ref().unwrap() {
             Node::Const(c) => write!(f, "{}", c),
+            Node::FunType(v) => {
+                write!(f, "fun(")?;
+                let mut first = true;
+                for ty in v {
+                    if !first {
+                        first = false;
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", ty.pretty(m))?;
+                }
+                write!(f, ")")
+            }
             // Node::Param(a, b) => write!(f, "{}.{}", a.pretty(m), b),
             _ => match &m.names[v.num()] {
                 Some(x) => write!(f, "{}", x),
@@ -71,7 +83,7 @@ impl Module {
                         }
                         writeln!(buf, ";").unwrap();
                     }
-                    Node::Param(_, _) | Node::Const(_) => {
+                    Node::Param(_, _) | Node::Const(_) | Node::FunType(_) => {
                         // Nothing, since constants and params are inlined
                     }
                     Node::BinOp(op, a, b) => {

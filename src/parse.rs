@@ -159,7 +159,20 @@ impl<'a> Parser<'a> {
             self.expect(")");
             self.module.add(Node::BinOp(op, lhs, rhs), None)
         } else if self.matches("fun") {
-            self.module.add(Node::Const(Constant::FunType), None)
+            self.expect("(");
+            self.skip_whitespace();
+
+            let mut params = SmallVec::new();
+            while !self.matches(")") {
+                params.push(self.expr());
+                if self.matches(")") {
+                    break;
+                } else {
+                    self.expect(",");
+                    self.skip_whitespace();
+                }
+            }
+            self.module.add(Node::FunType(params), None)
         } else if self.matches("I32") {
             self.module
                 .add(Node::Const(Constant::IntType(Width::W32)), None)

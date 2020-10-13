@@ -37,6 +37,7 @@ impl SimpleSSA {
                 Some(x) => format!("{}", x),
                 None => format!("%{}", v.num()),
             },
+            Node::FunType(_) => String::from("closure()"),
         }
     }
 }
@@ -100,7 +101,27 @@ impl Backend for SimpleSSA {
                     })
                     .next()
                     .unwrap();
-                write!(self.body, "): something").unwrap();
+                let rty = if let Node::FunType(v) = m.get(fun.params[pnum]).unwrap() {
+                    if v.len() == 1 {
+                        format!("{}", v[0].pretty(m))
+                    } else {
+                        let mut s = String::new();
+                        s.push('(');
+                        let mut first = true;
+                        for i in v {
+                            if !first {
+                                first = false;
+                                write!(s, ", ").unwrap();
+                            }
+                            write!(s, "{}", i.pretty(m)).unwrap();
+                        }
+                        s.push(')');
+                        s
+                    }
+                } else {
+                    unreachable!()
+                };
+                write!(self.body, "): {}", rty).unwrap();
                 Some(ret)
             }
             _ => {
@@ -208,8 +229,7 @@ impl Module {
                     call_args,
                 }) = self.get(v).unwrap()
                 {
-                    if *self.get(*params.last().unwrap()).unwrap() == Node::Const(Constant::FunType)
-                    {
+                    if let Node::FunType(_) = *self.get(*params.last().unwrap()).unwrap() {
                         let cont_n = params.len() as u8 - 1;
                         let &cont_p = self
                             .uses(v)
@@ -226,7 +246,7 @@ impl Module {
                             || *callee == cont_p
                             // Allow calling functions that will become basic blocks, i.e. don't have continuations
                             || if let Node::Fun(Function { params, .. }) = self.get(*callee).unwrap() {
-                                params.last().map_or(true, |t| *self.get(*t).unwrap() != Node::Const(Constant::FunType))
+                                params.last().map_or(true, |t| if let Node::FunType(_) = *self.get(*t).unwrap() { false } else { true })
                             } else { false }
                             // Single recursion is fine
                             || *callee == v);
@@ -240,7 +260,9 @@ impl Module {
             }
         }
 
-        for v in self.top_level() {
+        let mut stack: Vec<_> = self.top_level().collect();
+        let mut added: HashSet<_> = stack.iter().copied().collect();
+        while let Some(v) = stack.pop() {
             if let Node::Fun(Function {
                 params,
                 callee,
@@ -264,11 +286,22 @@ impl Module {
                         })) = self.get(x)
                         {
                             // A function is eligible for turning into a basic block if it doesn't take a continuation - it always branches to a known destination.
-                            // That's approximated by not having any parameters of type `fun`.
-                            // Polymorphic parameters that *could* have type `fun` don't count, because they can't be called.
+                            // That's approximated by not having any parameters with function types.
+                            // Polymorphic parameters that *could* have function types don't count, because they can't be called.
                             if params
                                 .iter()
-                                .all(|&x| *self.get(x).unwrap() != Node::Const(Constant::FunType))
+                                .all(|&x| match *self.get(x).unwrap() {
+                                    Node::FunType(_) => false,
+                                    _ => true,
+                                })
+                                // It must also not be used as a first-class function (not passed around, just called)
+                                // This is, in theory, an arbitrary LLVM-specific restriction
+                                // In assembly and probably other IRs, basic blocks (labels) can be passed around just fine
+                                && self.uses(x).iter().all(|u| match self.get(*u).unwrap() {
+                                    Node::Fun(f) => f.call_args.iter().all(|a| *a != x),
+                                    Node::Param(_, _) => true,
+                                    _ => false,
+                                })
                             {
                                 Some((
                                     x,
@@ -279,6 +312,10 @@ impl Module {
                                     },
                                 ))
                             } else {
+                                if !added.contains(&x) {
+                                    added.insert(x);
+                                    stack.push(x);
+                                }
                                 None
                             }
                         } else {
