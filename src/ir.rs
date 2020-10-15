@@ -1,4 +1,3 @@
-use either::Either;
 use smallvec::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -8,7 +7,6 @@ impl Val {
         self.0
     }
 }
-pub type Ty = Val;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Slot {
@@ -162,6 +160,32 @@ pub enum Node {
     Const(Constant),
     BinOp(BinOp, Val, Val),
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ty {
+    Const(Constant),
+    FunType(SmallVec<[Val; 4]>),
+    Val(Val),
+}
+impl Ty {
+    pub fn to_val(self, m: &mut Module) -> Val {
+        match self {
+            Ty::Const(c) => m.add(Node::Const(c), None),
+            Ty::FunType(v) => m.add(Node::FunType(v), None),
+            Ty::Val(v) => v,
+        }
+    }
+
+    pub fn inline(self, m: &Module) -> Self {
+        match self {
+            Ty::Val(v) => match m.get(v).unwrap() {
+                Node::Const(c) => Ty::Const(c.clone()),
+                Node::FunType(v) => Ty::FunType(v.clone()),
+                _ => Ty::Val(v),
+            },
+            x => x,
+        }
+    }
+}
 impl Node {
     pub fn args(&self) -> SmallVec<[Val; 4]> {
         match self {
@@ -182,24 +206,22 @@ impl Node {
         }
     }
 
-    pub fn ty(&self, m: &mut Module) -> Either<Constant, Ty> {
+    pub fn ty(&self, m: &Module) -> Ty {
         match self {
-            Node::Fun(f) => {
-                Either::Right(m.add(Node::FunType(f.params.as_slice().to_smallvec()), None))
-            }
-            Node::FunType(_) => Either::Left(Constant::TypeType),
+            Node::Fun(f) => Ty::FunType(f.params.as_slice().to_smallvec()),
+            Node::FunType(_) => Ty::Const(Constant::TypeType),
             Node::Param(f, i) => {
                 if let Node::Fun(f) = m.get(*f).unwrap() {
-                    Either::Right(f.params[*i as usize])
+                    Ty::Val(f.params[*i as usize])
                 } else {
                     panic!("non-function has no params")
                 }
             }
             Node::Const(c) => match c {
-                Constant::TypeType | Constant::IntType(_) => Either::Left(Constant::TypeType),
-                Constant::Int(w, _) => Either::Left(Constant::IntType(*w)),
+                Constant::TypeType | Constant::IntType(_) => Ty::Const(Constant::TypeType),
+                Constant::Int(w, _) => Ty::Const(Constant::IntType(*w)),
             },
-            Node::BinOp(BinOp::IEq, _, _) => Either::Left(Constant::IntType(Width::W1)),
+            Node::BinOp(BinOp::IEq, _, _) => Ty::Const(Constant::IntType(Width::W1)),
             Node::BinOp(_, a, _) => m.get(*a).unwrap().clone().ty(m),
         }
     }
@@ -208,7 +230,8 @@ impl Node {
 /// A function body is just a call
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Function {
-    pub params: SmallVec<[Ty; 3]>,
+    /// The parameter types
+    pub params: SmallVec<[Val; 3]>,
     pub callee: Val,
     pub call_args: SmallVec<[Val; 3]>,
 }
@@ -220,6 +243,17 @@ pub enum Width {
     W16,
     W32,
     W64,
+}
+impl Width {
+    pub fn bits(self) -> u32 {
+        match self {
+            Width::W1 => 1,
+            Width::W8 => 8,
+            Width::W16 => 16,
+            Width::W32 => 32,
+            Width::W64 => 64,
+        }
+    }
 }
 
 /// Types are generally constants
@@ -253,13 +287,7 @@ mod display {
     }
     impl std::fmt::Display for Width {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            match self {
-                Width::W1 => write!(f, "1"),
-                Width::W8 => write!(f, "8"),
-                Width::W16 => write!(f, "16"),
-                Width::W32 => write!(f, "32"),
-                Width::W64 => write!(f, "64"),
-            }
+            self.bits().fmt(f)
         }
     }
     impl std::fmt::Display for BinOp {

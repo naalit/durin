@@ -54,12 +54,7 @@ pub fn lift(m: &mut Module, vfun: Val, to_lift: Val) -> Val {
     // Add the new parameter
     let lift_name = m.name(to_lift).cloned();
     let fname = m.name(vfun).cloned();
-    let ty = m
-        .get(to_lift)
-        .unwrap()
-        .clone()
-        .ty(m)
-        .right_or_else(|x| m.add(Node::Const(x), None));
+    let ty = m.get(to_lift).unwrap().clone().ty(m).to_val(m);
     let nparams = fun.params.len();
     fun.params.push(ty);
 
@@ -138,7 +133,7 @@ mod tests {
         // So we can see in the output where the lifting happened
         m.add(Node::Const(Constant::Int(Width::W64, 111111111111)), None);
 
-        let after = lift(&mut m, before, to_lift);
+        let _after = lift(&mut m, before, to_lift);
         println!("{}", m.emit());
         // for (i, n) in m.nodes.iter().enumerate() {
         //     println!("%{} = {}", i, n.as_ref().unwrap());

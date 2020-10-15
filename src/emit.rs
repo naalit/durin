@@ -39,6 +39,25 @@ impl Module {
         self.names[n].clone().unwrap_or_else(|| format!("%{}", n))
     }
 
+    pub fn param_name(&self, v: Val, pnum: u8) -> String {
+        let name: Vec<_> = self
+            .uses(v)
+            .iter()
+            .filter(|&&x| {
+                if let Some(Node::Param(_, i)) = self.get(x) {
+                    *i == pnum
+                } else {
+                    false
+                }
+            })
+            .collect();
+        if name.len() == 1 {
+            self.name_or(name[0].num())
+        } else {
+            format!("{}.{}", self.name_or(v.num()), pnum)
+        }
+    }
+
     pub fn emit(&self) -> String {
         let mut buf = String::new();
         for (num, node) in self.nodes.iter().enumerate() {
