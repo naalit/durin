@@ -6,6 +6,9 @@ impl Val {
     pub fn num(self) -> usize {
         self.0
     }
+
+    /// An invalid value that can't have a Node associated with it
+    pub const INVALID: Self = Val(usize::MAX);
 }
 
 #[derive(Debug, Clone, PartialEq)]

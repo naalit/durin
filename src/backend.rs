@@ -13,12 +13,32 @@ pub const TAILCC: u32 = 18;
 pub const CCC: u32 = 0;
 pub const FASTCC: u32 = 8;
 
+/// Contains all the information needed to call or define a function.
+///
+/// Each Durin function (that isn't a basic block) corresponds to two LLVM functions:
+/// One function is used for known calls, and one for unknown calls.
+/// The `known` function has precise types, can use the LLVM stack, and accepts any closed-over values as typed parameters before the rest.
+/// The `unknown` function takes all parameters as `i8*`, has one closure parameter at the end, and can't use the LLVM stack to return.
+pub struct LFunction<'cxt> {
+    /// The arity of the function as written in Durin.
+    /// So the LLVM unknown version has arity `arity+1`, and the known version has arity `arity-(if stack_enabled then 1 else 0)+env.len()`.
+    pub arity: u32,
+    pub known: FunctionValue<'cxt>,
+    pub unknown: FunctionValue<'cxt>,
+    pub env: Vec<(Val, BasicTypeEnum<'cxt>)>,
+    pub stack_enabled: bool,
+    pub blocks: VecDeque<(Val, Function)>,
+    pub cont: Option<Val>,
+}
+
 pub struct Cxt<'cxt> {
     pub cxt: &'cxt Context,
     pub builder: Builder<'cxt>,
     pub module: Module<'cxt>,
     pub machine: TargetMachine,
     pub blocks: HashMap<Val, (BasicBlock<'cxt>, Vec<PointerValue<'cxt>>)>,
+    pub functions: HashMap<Val, LFunction<'cxt>>,
+    pub upvalues: HashMap<Val, BasicValueEnum<'cxt>>,
     /// Keeps track of the return continuation, if we're in a stack-enabled function
     pub cont: Option<Val>,
 }
@@ -32,6 +52,8 @@ impl<'cxt> Cxt<'cxt> {
             module,
             machine,
             blocks: HashMap::new(),
+            functions: HashMap::new(),
+            upvalues: HashMap::new(),
             cont: None,
         }
     }
@@ -63,7 +85,7 @@ impl crate::ir::Module {
     fn stack_enabled(&self) -> HashSet<Val> {
         let mut modes = HashMap::new();
         for val in self.vals() {
-            if let Node::Fun(Function { params, .. }) = self.get(val).unwrap() {
+            if let Node::Fun(Function { params, callee, .. }) = self.get(val).unwrap() {
                 if let Node::FunType(_) = *self.get(*params.last().unwrap()).unwrap() {
                     let cont_n = params.len() as u8 - 1;
                     let &cont_p = self
@@ -87,6 +109,10 @@ impl crate::ir::Module {
                             _ => false,
                         }
                     });
+                    // Also, we can only call functions that are guaranteed to return
+                    if !reqs.contains(callee) {
+                        reqs.push(*callee);
+                    }
 
                     if !good {
                         modes.insert(val, FunMode::NoStack);
@@ -117,15 +143,16 @@ impl crate::ir::Module {
                 if v == val {
                     continue;
                 }
-                match modes.get(&v).unwrap() {
-                    FunMode::YesStack => {
+                match modes.get(&v) {
+                    Some(FunMode::YesStack) => {
                         // We won't add it to nreqs, since we know it's good
                     }
-                    FunMode::NoStack => {
+                    // If it's None, it means it's an unknown function, which could be NoStack
+                    Some(FunMode::NoStack) | None => {
                         okay = false;
                         break;
                     }
-                    FunMode::Maybe(_) => {
+                    Some(FunMode::Maybe(_)) => {
                         nreqs.push(v);
                     }
                 }
@@ -198,18 +225,62 @@ impl crate::ir::Module {
     }
 
     fn gen_value<'cxt>(&self, val: Val, cxt: &Cxt<'cxt>) -> BasicValueEnum<'cxt> {
+        if let Some(&v) = cxt.upvalues.get(&val) {
+            return v;
+        }
         match self.get(val).unwrap() {
-            Node::Fun(_) => cxt
-                .module
-                .get_function(
-                    &self
-                        .name(val)
-                        .cloned()
-                        .unwrap_or_else(|| format!("fun${}", val.num())),
-                )
-                .unwrap()
-                .as_global_value()
-                .as_basic_value_enum(),
+            Node::Fun(_) => {
+                // Create a closure
+                let LFunction {
+                    arity,
+                    unknown,
+                    env,
+                    ..
+                } = cxt.functions.get(&val).unwrap();
+
+                // Create the environment struct, then store it in an alloca and bitcast the pointer to i8*
+                // TODO heap allocation instead of alloca
+                let env_tys: Vec<_> = env.iter().map(|&(_, ty)| ty).collect();
+                let mut env_val = cxt.cxt.struct_type(&env_tys, false).get_undef();
+                for (i, &(val, _)) in env.iter().enumerate() {
+                    // TODO reuse values (all over the codebase but especially here)
+                    let val = self.gen_value(val, cxt);
+                    env_val = cxt
+                        .builder
+                        .build_insert_value(env_val, val, i as u32, "env_insert")
+                        .unwrap()
+                        .into_struct_value();
+                }
+                let env_ptr = cxt
+                    .builder
+                    .build_alloca(cxt.cxt.struct_type(&env_tys, false), "env_ptr");
+                cxt.builder.build_store(env_ptr, env_val);
+                let env = cxt.builder.build_bitcast(env_ptr, cxt.any_ty(), "env");
+
+                // We use the unknown version of the function, which takes one environment parameter and all of type i8* (any)
+                let arg_tys: Vec<_> = (0..arity + 1).map(|_| cxt.any_ty()).collect();
+                let fun_ty = cxt
+                    .cxt
+                    .void_type()
+                    .fn_type(&arg_tys, false)
+                    .ptr_type(AddressSpace::Generic)
+                    .as_basic_type_enum();
+
+                let cl = cxt
+                    .cxt
+                    .struct_type(&[cxt.any_ty(), fun_ty], false)
+                    .get_undef();
+                let cl = cxt
+                    .builder
+                    .build_insert_value(cl, env, 0, "cl_partial")
+                    .unwrap();
+                let cl = cxt
+                    .builder
+                    .build_insert_value(cl, unknown.as_global_value().as_pointer_value(), 1, "cl")
+                    .unwrap();
+
+                cl.as_basic_value_enum()
+            }
             Node::FunType(_) => {
                 let ty = cxt.cxt.struct_type(&[cxt.any_ty(), cxt.any_ty()], false);
                 ty.size_of().unwrap().as_basic_value_enum()
@@ -267,15 +338,16 @@ impl crate::ir::Module {
         }
     }
 
-    pub fn codegen(&self, cxt: &mut Cxt) {
+    pub fn codegen<'cxt>(&self, cxt: &mut Cxt<'cxt>) {
         let stack_enabled = self.stack_enabled();
 
         // Codegen all functions visible from the top level, and everything reachable from there
-        let mut to_gen: Vec<Val> = self.top_level().collect();
+        let mut to_gen: Vec<(Vec<(Val, Val)>, Val)> =
+            self.top_level().map(|x| (Vec::new(), x)).collect();
         // This explicit for loop allows us to add to to_gen in the body of the loop
         let mut i = 0;
         while i < to_gen.len() {
-            let val = to_gen[i];
+            let (env, val) = to_gen[i].clone();
             i += 1;
 
             if let Node::Fun(fun) = self.get(val).unwrap() {
@@ -328,8 +400,27 @@ impl crate::ir::Module {
                                     },
                                 ))
                             } else {
-                                if !to_gen.contains(&x) {
-                                    to_gen.push(x);
+                                if !to_gen.iter().any(|(_, y)| *y == x) {
+                                    // This function is in `val`'s scope, so it must use its parameters
+                                    let env = fun
+                                        .params
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, &ty)| {
+                                            (
+                                                self.uses(val)
+                                                    .iter()
+                                                    .find(|&&x| {
+                                                        *self.get(x).unwrap()
+                                                            == Node::Param(val, i as u8)
+                                                    })
+                                                    .copied()
+                                                    .unwrap(),
+                                                ty,
+                                            )
+                                        })
+                                        .collect();
+                                    to_gen.push((env, x));
                                 }
                                 None
                             }
@@ -343,16 +434,30 @@ impl crate::ir::Module {
                 // The first basic block is the actual function body
                 blocks.push_front((val, fun.clone()));
 
-                let ty = if stack_enabled.contains(&val) {
-                    cxt.cont = self
-                        .uses(val)
+                let stack_enabled = stack_enabled.contains(&val);
+                let args: Vec<_> = env
+                    .iter()
+                    .map(|(_, ty)| ty)
+                    .chain(if stack_enabled {
+                        &fun.params[0..fun.params.len() - 1]
+                    } else {
+                        &fun.params
+                    })
+                    .map(|&x| self.llvm_ty(x, cxt))
+                    .collect();
+                let cont = if stack_enabled {
+                    self.uses(val)
                         .iter()
                         .find(|&&x| match self.get(x).unwrap() {
                             Node::Param(_, i) => *i as usize == fun.params.len() - 1,
                             _ => false,
                         })
-                        .copied();
+                        .copied()
+                } else {
+                    None
+                };
 
+                let known_ty = if stack_enabled {
                     let &ret_ty = fun.params.last().unwrap();
                     let ret_ty = match self.get(ret_ty).unwrap() {
                         Node::FunType(v) => {
@@ -365,17 +470,8 @@ impl crate::ir::Module {
                         _ => unreachable!(),
                     };
                     let ret_ty = self.llvm_ty(ret_ty, cxt);
-                    let args: Vec<_> = fun
-                        .params
-                        .iter()
-                        .take(fun.params.len() - 1)
-                        .map(|&x| self.llvm_ty(x, cxt))
-                        .collect();
                     ret_ty.fn_type(&args, false)
                 } else {
-                    cxt.cont = None;
-
-                    let args: Vec<_> = fun.params.iter().map(|&x| self.llvm_ty(x, cxt)).collect();
                     cxt.cxt.void_type().fn_type(&args, false)
                 };
 
@@ -383,72 +479,205 @@ impl crate::ir::Module {
                     .name(val)
                     .cloned()
                     .unwrap_or_else(|| format!("fun${}", val.num()));
-                let fun = cxt.module.add_function(&name, ty, None);
-                fun.set_call_conventions(TAILCC);
+                let known = cxt.module.add_function(&name, known_ty, None);
+                known.set_call_conventions(TAILCC);
 
-                let entry = cxt.cxt.append_basic_block(fun, "entry");
-                cxt.builder.position_at_end(entry);
-
-                // Remove any basic blocks we generated last time, they're no longer accessible
-                cxt.blocks = HashMap::new();
-
-                // Declare all blocks and their parameters first
-                // Block parameters are stored in allocas, which will be removed with mem2reg
-                for (bval, bfun) in &blocks {
-                    let name = self
-                        .name(*bval)
-                        .cloned()
-                        .unwrap_or_else(|| format!("block${}", val.num()));
-                    let block = cxt.cxt.append_basic_block(fun, &name);
-                    let mut params = Vec::new();
-                    for &ty in &bfun.params {
-                        let ty = self.llvm_ty(ty, cxt);
-                        let name = self.param_name(*bval, i as u8);
-                        let param = cxt.builder.build_alloca(ty, &name);
-                        params.push(param);
-                    }
-                    cxt.blocks.insert(*bval, (block, params));
-                }
-
-                // We store the function parameters in the parameter slots of the entry block
-                let (first_block, _) = &blocks[0];
-                for (&ptr, value) in cxt
-                    .blocks
-                    .get(first_block)
-                    .unwrap()
-                    .1
+                let uargs: Vec<_> = fun
+                    .params
                     .iter()
-                    .zip(fun.get_params())
-                {
-                    cxt.builder.build_store(ptr, value);
-                }
-                cxt.builder
-                    .build_unconditional_branch(cxt.blocks.get(first_block).unwrap().0);
+                    .map(|_| cxt.any_ty())
+                    .chain(std::iter::once(cxt.any_ty()))
+                    .collect();
+                let unknown_ty = cxt.cxt.void_type().fn_type(&uargs, false);
+                let uname = format!("u${}", name);
+                let unknown = cxt.module.add_function(&uname, unknown_ty, None);
+                unknown.set_call_conventions(TAILCC);
 
-                // Now actually generate the blocks' code
-                for (bval, bfun) in blocks {
-                    let (block, _) = cxt.blocks.get(&bval).unwrap();
-                    cxt.builder.position_at_end(*block);
+                // TODO only include live values in `env`
+                let env = args[0..env.len()]
+                    .iter()
+                    .zip(env)
+                    .map(|(&ty, (val, _))| (val, ty))
+                    .collect();
 
-                    let args: Vec<_> = bfun
-                        .call_args
-                        .iter()
-                        .take(if bfun.call_args.is_empty() {
-                            0
-                        } else {
-                            bfun.call_args.len() - 1
-                        })
-                        .map(|x| self.gen_value(*x, cxt))
-                        .collect();
-                    self.gen_call(
-                        bfun.callee,
-                        &stack_enabled,
-                        args,
-                        bfun.call_args.last().copied(),
-                        cxt,
-                    );
-                }
+                cxt.functions.insert(
+                    val,
+                    LFunction {
+                        arity: fun.params.len() as u32,
+                        known,
+                        unknown,
+                        env,
+                        blocks,
+                        cont,
+                        stack_enabled,
+                    },
+                );
             }
+        }
+        for (
+            val,
+            LFunction {
+                unknown,
+                known,
+                blocks,
+                cont,
+                env,
+                ..
+            },
+        ) in &cxt.functions
+        {
+            // First generate the unknown version, which just delegates to the known version
+            {
+                let uentry = cxt.cxt.append_basic_block(*unknown, "entry");
+                cxt.builder.position_at_end(uentry);
+
+                // Unpack environment
+                let &env_ptr = unknown.get_params().last().unwrap();
+                // TODO wait, what about dependently sized types?
+                let env_tys: Vec<_> = env.iter().map(|&(_, ty)| ty).collect();
+                let env_ty = cxt.cxt.struct_type(&env_tys, false);
+                let env_ptr = cxt.builder.build_bitcast(
+                    env_ptr,
+                    env_ty.ptr_type(AddressSpace::Generic),
+                    "env_ptr",
+                );
+                let env_val = cxt
+                    .builder
+                    .build_load(env_ptr.into_pointer_value(), "env")
+                    .into_struct_value();
+
+                // Add environment slots to the context
+                cxt.upvalues = HashMap::new();
+                for (i, &(val, _)) in env.iter().enumerate() {
+                    let value = cxt
+                        .builder
+                        .build_extract_value(
+                            env_val,
+                            i as u32,
+                            self.name(val).map(|x| x as &str).unwrap_or("upvalue"),
+                        )
+                        .unwrap();
+                    cxt.upvalues.insert(val, value);
+                }
+
+                // Call function
+                let mut args: Vec<BasicValueEnum> = blocks[0]
+                    .1
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &ty)| {
+                        self.from_any(unknown.get_params()[i].into_pointer_value(), ty, cxt)
+                    })
+                    .collect();
+                // `gen_call` takes the continuation as a Val, not a BasicValueEnum; so, we use an unused Val slot and stick the BasicValueEnum in the upvalues map
+                // Thing is, we can't call `self.reserve()` because we don't want to take `self` as mutable
+                // But we only ever need one of these at once, so we use `Val::INVALID`, which exists for this purpose
+                let cont = Val::INVALID;
+                cxt.upvalues.insert(cont, args.pop().unwrap());
+                self.gen_call(*val, args, Some(cont), &cxt);
+            }
+
+            let &fun = known;
+            cxt.cont = *cont;
+
+            let entry = cxt.cxt.append_basic_block(fun, "entry");
+            cxt.builder.position_at_end(entry);
+
+            // Remove any basic blocks and upvalues we generated last time, they're no longer accessible
+            cxt.blocks = HashMap::new();
+            cxt.upvalues = HashMap::new();
+
+            // Add closed-over upvalues to the context
+            for ((val, _ty), param) in env.iter().zip(fun.get_params()) {
+                cxt.upvalues.insert(*val, param);
+            }
+
+            // Declare all blocks and their parameters first
+            // Block parameters are stored in allocas, which will be removed with mem2reg
+            for (bval, bfun) in blocks {
+                let name = self
+                    .name(*bval)
+                    .cloned()
+                    .unwrap_or_else(|| format!("block${}", val.num()));
+                let block = cxt.cxt.append_basic_block(fun, &name);
+                let mut params = Vec::new();
+                for &ty in &bfun.params {
+                    let ty = self.llvm_ty(ty, cxt);
+                    let name = self.param_name(*bval, i as u8);
+                    let param = cxt.builder.build_alloca(ty, &name);
+                    params.push(param);
+                }
+                cxt.blocks.insert(*bval, (block, params));
+            }
+
+            // We store the function parameters in the parameter slots of the entry block
+            let (first_block, _) = &blocks[0];
+            for (&ptr, value) in cxt
+                .blocks
+                .get(first_block)
+                .unwrap()
+                .1
+                .iter()
+                .zip(fun.get_params().into_iter().skip(env.len()))
+            {
+                cxt.builder.build_store(ptr, value);
+            }
+            cxt.builder
+                .build_unconditional_branch(cxt.blocks.get(first_block).unwrap().0);
+
+            // Now actually generate the blocks' code
+            for (bval, bfun) in blocks {
+                let (block, _) = cxt.blocks.get(&bval).unwrap();
+                cxt.builder.position_at_end(*block);
+
+                let args: Vec<_> = bfun
+                    .call_args
+                    .iter()
+                    .take(if bfun.call_args.is_empty() {
+                        0
+                    } else {
+                        bfun.call_args.len() - 1
+                    })
+                    .map(|x| self.gen_value(*x, cxt))
+                    .collect();
+                self.gen_call(bfun.callee, args, bfun.call_args.last().copied(), cxt);
+            }
+        }
+    }
+
+    fn from_any<'cxt>(
+        &self,
+        any: PointerValue<'cxt>,
+        ty: Val,
+        cxt: &Cxt<'cxt>,
+    ) -> BasicValueEnum<'cxt> {
+        match self.get(ty).unwrap() {
+            Node::Const(c) => match c {
+                crate::ir::Constant::TypeType => cxt
+                    .builder
+                    .build_ptr_to_int(any, cxt.size_ty(), "cast")
+                    .as_basic_value_enum(),
+                crate::ir::Constant::IntType(w) => cxt
+                    .builder
+                    .build_ptr_to_int(any, cxt.cxt.custom_width_int_type(w.bits()), "cast")
+                    .as_basic_value_enum(),
+                crate::ir::Constant::Int(_, _) => unreachable!("not a type"),
+            },
+            Node::FunType(_) => {
+                let ptr = cxt
+                    .builder
+                    .build_bitcast(
+                        any,
+                        self.llvm_ty(ty, cxt).ptr_type(AddressSpace::Generic),
+                        "ptr",
+                    )
+                    .into_pointer_value();
+                cxt.builder.build_load(ptr, "fun")
+            }
+            // Leave as an "any" since it's polymorphic
+            Node::Param(_, _) => any.as_basic_value_enum(),
+            Node::BinOp(_, _, _) | Node::Fun(_) => unreachable!("not a type"),
         }
     }
 
@@ -472,7 +701,9 @@ impl crate::ir::Module {
                 // TODO heap allocate instead
                 let ptr = cxt.builder.build_alloca(ty, "cast_slot");
                 cxt.builder.build_store(ptr, val);
-                ptr
+                cxt.builder
+                    .build_bitcast(ptr, cxt.any_ty(), "casted")
+                    .into_pointer_value()
             }
             // Already as an "any" since it's polymorphic
             Node::Param(_, _) => val.into_pointer_value(),
@@ -483,10 +714,9 @@ impl crate::ir::Module {
     fn gen_call<'cxt>(
         &self,
         callee: Val,
-        stack_enabled: &HashSet<Val>,
         mut args: Vec<BasicValueEnum<'cxt>>,
         cont: Option<Val>,
-        cxt: &mut Cxt<'cxt>,
+        cxt: &Cxt<'cxt>,
     ) {
         // If we're calling the return continuation, emit a return instruction
         if cxt.cont == Some(callee) {
@@ -508,20 +738,30 @@ impl crate::ir::Module {
         // Otherwise, we're actually calling a function
         } else {
             // The mechanism depends on whether it's a known or unknown call
-            match self.get(callee).unwrap() {
-                // Known call
-                Node::Fun(_) => {
-                    if stack_enabled.contains(&callee) {
-                        let val = self.gen_value(callee, cxt);
+            match cxt.functions.get(&callee) {
+                Some(LFunction {
+                    known,
+                    env,
+                    stack_enabled,
+                    ..
+                }) => {
+                    // Known call
+
+                    // Prepend upvalues to the argument list
+                    let mut args: Vec<_> = env
+                        .iter()
+                        .map(|&(val, _)| self.gen_value(val, cxt))
+                        .chain(args)
+                        .collect();
+
+                    // The actual call depends on whether we're using the LLVM stack or not
+                    if *stack_enabled {
                         let cont = cont.unwrap();
-                        let call =
-                            cxt.builder
-                                .build_call(val.into_pointer_value(), &args, "stack_call");
+                        let call = cxt.builder.build_call(*known, &args, "stack_call");
                         call.set_tail_call(true);
                         call.set_call_convention(TAILCC);
                         self.gen_call(
                             cont,
-                            stack_enabled,
                             vec![call.try_as_basic_value().left().unwrap()],
                             None,
                             cxt,
@@ -530,21 +770,18 @@ impl crate::ir::Module {
                         if let Some(k) = cont {
                             args.push(self.gen_value(k, cxt));
                         }
-                        let val = self.gen_value(callee, cxt);
-                        let call = cxt
-                            .builder
-                            .build_call(val.into_pointer_value(), &args, "call");
+                        let call = cxt.builder.build_call(*known, &args, "call");
                         call.set_tail_call(true);
                         call.set_call_convention(TAILCC);
                         cxt.builder.build_return(None);
                     }
                 }
-                // Unknown call
-                x => {
+                None => {
+                    // Unknown call
                     if let Some(k) = cont {
                         args.push(self.gen_value(k, cxt));
                     }
-                    let tys = match x.ty(self).inline(self) {
+                    let tys = match self.get(callee).unwrap().ty(self).inline(self) {
                         Ty::FunType(tys) => tys,
                         _ => unreachable!(),
                     };
