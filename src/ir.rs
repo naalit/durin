@@ -1,4 +1,5 @@
 use smallvec::*;
+use std::collections::HashSet;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Val(usize);
@@ -130,14 +131,25 @@ impl Module {
             .filter(move |x| self.get(*x).is_some())
     }
 
-    /// Returns a list of everything that depends on `v`, transitively.
+    /// Returns a list of everything that depends on `v`'s parameters (and so must be nested in `v`), transitively.
+    /// `v` must be a function.
     pub fn scope(&self, v: Val) -> Vec<Val> {
-        use std::collections::HashSet;
+        match self.get(v).unwrap() {
+            Node::Fun(_) => (),
+            _ => panic!("Called scope() on non-function"),
+        };
 
-        let mut vec = vec![v];
+        let mut vec = Vec::new();
         let mut ix = 0;
         let mut seen = HashSet::new();
+        // Don't include the function itself in the scope
         seen.insert(v);
+        for &i in self.uses(v) {
+            if let Node::Param(_, _) = self.get(i).unwrap() {
+                vec.push(i);
+                seen.insert(i);
+            }
+        }
 
         // Instead of using a stack, we use one vec that we go through in order, since we're going to return it too
         while let Some(&v) = vec.get(ix) {

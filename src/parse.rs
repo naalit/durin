@@ -84,6 +84,11 @@ impl<'a> Parser<'a> {
         while let Some(c) = self.peek() {
             if c.is_whitespace() {
                 self.next();
+            } else if c == '#' {
+                // Skip line comments
+                while self.peek() != Some('\n') {
+                    self.next();
+                }
             } else {
                 break;
             }
