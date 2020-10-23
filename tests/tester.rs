@@ -13,31 +13,10 @@ macro_rules! verify {
                 buf
             };
             let m = durin::parse::Parser::new(&input).parse();
-            let triple = inkwell::targets::TargetMachine::get_default_triple();
-            inkwell::targets::Target::initialize_native(
-                &inkwell::targets::InitializationConfig::default(),
-            )
-            .unwrap();
-            let machine = inkwell::targets::Target::from_triple(&triple)
-                .unwrap()
-                .create_target_machine(
-                    &triple,
-                    inkwell::targets::TargetMachine::get_host_cpu_name()
-                        .to_str()
-                        .unwrap(),
-                    inkwell::targets::TargetMachine::get_host_cpu_features()
-                        .to_str()
-                        .unwrap(),
-                    inkwell::OptimizationLevel::None,
-                    inkwell::targets::RelocMode::Default,
-                    inkwell::targets::CodeModel::Default,
-                )
-                .unwrap();
-            let cxt = inkwell::context::Context::create();
-            let mut cxt = durin::backend::Cxt::new(&cxt, machine);
-            m.codegen(&mut cxt);
-            println!("{}", cxt.module.print_to_string().to_str().unwrap());
-            cxt.module.verify().unwrap();
+            let backend = durin::backend::Backend::native();
+            let l = backend.codegen_module(&m);
+            println!("{}", l.print_to_string().to_str().unwrap());
+            l.verify().unwrap();
         }
     };
 }

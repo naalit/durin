@@ -13,6 +13,53 @@ pub const TAILCC: u32 = 18;
 pub const CCC: u32 = 0;
 pub const FASTCC: u32 = 8;
 
+/// An owning wrapper around the Inkwell context
+pub struct Backend {
+    pub cxt: Context,
+    pub machine: TargetMachine,
+}
+impl Backend {
+    /// Creates a new Backend object configured to target the host machine.
+    pub fn native() -> Self {
+        let triple = inkwell::targets::TargetMachine::get_default_triple();
+        inkwell::targets::Target::initialize_native(
+            &inkwell::targets::InitializationConfig::default(),
+        )
+        .unwrap();
+        let machine = inkwell::targets::Target::from_triple(&triple)
+            .unwrap()
+            .create_target_machine(
+                &triple,
+                inkwell::targets::TargetMachine::get_host_cpu_name()
+                    .to_str()
+                    .unwrap(),
+                inkwell::targets::TargetMachine::get_host_cpu_features()
+                    .to_str()
+                    .unwrap(),
+                inkwell::OptimizationLevel::None,
+                inkwell::targets::RelocMode::Default,
+                inkwell::targets::CodeModel::Default,
+            )
+            .unwrap();
+        let cxt = inkwell::context::Context::create();
+        Backend {
+            cxt,
+            machine,
+        }
+    }
+
+    pub fn codegen_module(&self, m: &crate::ir::Module) -> inkwell::module::Module {
+        let mut cxt = self.cxt();
+        m.codegen(&mut cxt);
+        cxt.module
+    }
+
+    /// Creates a `Cxt` for code generation, which borrows the `Backend`.
+    pub fn cxt(&self) -> Cxt {
+        Cxt::new(&self.cxt, &self.machine)
+    }
+}
+
 /// Contains all the information needed to call or define a function.
 ///
 /// Each Durin function (that isn't a basic block) corresponds to two LLVM functions:
@@ -35,7 +82,7 @@ pub struct Cxt<'cxt> {
     pub cxt: &'cxt Context,
     pub builder: Builder<'cxt>,
     pub module: Module<'cxt>,
-    pub machine: TargetMachine,
+    pub machine: &'cxt TargetMachine,
     pub blocks: HashMap<Val, (BasicBlock<'cxt>, Vec<PointerValue<'cxt>>)>,
     pub functions: HashMap<Val, LFunction<'cxt>>,
     pub upvalues: HashMap<Val, BasicValueEnum<'cxt>>,
@@ -43,7 +90,7 @@ pub struct Cxt<'cxt> {
     pub cont: Option<Val>,
 }
 impl<'cxt> Cxt<'cxt> {
-    pub fn new(cxt: &'cxt Context, machine: TargetMachine) -> Self {
+    pub fn new(cxt: &'cxt Context, machine: &'cxt TargetMachine) -> Self {
         let module = cxt.create_module("main");
 
         Cxt {
