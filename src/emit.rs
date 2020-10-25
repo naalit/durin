@@ -7,15 +7,15 @@ impl<'a> Display for PrettyVal<'a> {
         let PrettyVal(m, v) = *self;
         match m.get(v).as_ref().unwrap() {
             Node::Const(c) => write!(f, "{}", c),
-            Node::FunType(v) => {
+            Node::FunType(params) => {
                 write!(f, "fun(")?;
                 let mut first = true;
-                for ty in v {
+                for (i, ty) in params.iter().enumerate() {
                     if !first {
                         first = false;
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", ty.pretty(m))?;
+                    write!(f, "{}: {}", m.param_name(v, i as u8), ty.pretty(m))?;
                 }
                 write!(f, ")")
             }

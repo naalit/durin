@@ -734,16 +734,15 @@ impl crate::ir::Module {
         ty: Val,
         cxt: &Cxt<'cxt>,
     ) -> PointerValue<'cxt> {
-        match self.get(ty).unwrap() {
-            Node::Const(c) => match c {
-                crate::ir::Constant::TypeType | crate::ir::Constant::IntType(_) => {
-                    let val = val.into_int_value();
-                    cxt.builder
-                        .build_int_to_ptr(val, cxt.any_ty().into_pointer_type(), "cast")
-                }
-                crate::ir::Constant::Int(_, _) => unreachable!("not a type"),
-            },
-            Node::FunType(_) => {
+        match val.get_type() {
+            BasicTypeEnum::IntType(_) => {
+                let val = val.into_int_value();
+                cxt.builder
+                    .build_int_to_ptr(val, cxt.any_ty().into_pointer_type(), "cast")
+            }
+            BasicTypeEnum::ArrayType(_)
+            | BasicTypeEnum::StructType(_)
+            | BasicTypeEnum::VectorType(_) => {
                 let ty = val.get_type();
                 // TODO heap allocate instead
                 let ptr = cxt.builder.build_alloca(ty, "cast_slot");
@@ -752,10 +751,32 @@ impl crate::ir::Module {
                     .build_bitcast(ptr, cxt.any_ty(), "casted")
                     .into_pointer_value()
             }
-            // Already as an "any" since it's polymorphic
-            Node::Param(_, _) => val.into_pointer_value(),
-            Node::BinOp(_, _, _) | Node::Fun(_) => unreachable!("not a type"),
+            BasicTypeEnum::PointerType(_) => val.into_pointer_value(),
+            BasicTypeEnum::FloatType(_) => unimplemented!(),
         }
+        // TODO do we really not need the type information?
+        // match self.get(ty).unwrap() {
+        //     Node::Const(c) => match c {
+        //         crate::ir::Constant::TypeType | crate::ir::Constant::IntType(_) => {
+        //             let val = val.into_int_value();
+        //             cxt.builder
+        //                 .build_int_to_ptr(val, cxt.any_ty().into_pointer_type(), "cast")
+        //         }
+        //         crate::ir::Constant::Int(_, _) => unreachable!("not a type"),
+        //     },
+        //     Node::FunType(_) => {
+        //         let ty = val.get_type();
+        //         // TODO heap allocate instead
+        //         let ptr = cxt.builder.build_alloca(ty, "cast_slot");
+        //         cxt.builder.build_store(ptr, val);
+        //         cxt.builder
+        //             .build_bitcast(ptr, cxt.any_ty(), "casted")
+        //             .into_pointer_value()
+        //     }
+        //     // Already as an "any" since it's polymorphic
+        //     Node::Param(_, _) => val.into_pointer_value(),
+        //     Node::BinOp(_, _, _) | Node::Fun(_) => unreachable!("not a type"),
+        // }
     }
 
     fn gen_call<'cxt>(

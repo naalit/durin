@@ -1,4 +1,4 @@
 # Testing creating closures and passing them around
-fun main (x: I32, r: fun(I32)) = one two;
-fun one (f: fun(I32)) = f x;
+fun main (x: I32, r: fun(_:I32)) = one two;
+fun one (f: fun(_:I32)) = f x;
 fun two (y: I32) = r y;

@@ -39,3 +39,4 @@ fn test_basic() {
 verify!(basic);
 verify!(ssa);
 verify!(closures);
+verify!(pi);

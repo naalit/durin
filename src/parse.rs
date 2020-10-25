@@ -168,7 +168,13 @@ impl<'a> Parser<'a> {
             self.skip_whitespace();
 
             let mut params = SmallVec::new();
+            let mut names = Vec::new();
             while !self.matches(")") {
+                let name = self.var();
+                self.skip_whitespace();
+                self.expect(":");
+                self.skip_whitespace();
+                names.push(name);
                 params.push(self.expr());
                 if self.matches(")") {
                     break;
@@ -177,7 +183,13 @@ impl<'a> Parser<'a> {
                     self.skip_whitespace();
                 }
             }
-            self.module.add(Node::FunType(params), None)
+            let t = self.module.add(Node::FunType(params), None);
+            for (i, x) in names.into_iter().enumerate() {
+                self.module.replace(x, Node::Param(t, i as u8));
+            }
+            t
+        } else if self.matches("Type") {
+            self.module.add(Node::Const(Constant::TypeType), None)
         } else if self.matches("I32") {
             self.module
                 .add(Node::Const(Constant::IntType(Width::W32)), None)

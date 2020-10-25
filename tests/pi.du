@@ -1,0 +1,2 @@
+# Do pi types work in Durin?
+fun f (x: fun(y: Type, z: y)) = x Type Type;

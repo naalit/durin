@@ -1,5 +1,5 @@
 
-fun f (x : I32, r : fun(I32)) = g a;
+fun f (x : I32, r : fun(_: I32)) = g a;
 
 fun g (y : I32) = r y;
 val a = (x + 2i32);
