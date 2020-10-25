@@ -66,6 +66,10 @@ impl Module {
         self.names.get(i.num()).map(|x| x.as_ref()).flatten()
     }
 
+    pub fn set_name(&mut self, i: Val, n: Option<String>) {
+        self.names[i.num()] = n;
+    }
+
     // TODO deduplicate constants, or just everything (implicit CSE)
     pub fn add(&mut self, x: Node, n: Option<String>) -> Val {
         let args = x.args();
