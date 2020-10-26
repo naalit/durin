@@ -42,10 +42,7 @@ impl Backend {
             )
             .unwrap();
         let cxt = inkwell::context::Context::create();
-        Backend {
-            cxt,
-            machine,
-        }
+        Backend { cxt, machine }
     }
 
     pub fn codegen_module(&self, m: &crate::ir::Module) -> inkwell::module::Module {

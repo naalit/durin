@@ -2,6 +2,7 @@ use smallvec::*;
 use std::collections::HashMap;
 
 pub mod backend;
+pub mod builder;
 mod emit;
 pub mod ir;
 pub mod parse;

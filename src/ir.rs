@@ -12,7 +12,7 @@ impl Val {
     pub const INVALID: Self = Val(usize::MAX);
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Slot {
     Full(Node),
     Reserved,
@@ -36,7 +36,7 @@ impl Slot {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Eq, PartialEq)]
 pub struct Module {
     pub nodes: Vec<Slot>,
     pub uses: Vec<Vec<Val>>,
@@ -120,7 +120,14 @@ impl Module {
             fn has_param(m: &Module, x: Val, not: Val) -> bool {
                 match m.get(x) {
                     None => true,
-                    Some(Node::Param(p, _)) => *p != not && if let Some(Node::Fun(_)) = m.get(*p) { true } else { false },
+                    Some(Node::Param(p, _)) => {
+                        *p != not
+                            && if let Some(Node::Fun(_)) = m.get(*p) {
+                                true
+                            } else {
+                                false
+                            }
+                    }
                     Some(Node::Fun(_)) if x != not => false,
                     Some(n) => n.args().iter().any(|x| has_param(m, *x, not)),
                 }
