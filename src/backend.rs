@@ -238,7 +238,9 @@ impl crate::ir::Module {
                 crate::ir::Constant::IntType(w) => {
                     cxt.cxt.custom_width_int_type(w.bits()).as_basic_type_enum()
                 }
-                crate::ir::Constant::Int(_, _) => unreachable!("not a type"),
+                crate::ir::Constant::Int(_, _) | crate::ir::Constant::Stop => {
+                    unreachable!("not a type")
+                }
             },
             // A closure
             Node::FunType(v) => {
@@ -346,6 +348,7 @@ impl crate::ir::Module {
                     .custom_width_int_type(w.bits())
                     .const_int(*val as u64, false)
                     .as_basic_value_enum(),
+                crate::ir::Constant::Stop => panic!("stop isn't a first-class function!"),
             },
             Node::BinOp(op, a, b) => {
                 let a = self.gen_value(*a, cxt);
@@ -706,7 +709,9 @@ impl crate::ir::Module {
                     .builder
                     .build_ptr_to_int(any, cxt.cxt.custom_width_int_type(w.bits()), "cast")
                     .as_basic_value_enum(),
-                crate::ir::Constant::Int(_, _) => unreachable!("not a type"),
+                crate::ir::Constant::Int(_, _) | crate::ir::Constant::Stop => {
+                    unreachable!("not a type")
+                }
             },
             Node::FunType(_) => {
                 let ptr = cxt
@@ -800,6 +805,9 @@ impl crate::ir::Module {
                 cxt.builder.build_store(ptr, value);
             }
             cxt.builder.build_unconditional_branch(*target);
+        // If we're stopping, return void
+        } else if let Some(Node::Const(crate::ir::Constant::Stop)) = self.get(callee) {
+            cxt.builder.build_return(None);
         // Otherwise, we're actually calling a function
         } else {
             // The mechanism depends on whether it's a known or unknown call

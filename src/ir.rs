@@ -19,6 +19,14 @@ pub enum Slot {
     Open,
 }
 impl Slot {
+    pub fn to_option_mut(&mut self) -> Option<&mut Node> {
+        if let Slot::Full(n) = self {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
     pub fn to_option(&self) -> Option<&Node> {
         if let Slot::Full(n) = self {
             Some(n)
@@ -56,6 +64,13 @@ impl Module {
 
     pub fn get(&self, i: Val) -> Option<&Node> {
         self.nodes.get(i.num()).map(|x| x.to_option()).flatten()
+    }
+
+    pub fn get_mut(&mut self, i: Val) -> Option<&mut Node> {
+        self.nodes
+            .get_mut(i.num())
+            .map(|x| x.to_option_mut())
+            .flatten()
     }
 
     pub fn uses(&self, i: Val) -> &Vec<Val> {
@@ -246,6 +261,7 @@ impl Node {
             Node::Const(c) => match c {
                 Constant::TypeType | Constant::IntType(_) => Ty::Const(Constant::TypeType),
                 Constant::Int(w, _) => Ty::Const(Constant::IntType(*w)),
+                Constant::Stop => Ty::FunType(SmallVec::new()),
             },
             Node::BinOp(BinOp::IEq, _, _) => Ty::Const(Constant::IntType(Width::W1)),
             Node::BinOp(_, a, _) => m.get(*a).unwrap().clone().ty(m),
@@ -285,6 +301,7 @@ impl Width {
 /// Types are generally constants
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Constant {
+    Stop,
     TypeType,
     IntType(Width),
     Int(Width, i64),
@@ -305,6 +322,7 @@ mod display {
     impl std::fmt::Display for Constant {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             match self {
+                Constant::Stop => write!(f, "stop"),
                 Constant::TypeType => write!(f, "Type"),
                 Constant::IntType(w) => write!(f, "I{}", w),
                 Constant::Int(w, i) => write!(f, "{}i{}", i, w),

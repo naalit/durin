@@ -25,6 +25,19 @@ impl<'m> Builder<'m> {
         }
     }
 
+    // TODO: should this just be a Drop impl?
+    pub fn finish(&mut self) {
+        let stop = self.module.add(Node::Const(Constant::Stop), None);
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee: stop,
+                call_args: smallvec![],
+            }),
+        )
+    }
+
     pub fn call(&mut self, f: Val, x: Val, ret_ty: Val) -> Val {
         let cont = self.module.reserve(None);
         self.module.replace(
@@ -72,18 +85,32 @@ impl<'m> Builder<'m> {
     }
 
     /// Returns the parameter value
-    pub fn push_fun(&mut self, param: Option<String>, param_ty: Val, ret_ty: Val) -> Val {
+    pub fn push_fun(&mut self, param: Option<String>, param_ty: Val) -> Val {
         let fun = self.module.reserve(None);
         let cont = self.module.add(Node::Param(fun, 1), None);
         self.funs.push((fun, self.block, self.params.clone(), cont));
         self.block = fun;
-        let cont_ty = self.module.add(Node::FunType(smallvec![ret_ty]), None);
-        self.params = vec![param_ty, cont_ty];
+        // Skip adding the continuation parameter and add it later, since we might not know the return type yet
+        self.params = vec![param_ty];
         self.module.add(Node::Param(fun, 0), param)
     }
 
-    pub fn pop_fun(&mut self, ret: Val) -> Val {
+    pub fn pop_fun(&mut self, ret: Val, ret_ty: Val) -> Val {
         let (fun, block, params, cont) = self.funs.pop().unwrap();
+
+        // Add the continuation parameter to the function
+        let cont_ty = self.module.add(Node::FunType(smallvec![ret_ty]), None);
+        match self.module.get_mut(fun) {
+            Some(Node::Fun(f)) => {
+                f.params.push(cont_ty);
+            }
+            // The function returns a value directly, so we'll just add the continuation parameter to the function node we're making now
+            None => {
+                self.params.push(cont_ty);
+            }
+            _ => unreachable!(),
+        }
+
         // We don't use self.call since we don't add the cont parameter here
         self.module.replace(
             self.block,
