@@ -11,3 +11,6 @@ fun else () = ifcase 1 x then2 else2;
 fun then2 (z : I32) = cont z;
 # TODO add `unreachable` instruction
 fun else2 () = cont 184i32;
+
+# `t:i x` makes a value of a sum type
+fun make_adt (k : fun (_:I32)) = adt_fun (((I32, I32) | I32):0 { 3i32, 4i32 }) k;

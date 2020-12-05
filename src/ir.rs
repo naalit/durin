@@ -206,6 +206,9 @@ pub enum Node {
     IfCase(usize, Val),
     /// Projecting a numbered member of a product type
     Proj(Val, usize),
+    /// Injecting a numbered member of a sum type (the type is the first argument)
+    Inj(Val, usize, Val),
+    Product(Val, SmallVec<[Val; 3]>),
     /// The `Val` should point to a function
     Param(Val, u8),
     Const(Constant),
@@ -224,9 +227,10 @@ impl Node {
                 .copied()
                 .chain(std::iter::once(*callee))
                 .collect(),
+            Node::Product(ty, v) => v.iter().copied().chain(std::iter::once(*ty)).collect(),
             Node::FunType(v) | Node::ProdType(v) | Node::SumType(v) => v.clone(),
             Node::Param(f, _) => smallvec![*f],
-            Node::BinOp(_, a, b) => smallvec![*a, *b],
+            Node::BinOp(_, a, b) | Node::Inj(a, _, b) => smallvec![*a, *b],
             Node::Const(_) => SmallVec::new(),
             Node::IfCase(_, x) | Node::Proj(x, _) => smallvec![*x],
         }
@@ -238,6 +242,7 @@ impl Node {
             Node::FunType(_) | Node::ProdType(_) | Node::SumType(_) => {
                 m.add(Node::Const(Constant::TypeType), None)
             }
+            Node::Product(ty, _) => *ty,
             Node::Param(f, i) => {
                 if let Node::Fun(f) = m.get(*f).unwrap() {
                     f.params[*i as usize]
@@ -267,6 +272,7 @@ impl Node {
                 Node::ProdType(v) => v[*i],
                 _ => unreachable!(),
             },
+            Node::Inj(t, _, _) => *t,
         }
     }
 }

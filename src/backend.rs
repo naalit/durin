@@ -244,7 +244,12 @@ impl crate::ir::Module {
             Node::ProdType(v) => v.iter().map(|&x| self.static_size(x, cxt)).sum(),
             Node::SumType(v) => v.iter().map(|&x| self.static_size(x, cxt)).max().unwrap(),
             Node::Param(_, _) => cxt.size_ty().get_bit_width() as u64 / 4,
-            Node::Fun(_) | Node::BinOp(_, _, _) | Node::IfCase(_, _) | Node::Proj(_, _) => {
+            Node::Fun(_)
+            | Node::BinOp(_, _, _)
+            | Node::IfCase(_, _)
+            | Node::Proj(_, _)
+            | Node::Inj(_, _, _)
+            | Node::Product(_, _) => {
                 unreachable!("not a type")
             }
         }
@@ -304,7 +309,12 @@ impl crate::ir::Module {
             }
             // Polymorphic
             Node::Param(_, _) => cxt.any_ty(),
-            Node::Fun(_) | Node::BinOp(_, _, _) | Node::IfCase(_, _) | Node::Proj(_, _) => {
+            Node::Fun(_)
+            | Node::BinOp(_, _, _)
+            | Node::IfCase(_, _)
+            | Node::Proj(_, _)
+            | Node::Inj(_, _, _)
+            | Node::Product(_, _) => {
                 unreachable!("not a type")
             }
         }
@@ -383,6 +393,53 @@ impl crate::ir::Module {
                 cxt.builder
                     .build_extract_value(x, *i as u32, "project")
                     .unwrap()
+            }
+            Node::Inj(ty, i, payload) => {
+                let payload = self.gen_value(*payload, cxt);
+                let payload_ptr = cxt.builder.build_alloca(payload.get_type(), "payload.ptr");
+                cxt.builder.build_store(payload_ptr, payload);
+
+                let ty = self.llvm_ty(*ty, cxt).into_struct_type();
+                let payload_ty = ty.get_field_type_at_index(1).unwrap();
+                let payload_ptr = cxt
+                    .builder
+                    .build_bitcast(
+                        payload_ptr,
+                        payload_ty.ptr_type(AddressSpace::Generic),
+                        "payload.ptr.casted",
+                    )
+                    .into_pointer_value();
+                // This load can go past the alloca, but I don't think that causes any problems because we don't look at it.
+                // TODO: We might want a larger alloca if this is actually undefined behaviour.
+                let payload = cxt.builder.build_load(payload_ptr, "payload.casted");
+
+                let tag = ty
+                    .get_field_type_at_index(0)
+                    .unwrap()
+                    .into_int_type()
+                    .const_int(*i as u64, false)
+                    .as_basic_value_enum();
+                let agg = cxt
+                    .builder
+                    .build_insert_value(ty.get_undef(), tag, 0, "union.tag")
+                    .unwrap();
+                let agg = cxt
+                    .builder
+                    .build_insert_value(agg, payload, 1, "union")
+                    .unwrap();
+                agg.as_basic_value_enum()
+            }
+            Node::Product(ty, v) => {
+                let ty = self.llvm_ty(*ty, cxt).into_struct_type();
+                let mut agg = ty.get_undef().as_aggregate_value_enum();
+                for (i, x) in v.into_iter().enumerate() {
+                    let x = self.gen_value(*x, cxt);
+                    agg = cxt
+                        .builder
+                        .build_insert_value(agg, x, i as u32, "product")
+                        .unwrap();
+                }
+                agg.as_basic_value_enum()
             }
             Node::IfCase(_, _) => panic!("`ifcase _ _` isn't a first-class function!"),
             Node::Param(f, i) => {
@@ -840,7 +897,12 @@ impl crate::ir::Module {
             // Leave as an "any" since it's polymorphic
             Node::Param(_, _) => any.as_basic_value_enum(),
             // TODO Proj should be allowed as a type
-            Node::BinOp(_, _, _) | Node::Fun(_) | Node::IfCase(_, _) | Node::Proj(_, _) => {
+            Node::BinOp(_, _, _)
+            | Node::Fun(_)
+            | Node::IfCase(_, _)
+            | Node::Proj(_, _)
+            | Node::Inj(_, _, _)
+            | Node::Product(_, _) => {
                 unreachable!("not a type")
             }
         }

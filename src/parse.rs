@@ -161,7 +161,35 @@ impl<'a> Parser<'a> {
     }
 
     fn expr(&mut self) -> Val {
-        if self.matches("(") {
+        if self.matches("{") {
+            // A product type literal
+            // We can't use (x, y) b/c that's the syntax for product types, and * wouldn't work b/c that's multiplication
+            let mut v: SmallVec<[Val; 3]> = SmallVec::new();
+            while !self.matches("}") {
+                self.skip_whitespace();
+                v.push(self.expr());
+                self.skip_whitespace();
+                if self.matches("}") {
+                    break;
+                } else {
+                    self.expect(",");
+                }
+            }
+            let ty = {
+                let v = v
+                    .iter()
+                    .map(|x| {
+                        self.module
+                            .get(*x)
+                            .expect("unknown type in product literal")
+                            .clone()
+                            .ty(&mut self.module)
+                    })
+                    .collect();
+                self.module.add(Node::ProdType(v), None)
+            };
+            self.module.add(Node::Product(ty, v), None)
+        } else if self.matches("(") {
             // A binop
             let lhs = self.expr();
             self.skip_whitespace();
@@ -206,6 +234,19 @@ impl<'a> Parser<'a> {
                 self.skip_whitespace();
                 self.expect(")");
                 self.module.add(Node::Proj(lhs, i), None)
+            } else if self.matches(":") {
+                // Injection into a sum type
+                self.skip_whitespace();
+                let mut i = String::new();
+                while self.peek().expect("unexpected EOF").is_digit(10) {
+                    i.push(self.next().unwrap());
+                }
+                let i: usize = i.parse().expect("invalid number for ifcase tag");
+                self.skip_whitespace();
+                let val = self.expr();
+                self.skip_whitespace();
+                self.expect(")");
+                self.module.add(Node::Inj(lhs, i, val), None)
             } else {
                 let op = self.binop();
                 self.skip_whitespace();
@@ -245,7 +286,12 @@ impl<'a> Parser<'a> {
         } else if self.matches("I32") {
             self.module
                 .add(Node::Const(Constant::IntType(Width::W32)), None)
-        } else if self.peek().expect("unexpected EOF").is_digit(10) || self.peek().unwrap() == '-' {
+        } else if self
+            .peek()
+            .expect("unexpected EOF, maybe missing ;")
+            .is_digit(10)
+            || self.peek().unwrap() == '-'
+        {
             let mut s = String::new();
             while self.peek().unwrap() != 'i' {
                 if self.peek().unwrap().is_digit(10) || self.peek().unwrap() == '-' {

@@ -29,10 +29,15 @@ impl Node {
                 v.iter_mut().for_each(|x| *x = x.mangle(m, map));
                 Node::ProdType(v)
             }
+            Node::Product(ty, mut v) => {
+                v.iter_mut().for_each(|x| *x = x.mangle(m, map));
+                Node::Product(ty.mangle(m, map), v)
+            }
             Node::IfCase(i, x) => Node::IfCase(i, x.mangle(m, map)),
             Node::Proj(x, i) => Node::Proj(x.mangle(m, map), i),
             Node::Param(f, i) => Node::Param(f.mangle(m, map), i),
             Node::BinOp(op, a, b) => Node::BinOp(op, a.mangle(m, map), b.mangle(m, map)),
+            Node::Inj(a, i, b) => Node::Inj(a.mangle(m, map), i, b.mangle(m, map)),
             // Constants can't use other values
             Node::Const(c) => Node::Const(c),
         }
