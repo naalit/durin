@@ -129,14 +129,6 @@ impl Module {
                         }
                         writeln!(buf, ";").unwrap();
                     }
-                    Node::Param(_, _)
-                    | Node::Const(_)
-                    | Node::FunType(_)
-                    | Node::ProdType(_)
-                    | Node::SumType(_)
-                    | Node::IfCase(_, _) => {
-                        // Nothing, since constants and params are inlined
-                    }
                     Node::BinOp(op, a, b) => {
                         writeln!(
                             buf,
@@ -147,6 +139,9 @@ impl Module {
                             b.pretty(self)
                         )
                         .unwrap();
+                    }
+                    _ => {
+                        // Nothing, since constants and params are inlined
                     }
                 }
             }

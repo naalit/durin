@@ -204,6 +204,8 @@ pub enum Node {
     SumType(SmallVec<[Val; 4]>),
     /// IfCase(tag, x); then and else are passed to it as arguments
     IfCase(usize, Val),
+    /// Projecting a numbered member of a product type
+    Proj(Val, usize),
     /// The `Val` should point to a function
     Param(Val, u8),
     Const(Constant),
@@ -226,7 +228,7 @@ impl Node {
             Node::Param(f, _) => smallvec![*f],
             Node::BinOp(_, a, b) => smallvec![*a, *b],
             Node::Const(_) => SmallVec::new(),
-            Node::IfCase(_, x) => smallvec![*x],
+            Node::IfCase(_, x) | Node::Proj(x, _) => smallvec![*x],
         }
     }
 
@@ -261,6 +263,10 @@ impl Node {
                 let ftwo = m.add(Node::FunType(smallvec![]), None);
                 m.add(Node::FunType(smallvec![fone, ftwo]), None)
             }
+            Node::Proj(x, i) => match x.get(m).clone().ty(m).get(m) {
+                Node::ProdType(v) => v[*i],
+                _ => unreachable!(),
+            },
         }
     }
 }

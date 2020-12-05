@@ -30,6 +30,7 @@ impl Node {
                 Node::ProdType(v)
             }
             Node::IfCase(i, x) => Node::IfCase(i, x.mangle(m, map)),
+            Node::Proj(x, i) => Node::Proj(x.mangle(m, map), i),
             Node::Param(f, i) => Node::Param(f.mangle(m, map), i),
             Node::BinOp(op, a, b) => Node::BinOp(op, a.mangle(m, map), b.mangle(m, map)),
             // Constants can't use other values

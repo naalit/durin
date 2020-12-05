@@ -99,8 +99,16 @@ impl<'a> Parser<'a> {
     fn name(&mut self) -> &'a str {
         let start = self.pos;
         while let Some(c) = self.peek() {
-            // Durin allows all non-whitespace characters in names, except "(", ")", ":", ";", and ",", since those are ambiguous
-            if !c.is_whitespace() && c != '(' && c != ')' && c != ':' && c != ',' && c != ';' {
+            // Durin allows all non-whitespace characters in names, except "(", ")", and certain binary operators, since those are ambiguous
+            if !c.is_whitespace()
+                && c != '('
+                && c != ')'
+                && c != ':'
+                && c != ','
+                && c != ';'
+                && c != '|'
+                && c != '.'
+            {
                 self.next();
             } else {
                 break;
@@ -187,6 +195,17 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.module.add(Node::SumType(v), None)
+            } else if self.matches(".") {
+                // Projection of a product type member
+                self.skip_whitespace();
+                let mut i = String::new();
+                while self.peek().expect("unexpected EOF").is_digit(10) {
+                    i.push(self.next().unwrap());
+                }
+                let i: usize = i.parse().expect("invalid number for ifcase tag");
+                self.skip_whitespace();
+                self.expect(")");
+                self.module.add(Node::Proj(lhs, i), None)
             } else {
                 let op = self.binop();
                 self.skip_whitespace();

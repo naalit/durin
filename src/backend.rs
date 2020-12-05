@@ -244,7 +244,9 @@ impl crate::ir::Module {
             Node::ProdType(v) => v.iter().map(|&x| self.static_size(x, cxt)).sum(),
             Node::SumType(v) => v.iter().map(|&x| self.static_size(x, cxt)).max().unwrap(),
             Node::Param(_, _) => cxt.size_ty().get_bit_width() as u64 / 4,
-            Node::Fun(_) | Node::BinOp(_, _, _) | Node::IfCase(_, _) => unreachable!("not a type"),
+            Node::Fun(_) | Node::BinOp(_, _, _) | Node::IfCase(_, _) | Node::Proj(_, _) => {
+                unreachable!("not a type")
+            }
         }
     }
 
@@ -302,7 +304,9 @@ impl crate::ir::Module {
             }
             // Polymorphic
             Node::Param(_, _) => cxt.any_ty(),
-            Node::Fun(_) | Node::BinOp(_, _, _) | Node::IfCase(_, _) => unreachable!("not a type"),
+            Node::Fun(_) | Node::BinOp(_, _, _) | Node::IfCase(_, _) | Node::Proj(_, _) => {
+                unreachable!("not a type")
+            }
         }
     }
 
@@ -373,6 +377,12 @@ impl crate::ir::Module {
                     .size_of()
                     .unwrap()
                     .as_basic_value_enum()
+            }
+            Node::Proj(x, i) => {
+                let x = self.gen_value(*x, cxt).into_struct_value();
+                cxt.builder
+                    .build_extract_value(x, *i as u32, "project")
+                    .unwrap()
             }
             Node::IfCase(_, _) => panic!("`ifcase _ _` isn't a first-class function!"),
             Node::Param(f, i) => {
@@ -829,7 +839,10 @@ impl crate::ir::Module {
             }
             // Leave as an "any" since it's polymorphic
             Node::Param(_, _) => any.as_basic_value_enum(),
-            Node::BinOp(_, _, _) | Node::Fun(_) | Node::IfCase(_, _) => unreachable!("not a type"),
+            // TODO Proj should be allowed as a type
+            Node::BinOp(_, _, _) | Node::Fun(_) | Node::IfCase(_, _) | Node::Proj(_, _) => {
+                unreachable!("not a type")
+            }
         }
     }
 

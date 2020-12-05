@@ -36,8 +36,8 @@ fn test_basic() {
 //     // panic!("ah");
 // }
 
-// verify!(basic);
-// verify!(ssa);
-// verify!(closures);
-// verify!(pi);
+verify!(basic);
+verify!(ssa);
+verify!(closures);
+verify!(pi);
 verify!(adt);
