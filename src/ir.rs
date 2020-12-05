@@ -4,6 +4,10 @@ use std::collections::HashSet;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Val(usize);
 impl Val {
+    pub fn get(self, m: &Module) -> &Node {
+        m.get(self).unwrap()
+    }
+
     pub fn num(self) -> usize {
         self.0
     }
@@ -196,36 +200,14 @@ impl Module {
 pub enum Node {
     Fun(Function),
     FunType(SmallVec<[Val; 4]>),
+    ProdType(SmallVec<[Val; 4]>),
+    SumType(SmallVec<[Val; 4]>),
+    /// IfCase(tag, x); then and else are passed to it as arguments
+    IfCase(usize, Val),
     /// The `Val` should point to a function
     Param(Val, u8),
     Const(Constant),
     BinOp(BinOp, Val, Val),
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Ty {
-    Const(Constant),
-    FunType(SmallVec<[Val; 4]>),
-    Val(Val),
-}
-impl Ty {
-    pub fn to_val(self, m: &mut Module) -> Val {
-        match self {
-            Ty::Const(c) => m.add(Node::Const(c), None),
-            Ty::FunType(v) => m.add(Node::FunType(v), None),
-            Ty::Val(v) => v,
-        }
-    }
-
-    pub fn inline(self, m: &Module) -> Self {
-        match self {
-            Ty::Val(v) => match m.get(v).unwrap() {
-                Node::Const(c) => Ty::Const(c.clone()),
-                Node::FunType(v) => Ty::FunType(v.clone()),
-                _ => Ty::Val(v),
-            },
-            x => x,
-        }
-    }
 }
 impl Node {
     pub fn args(&self) -> SmallVec<[Val; 4]> {
@@ -240,31 +222,45 @@ impl Node {
                 .copied()
                 .chain(std::iter::once(*callee))
                 .collect(),
-            Node::FunType(v) => v.clone(),
+            Node::FunType(v) | Node::ProdType(v) | Node::SumType(v) => v.clone(),
             Node::Param(f, _) => smallvec![*f],
             Node::BinOp(_, a, b) => smallvec![*a, *b],
             Node::Const(_) => SmallVec::new(),
+            Node::IfCase(_, x) => smallvec![*x],
         }
     }
 
-    pub fn ty(&self, m: &Module) -> Ty {
+    pub fn ty(&self, m: &mut Module) -> Val {
         match self {
-            Node::Fun(f) => Ty::FunType(f.params.as_slice().to_smallvec()),
-            Node::FunType(_) => Ty::Const(Constant::TypeType),
+            Node::Fun(f) => m.add(Node::FunType(f.params.as_slice().to_smallvec()), None),
+            Node::FunType(_) | Node::ProdType(_) | Node::SumType(_) => {
+                m.add(Node::Const(Constant::TypeType), None)
+            }
             Node::Param(f, i) => {
                 if let Node::Fun(f) = m.get(*f).unwrap() {
-                    Ty::Val(f.params[*i as usize])
+                    f.params[*i as usize]
                 } else {
                     panic!("non-function has no params")
                 }
             }
             Node::Const(c) => match c {
-                Constant::TypeType | Constant::IntType(_) => Ty::Const(Constant::TypeType),
-                Constant::Int(w, _) => Ty::Const(Constant::IntType(*w)),
-                Constant::Stop => Ty::FunType(SmallVec::new()),
+                Constant::TypeType | Constant::IntType(_) => {
+                    m.add(Node::Const(Constant::TypeType), None)
+                }
+                Constant::Int(w, _) => m.add(Node::Const(Constant::IntType(*w)), None),
+                Constant::Stop => m.add(Node::FunType(SmallVec::new()), None),
             },
-            Node::BinOp(BinOp::IEq, _, _) => Ty::Const(Constant::IntType(Width::W1)),
-            Node::BinOp(_, a, _) => m.get(*a).unwrap().clone().ty(m),
+            Node::BinOp(BinOp::IEq, _, _) => m.add(Node::Const(Constant::IntType(Width::W1)), None),
+            Node::BinOp(_, a, _) => a.get(m).clone().ty(m),
+            Node::IfCase(i, x) => {
+                let arg = match x.get(m).clone().ty(m).get(m) {
+                    Node::SumType(v) => v[*i],
+                    _ => unreachable!(),
+                };
+                let fone = m.add(Node::FunType(smallvec![arg]), None);
+                let ftwo = m.add(Node::FunType(smallvec![]), None);
+                m.add(Node::FunType(smallvec![fone, ftwo]), None)
+            }
         }
     }
 }

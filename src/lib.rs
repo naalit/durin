@@ -1,6 +1,6 @@
-use smallvec::*;
 use std::collections::HashMap;
 
+use smallvec::*;
 pub mod backend;
 pub mod builder;
 mod emit;
@@ -21,6 +21,15 @@ impl Node {
                 v.iter_mut().for_each(|x| *x = x.mangle(m, map));
                 Node::FunType(v)
             }
+            Node::SumType(mut v) => {
+                v.iter_mut().for_each(|x| *x = x.mangle(m, map));
+                Node::SumType(v)
+            }
+            Node::ProdType(mut v) => {
+                v.iter_mut().for_each(|x| *x = x.mangle(m, map));
+                Node::ProdType(v)
+            }
+            Node::IfCase(i, x) => Node::IfCase(i, x.mangle(m, map)),
             Node::Param(f, i) => Node::Param(f.mangle(m, map), i),
             Node::BinOp(op, a, b) => Node::BinOp(op, a.mangle(m, map), b.mangle(m, map)),
             // Constants can't use other values
@@ -55,7 +64,7 @@ pub fn lift(m: &mut Module, vfun: Val, to_lift: Val) -> Val {
     // Add the new parameter
     let lift_name = m.name(to_lift).cloned();
     let fname = m.name(vfun).cloned();
-    let ty = m.get(to_lift).unwrap().clone().ty(m).to_val(m);
+    let ty = m.get(to_lift).unwrap().clone().ty(m);
     let nparams = fun.params.len();
     fun.params.push(ty);
 

@@ -1,4 +1,4 @@
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 
 use crate::ir::*;
 use std::collections::HashMap;
@@ -23,11 +23,12 @@ impl<'a> Parser<'a> {
             .input
             .lines()
             .find(|x| {
-                if lpos + x.len() > self.pos {
+                // +1 for the \n
+                if lpos + x.len() + 1 > self.pos {
                     true
                 } else {
                     lnum += 1;
-                    lpos += x.len();
+                    lpos += x.len() + 1;
                     false
                 }
             })
@@ -106,7 +107,6 @@ impl<'a> Parser<'a> {
             }
         }
         if self.pos == start {
-            self.pos = start;
             self.error(format!("Expected name"))
         }
         &self.input[start..self.pos]
@@ -157,13 +157,46 @@ impl<'a> Parser<'a> {
             // A binop
             let lhs = self.expr();
             self.skip_whitespace();
-            let op = self.binop();
-            self.skip_whitespace();
-            let rhs = self.expr();
-            self.skip_whitespace();
-            self.expect(")");
-            self.module.add(Node::BinOp(op, lhs, rhs), None)
+            if self.matches(",") {
+                // Product type
+                let mut v = smallvec![lhs];
+                loop {
+                    self.skip_whitespace();
+                    let next = self.expr();
+                    v.push(next);
+                    self.skip_whitespace();
+                    if self.matches(")") {
+                        break;
+                    } else {
+                        self.expect(",");
+                    }
+                }
+                self.module.add(Node::ProdType(v), None)
+            } else if self.matches("|") {
+                // Sum type
+                let mut v = smallvec![lhs];
+                loop {
+                    self.skip_whitespace();
+                    let next = self.expr();
+                    v.push(next);
+                    self.skip_whitespace();
+                    if self.matches(")") {
+                        break;
+                    } else {
+                        self.expect("|");
+                    }
+                }
+                self.module.add(Node::SumType(v), None)
+            } else {
+                let op = self.binop();
+                self.skip_whitespace();
+                let rhs = self.expr();
+                self.skip_whitespace();
+                self.expect(")");
+                self.module.add(Node::BinOp(op, lhs, rhs), None)
+            }
         } else if self.matches("fun") {
+            self.skip_whitespace();
             self.expect("(");
             self.skip_whitespace();
 
@@ -193,7 +226,7 @@ impl<'a> Parser<'a> {
         } else if self.matches("I32") {
             self.module
                 .add(Node::Const(Constant::IntType(Width::W32)), None)
-        } else if self.peek().unwrap().is_digit(10) || self.peek().unwrap() == '-' {
+        } else if self.peek().expect("unexpected EOF").is_digit(10) || self.peek().unwrap() == '-' {
             let mut s = String::new();
             while self.peek().unwrap() != 'i' {
                 if self.peek().unwrap().is_digit(10) || self.peek().unwrap() == '-' {
@@ -301,23 +334,54 @@ impl<'a> Parser<'a> {
             self.expect("=");
             self.skip_whitespace();
 
-            let callee = self.var();
-            self.skip_whitespace();
-
-            let mut call_args = SmallVec::new();
-            while !self.matches(";") {
-                call_args.push(self.expr());
+            if self.matches("ifcase") {
                 self.skip_whitespace();
-            }
+                let mut i = String::new();
+                while self.peek().expect("unexpected EOF").is_digit(10) {
+                    i.push(self.next().unwrap());
+                }
+                let i: usize = i.parse().expect("invalid number for ifcase tag");
+                self.skip_whitespace();
 
-            self.module.replace(
-                val,
-                Node::Fun(Function {
-                    params,
-                    callee,
-                    call_args,
-                }),
-            )
+                let x = self.expr();
+                self.skip_whitespace();
+
+                let fthen = self.expr();
+                self.skip_whitespace();
+
+                let felse = self.expr();
+                self.skip_whitespace();
+
+                self.expect(";");
+
+                let callee = self.module.add(Node::IfCase(i, x), None);
+                self.module.replace(
+                    val,
+                    Node::Fun(Function {
+                        params,
+                        callee,
+                        call_args: smallvec![fthen, felse],
+                    }),
+                );
+            } else {
+                let callee = self.var();
+                self.skip_whitespace();
+
+                let mut call_args = SmallVec::new();
+                while !self.matches(";") {
+                    call_args.push(self.expr());
+                    self.skip_whitespace();
+                }
+
+                self.module.replace(
+                    val,
+                    Node::Fun(Function {
+                        params,
+                        callee,
+                        call_args,
+                    }),
+                )
+            }
         }
 
         for (name, (val, pos)) in &self.names {

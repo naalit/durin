@@ -1,4 +1,3 @@
-use crate::ir::Ty;
 use crate::ir::{Function, Node, Val};
 use inkwell::basic_block::BasicBlock;
 use inkwell::IntPredicate;
@@ -45,7 +44,7 @@ impl Backend {
         Backend { cxt, machine }
     }
 
-    pub fn codegen_module(&self, m: &crate::ir::Module) -> inkwell::module::Module {
+    pub fn codegen_module(&self, m: &mut crate::ir::Module) -> inkwell::module::Module {
         let mut cxt = self.cxt();
         m.codegen(&mut cxt);
         cxt.module
@@ -130,7 +129,7 @@ impl crate::ir::Module {
         let mut modes = HashMap::new();
         for val in self.vals() {
             if let Node::Fun(Function { params, callee, .. }) = self.get(val).unwrap() {
-                if let Node::FunType(_) = *self.get(*params.last().unwrap()).unwrap() {
+                if let Some(Node::FunType(_)) = params.last().and_then(|&x| self.get(x)) {
                     let cont_n = params.len() as u8 - 1;
                     let &cont_p = self
                         .uses(val)
@@ -231,6 +230,24 @@ impl crate::ir::Module {
             .collect()
     }
 
+    /// The size that this type takes up on the *stack*
+    fn static_size<'cxt>(&self, val: Val, cxt: &Cxt<'cxt>) -> u64 {
+        match self.get(val).unwrap() {
+            Node::Const(c) => match c {
+                crate::ir::Constant::TypeType => cxt.size_ty().get_bit_width() as u64 / 4,
+                crate::ir::Constant::IntType(w) => w.bits() as u64 / 4,
+                crate::ir::Constant::Int(_, _) | crate::ir::Constant::Stop => {
+                    unreachable!("not a type")
+                }
+            },
+            Node::FunType(_) => cxt.size_ty().get_bit_width() as u64 / 4 * 2,
+            Node::ProdType(v) => v.iter().map(|&x| self.static_size(x, cxt)).sum(),
+            Node::SumType(v) => v.iter().map(|&x| self.static_size(x, cxt)).max().unwrap(),
+            Node::Param(_, _) => cxt.size_ty().get_bit_width() as u64 / 4,
+            Node::Fun(_) | Node::BinOp(_, _, _) | Node::IfCase(_, _) => unreachable!("not a type"),
+        }
+    }
+
     fn llvm_ty<'cxt>(&self, val: Val, cxt: &Cxt<'cxt>) -> BasicTypeEnum<'cxt> {
         match self.get(val).unwrap() {
             Node::Const(c) => match c {
@@ -264,9 +281,28 @@ impl crate::ir::Module {
                     )
                     .as_basic_type_enum()
             }
+            Node::ProdType(v) => {
+                let v: Vec<_> = v.iter().map(|&x| self.llvm_ty(x, cxt)).collect();
+                cxt.cxt.struct_type(&v, false).as_basic_type_enum()
+            }
+            Node::SumType(v) => {
+                // TODO size probably isn't a constant
+                let &payload = v.iter().max_by_key(|&&x| self.static_size(x, cxt)).unwrap();
+                let payload = self.llvm_ty(payload, cxt);
+                let tag = match v.len() {
+                    0..=1 => cxt.cxt.custom_width_int_type(0),
+                    2 => cxt.cxt.bool_type(),
+                    3..=256 => cxt.cxt.i8_type(),
+                    257..=65536 => cxt.cxt.i32_type(),
+                    _ => cxt.cxt.i64_type(),
+                };
+                cxt.cxt
+                    .struct_type(&[tag.as_basic_type_enum(), payload], false)
+                    .as_basic_type_enum()
+            }
             // Polymorphic
             Node::Param(_, _) => cxt.any_ty(),
-            Node::Fun(_) | Node::BinOp(_, _, _) => unreachable!("not a type"),
+            Node::Fun(_) | Node::BinOp(_, _, _) | Node::IfCase(_, _) => unreachable!("not a type"),
         }
     }
 
@@ -331,6 +367,14 @@ impl crate::ir::Module {
                 let ty = cxt.cxt.struct_type(&[cxt.any_ty(), cxt.any_ty()], false);
                 ty.size_of().unwrap().as_basic_value_enum()
             }
+            Node::ProdType(_) | Node::SumType(_) => {
+                // TODO boxing??
+                self.llvm_ty(val, cxt)
+                    .size_of()
+                    .unwrap()
+                    .as_basic_value_enum()
+            }
+            Node::IfCase(_, _) => panic!("`ifcase _ _` isn't a first-class function!"),
             Node::Param(f, i) => {
                 let name = self.name(val).map(|x| x as &str).unwrap_or("param");
                 let ptr = cxt.blocks.get(f).unwrap().1[*i as usize];
@@ -385,7 +429,7 @@ impl crate::ir::Module {
         }
     }
 
-    pub fn codegen<'cxt>(&self, cxt: &mut Cxt<'cxt>) {
+    pub fn codegen<'cxt>(&mut self, cxt: &mut Cxt<'cxt>) {
         let stack_enabled = self.stack_enabled();
 
         // Codegen all functions visible from the top level, and everything reachable from there
@@ -617,12 +661,16 @@ impl crate::ir::Module {
                         self.from_any(unknown.get_params()[i].into_pointer_value(), ty, cxt)
                     })
                     .collect();
-                // `gen_call` takes the continuation as a Val, not a BasicValueEnum; so, we use an unused Val slot and stick the BasicValueEnum in the upvalues map
-                // Thing is, we can't call `self.reserve()` because we don't want to take `self` as mutable
-                // But we only ever need one of these at once, so we use `Val::INVALID`, which exists for this purpose
-                let cont = Val::INVALID;
-                cxt.upvalues.insert(cont, args.pop().unwrap());
-                self.gen_call(*val, args, Some(cont), &cxt);
+                if let Some(vcont) = args.pop() {
+                    // `gen_call` takes the continuation as a Val, not a BasicValueEnum; so, we use an unused Val slot and stick the BasicValueEnum in the upvalues map
+                    // Thing is, we can't call `self.reserve()` because we don't want to take `self` as mutable
+                    // But we only ever need one of these at once, so we use `Val::INVALID`, which exists for this purpose
+                    let cont = Val::INVALID;
+                    cxt.upvalues.insert(cont, vcont);
+                    self.gen_call(*val, args, Some(cont), &cxt);
+                } else {
+                    self.gen_call(*val, args, None, &cxt);
+                }
             }
 
             let &fun = known;
@@ -678,17 +726,72 @@ impl crate::ir::Module {
                 let (block, _) = cxt.blocks.get(&bval).unwrap();
                 cxt.builder.position_at_end(*block);
 
-                let args: Vec<_> = bfun
-                    .call_args
-                    .iter()
-                    .take(if bfun.call_args.is_empty() {
-                        0
-                    } else {
-                        bfun.call_args.len() - 1
-                    })
-                    .map(|x| self.gen_value(*x, cxt))
-                    .collect();
-                self.gen_call(bfun.callee, args, bfun.call_args.last().copied(), cxt);
+                // If we're calling ifcase i x, do that instead
+                if let Some(Node::IfCase(i, x)) = self.get(bfun.callee) {
+                    let (&i, &x) = (i, x);
+                    let payload_ty = match x.get(self).clone().ty(self).get(self) {
+                        Node::SumType(v) => v[i],
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(bfun.call_args.len(), 2);
+                    let fthen = bfun.call_args[0];
+                    let felse = bfun.call_args[1];
+
+                    let x = self.gen_value(x, cxt);
+                    let tag = cxt
+                        .builder
+                        .build_extract_value(x.into_struct_value(), 0, "union.tag")
+                        .unwrap()
+                        .into_int_value();
+
+                    let bstart = cxt.builder.get_insert_block().unwrap();
+                    let bthen = cxt.cxt.insert_basic_block_after(bstart, "ifcase.then");
+                    let belse = cxt.cxt.insert_basic_block_after(bthen, "ifcase.else");
+
+                    let cond = cxt.builder.build_int_compare(
+                        IntPredicate::EQ,
+                        tag,
+                        tag.get_type().const_int(i as u64, false),
+                        "ifcase.cond",
+                    );
+                    cxt.builder.build_conditional_branch(cond, bthen, belse);
+
+                    cxt.builder.position_at_end(bthen);
+                    let payload_ty = self.llvm_ty(payload_ty, cxt);
+                    let payload = cxt
+                        .builder
+                        .build_extract_value(x.into_struct_value(), 1, "union.payload")
+                        .unwrap();
+                    let payload_ptr = cxt
+                        .builder
+                        .build_alloca(payload.get_type(), "union.payload.ptr");
+                    cxt.builder.build_store(payload_ptr, payload);
+                    let payload_ptr = cxt.builder.build_bitcast(
+                        payload_ptr,
+                        payload_ty.ptr_type(AddressSpace::Generic),
+                        "union.payload.casted_ptr",
+                    );
+                    let payload = cxt
+                        .builder
+                        .build_load(payload_ptr.into_pointer_value(), "union.payload.casted");
+                    self.gen_call(fthen, vec![payload], None, cxt);
+
+                    cxt.builder.position_at_end(belse);
+                    self.gen_call(felse, vec![], None, cxt);
+                } else {
+                    // Generate a call
+                    let args: Vec<_> = bfun
+                        .call_args
+                        .iter()
+                        .take(if bfun.call_args.is_empty() {
+                            0
+                        } else {
+                            bfun.call_args.len() - 1
+                        })
+                        .map(|x| self.gen_value(*x, cxt))
+                        .collect();
+                    self.gen_call(bfun.callee, args, bfun.call_args.last().copied(), cxt);
+                }
             }
         }
     }
@@ -713,7 +816,7 @@ impl crate::ir::Module {
                     unreachable!("not a type")
                 }
             },
-            Node::FunType(_) => {
+            Node::FunType(_) | Node::ProdType(_) | Node::SumType(_) => {
                 let ptr = cxt
                     .builder
                     .build_bitcast(
@@ -722,11 +825,11 @@ impl crate::ir::Module {
                         "ptr",
                     )
                     .into_pointer_value();
-                cxt.builder.build_load(ptr, "fun")
+                cxt.builder.build_load(ptr, "val")
             }
             // Leave as an "any" since it's polymorphic
             Node::Param(_, _) => any.as_basic_value_enum(),
-            Node::BinOp(_, _, _) | Node::Fun(_) => unreachable!("not a type"),
+            Node::BinOp(_, _, _) | Node::Fun(_) | Node::IfCase(_, _) => unreachable!("not a type"),
         }
     }
 
@@ -782,7 +885,7 @@ impl crate::ir::Module {
     }
 
     fn gen_call<'cxt>(
-        &self,
+        &mut self,
         callee: Val,
         mut args: Vec<BasicValueEnum<'cxt>>,
         cont: Option<Val>,
@@ -854,8 +957,8 @@ impl crate::ir::Module {
                     if let Some(k) = cont {
                         args.push(self.gen_value(k, cxt));
                     }
-                    let tys = match self.get(callee).unwrap().ty(self).inline(self) {
-                        Ty::FunType(tys) => tys,
+                    let tys = match self.get(callee).unwrap().clone().ty(self).get(self) {
+                        Node::FunType(tys) => tys,
                         _ => unreachable!(),
                     };
                     let callee = self.gen_value(callee, cxt).into_struct_value();
@@ -870,7 +973,7 @@ impl crate::ir::Module {
                     let mut args: Vec<_> = args
                         .into_iter()
                         .zip(tys)
-                        .map(|(val, ty)| self.to_any(val, ty, cxt).as_basic_value_enum())
+                        .map(|(val, ty)| self.to_any(val, *ty, cxt).as_basic_value_enum())
                         .collect();
                     // The closure environment is the last argument
                     args.push(env);

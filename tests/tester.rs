@@ -12,9 +12,9 @@ macro_rules! verify {
                 file.read_to_string(&mut buf).unwrap();
                 buf
             };
-            let m = durin::parse::Parser::new(&input).parse();
+            let mut m = durin::parse::Parser::new(&input).parse();
             let backend = durin::backend::Backend::native();
-            let l = backend.codegen_module(&m);
+            let l = backend.codegen_module(&mut m);
             println!("{}", l.print_to_string().to_str().unwrap());
             l.verify().unwrap();
         }
@@ -36,7 +36,8 @@ fn test_basic() {
 //     // panic!("ah");
 // }
 
-verify!(basic);
-verify!(ssa);
-verify!(closures);
-verify!(pi);
+// verify!(basic);
+// verify!(ssa);
+// verify!(closures);
+// verify!(pi);
+verify!(adt);

@@ -12,12 +12,39 @@ impl<'a> Display for PrettyVal<'a> {
                 let mut first = true;
                 for (i, ty) in params.iter().enumerate() {
                     if !first {
-                        first = false;
                         write!(f, ", ")?;
                     }
+                    first = false;
                     write!(f, "{}: {}", m.param_name(v, i as u8), ty.pretty(m))?;
                 }
                 write!(f, ")")
+            }
+            Node::ProdType(v) => {
+                write!(f, "(")?;
+                let mut first = true;
+                for i in v {
+                    if !first {
+                        write!(f, ", ")?;
+                    }
+                    first = false;
+                    write!(f, "{}", i.pretty(m))?;
+                }
+                write!(f, ")")
+            }
+            Node::SumType(v) => {
+                write!(f, "(")?;
+                let mut first = true;
+                for i in v {
+                    if !first {
+                        write!(f, "| ")?;
+                    }
+                    first = false;
+                    write!(f, "{}", i.pretty(m))?;
+                }
+                write!(f, ")")
+            }
+            Node::IfCase(i, x) => {
+                write!(f, "ifcase {} {}", i, x.pretty(m))
             }
             // Node::Param(a, b) => write!(f, "{}.{}", a.pretty(m), b),
             _ => match &m.names[v.num()] {
@@ -102,7 +129,12 @@ impl Module {
                         }
                         writeln!(buf, ";").unwrap();
                     }
-                    Node::Param(_, _) | Node::Const(_) | Node::FunType(_) => {
+                    Node::Param(_, _)
+                    | Node::Const(_)
+                    | Node::FunType(_)
+                    | Node::ProdType(_)
+                    | Node::SumType(_)
+                    | Node::IfCase(_, _) => {
                         // Nothing, since constants and params are inlined
                     }
                     Node::BinOp(op, a, b) => {
