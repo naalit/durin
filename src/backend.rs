@@ -128,7 +128,10 @@ impl crate::ir::Module {
     fn stack_enabled(&self) -> HashSet<Val> {
         let mut modes = HashMap::new();
         for val in self.vals() {
+            // For a function to use the stack it must:
+            // 1. be a function
             if let Node::Fun(Function { params, callee, .. }) = self.get(val).unwrap() {
+                // 2. have a last parameter with a function type - the continuation
                 if let Some(Node::FunType(_)) = params.last().and_then(|&x| self.get(x)) {
                     let cont_n = params.len() as u8 - 1;
                     let &cont_p = self
@@ -137,22 +140,23 @@ impl crate::ir::Module {
                         .find(|&&x| *self.get(x).unwrap() == Node::Param(val, cont_n))
                         .expect("Continuation isn't used, I guess?");
 
+                    // Instead of checking if other functions are stack-enabled, we add them to reqs, since they might be in any order
                     let mut reqs = Vec::new();
                     let good = self.uses(cont_p).iter().all(|&u| {
-                        // We can only replace the continuation with a call stack if the continuation is only called, not passed around.
+                        // 3. only use its continuation in known calls, not passing it around
                         match self.get(u).unwrap() {
                             Node::Fun(Function { callee, .. }) if *callee == cont_p => true,
-                            // But, it can be passed as a continuation to another function that can use a call stack
+                            // Although passing it as the continuation (last) parameter to another stack-enabled function is fine.
                             Node::Fun(Function {
                                 callee, call_args, ..
-                            }) if call_args.iter().any(|&x| x == cont_p) => {
+                            }) if call_args.last().map_or(false, |&x| x == cont_p) => {
                                 reqs.push(*callee);
                                 true
                             }
                             _ => false,
                         }
                     });
-                    // Also, we can only call functions that are guaranteed to return
+                    // 4. only call other stack-enabled functions - we won't have a continuation to pass other functions
                     if !reqs.contains(callee) {
                         reqs.push(*callee);
                     }
@@ -167,12 +171,46 @@ impl crate::ir::Module {
                         }
                     }
                 } else {
-                    // No continuation, so we won't use the call stack
-                    modes.insert(val, FunMode::NoStack);
+                    // This function doesn't have a continuation.
+                    // It can still be stack-enabled as long as it only calls stack-enabled functions or their continuations.
+                    if params.iter().any(|x| {
+                        if let Node::FunType(_) = x.get(self) {
+                            !self.uses(*x).is_empty()
+                        } else {
+                            false
+                        }
+                    }) {
+                        // This function has a parameter of function type (and uses it), so it can't use the stack.
+                        modes.insert(val, FunMode::NoStack);
+                    } else {
+                        let req = match callee.get(self) {
+                            // Check if this is the last parameter of a function.
+                            // If so, we require that *that* function is stack-enabled, so it has a continuation.
+                            Node::Param(f, i) => {
+                                if let Node::Fun(Function { params, .. }) = f.get(self) {
+                                    if params.len() == *i as usize + 1 {
+                                        Some(*f)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            // The called function isn't a continuation, so we require that it's stack-enabled.
+                            _ => Some(*callee),
+                        };
+                        if let Some(req) = req {
+                            modes.insert(val, FunMode::Maybe(vec![req]));
+                        } else {
+                            modes.insert(val, FunMode::NoStack);
+                        }
+                    }
                 }
             }
         }
 
+        // Now look at requirements and figure out which functions can actually use the stack
         while let Some((val, reqs)) = modes.iter().find_map(|(&val, mode)| match mode {
             FunMode::Maybe(reqs) => Some((val, reqs)),
             _ => None,
@@ -180,6 +218,7 @@ impl crate::ir::Module {
             let before = reqs.len();
 
             let mut okay = true;
+            // The new version of reqs - functions we're still waiting on
             let mut nreqs = Vec::new();
             for v in reqs.clone() {
                 // Single recursion is fine
@@ -195,8 +234,10 @@ impl crate::ir::Module {
                         okay = false;
                         break;
                     }
-                    Some(FunMode::Maybe(_)) => {
-                        nreqs.push(v);
+                    Some(FunMode::Maybe(rs)) => {
+                        // Transfer that functions requirements to this one.
+                        // We'll come back next iteration.
+                        nreqs.extend(rs.iter().copied().filter(|&x| x != v && x != val));
                     }
                 }
             }
@@ -908,12 +949,7 @@ impl crate::ir::Module {
         }
     }
 
-    fn to_any<'cxt>(
-        &self,
-        val: BasicValueEnum<'cxt>,
-        ty: Val,
-        cxt: &Cxt<'cxt>,
-    ) -> PointerValue<'cxt> {
+    fn to_any<'cxt>(&self, val: BasicValueEnum<'cxt>, cxt: &Cxt<'cxt>) -> PointerValue<'cxt> {
         match val.get_type() {
             BasicTypeEnum::IntType(_) => {
                 let val = val.into_int_value();
@@ -934,29 +970,6 @@ impl crate::ir::Module {
             BasicTypeEnum::PointerType(_) => val.into_pointer_value(),
             BasicTypeEnum::FloatType(_) => unimplemented!(),
         }
-        // TODO do we really not need the type information?
-        // match self.get(ty).unwrap() {
-        //     Node::Const(c) => match c {
-        //         crate::ir::Constant::TypeType | crate::ir::Constant::IntType(_) => {
-        //             let val = val.into_int_value();
-        //             cxt.builder
-        //                 .build_int_to_ptr(val, cxt.any_ty().into_pointer_type(), "cast")
-        //         }
-        //         crate::ir::Constant::Int(_, _) => unreachable!("not a type"),
-        //     },
-        //     Node::FunType(_) => {
-        //         let ty = val.get_type();
-        //         // TODO heap allocate instead
-        //         let ptr = cxt.builder.build_alloca(ty, "cast_slot");
-        //         cxt.builder.build_store(ptr, val);
-        //         cxt.builder
-        //             .build_bitcast(ptr, cxt.any_ty(), "casted")
-        //             .into_pointer_value()
-        //     }
-        //     // Already as an "any" since it's polymorphic
-        //     Node::Param(_, _) => val.into_pointer_value(),
-        //     Node::BinOp(_, _, _) | Node::Fun(_) => unreachable!("not a type"),
-        // }
     }
 
     fn gen_call<'cxt>(
@@ -1032,10 +1045,6 @@ impl crate::ir::Module {
                     if let Some(k) = cont {
                         args.push(self.gen_value(k, cxt));
                     }
-                    let tys = match self.get(callee).unwrap().clone().ty(self).get(self) {
-                        Node::FunType(tys) => tys,
-                        _ => unreachable!(),
-                    };
                     let callee = self.gen_value(callee, cxt).into_struct_value();
                     let env = cxt.builder.build_extract_value(callee, 0, "env").unwrap();
                     let fun_ptr = cxt
@@ -1047,8 +1056,7 @@ impl crate::ir::Module {
                     // It could be polymorphic, so we pass all arguments as word-size "any"
                     let mut args: Vec<_> = args
                         .into_iter()
-                        .zip(tys)
-                        .map(|(val, ty)| self.to_any(val, *ty, cxt).as_basic_value_enum())
+                        .map(|val| self.to_any(val, cxt).as_basic_value_enum())
                         .collect();
                     // The closure environment is the last argument
                     args.push(env);

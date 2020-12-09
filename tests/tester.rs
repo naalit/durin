@@ -22,10 +22,20 @@ macro_rules! verify {
 }
 
 #[test]
-fn test_basic() {
+fn basic() {
     let input = include_str!("basic.du");
-    let m = durin::parse::Parser::new(input).parse();
+    let mut m = durin::parse::Parser::new(input).parse();
     assert_eq!(input.trim(), m.emit().trim());
+
+    let backend = durin::backend::Backend::native();
+    let l = backend.codegen_module(&mut m);
+    let s = l.print_to_string();
+    let s = s.to_str().unwrap();
+    println!("{}", s);
+    assert!(
+        s.contains("define tailcc i32 @f("),
+        "f should use the LLVM stack!"
+    );
 }
 
 // #[test]
@@ -36,7 +46,6 @@ fn test_basic() {
 //     // panic!("ah");
 // }
 
-verify!(basic);
 verify!(ssa);
 verify!(closures);
 verify!(pi);
