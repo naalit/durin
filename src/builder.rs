@@ -57,6 +57,22 @@ impl<'m> Builder<'m> {
         self.module.add(Node::Const(c), None)
     }
 
+    pub fn prod_type(&mut self, v: impl Into<SmallVec<[Val; 4]>>) -> Val {
+        self.module.add(Node::ProdType(v.into()), None)
+    }
+
+    pub fn sum_type(&mut self, v: impl Into<SmallVec<[Val; 4]>>) -> Val {
+        self.module.add(Node::SumType(v.into()), None)
+    }
+
+    pub fn product(&mut self, ty: Val, v: impl Into<SmallVec<[Val; 3]>>) -> Val {
+        self.module.add(Node::Product(ty, v.into()), None)
+    }
+
+    pub fn inject_sum(&mut self, ty: Val, idx: usize, val: Val) -> Val {
+        self.module.add(Node::Inj(ty, idx, val), None)
+    }
+
     pub fn fun_type(&mut self, from: Val, to: Val) -> Val {
         let cont_ty = self.module.add(Node::FunType(smallvec![to]), None);
         self.module

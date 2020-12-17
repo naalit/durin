@@ -131,15 +131,20 @@ impl crate::ir::Module {
             // For a function to use the stack it must:
             // 1. be a function
             if let Node::Fun(Function { params, callee, .. }) = self.get(val).unwrap() {
-                // 2. have a last parameter with a function type - the continuation
-                if let Some(Node::FunType(_)) = params.last().and_then(|&x| self.get(x)) {
+                // 2. have a last parameter with a function type - the continuation - and use it
+                let cont_p = if matches!(
+                    params.last().and_then(|&x| self.get(x)),
+                    Some(Node::FunType(_))
+                ) {
                     let cont_n = params.len() as u8 - 1;
-                    let &cont_p = self
-                        .uses(val)
+                    self.uses(val)
                         .iter()
                         .find(|&&x| *self.get(x).unwrap() == Node::Param(val, cont_n))
-                        .expect("Continuation isn't used, I guess?");
-
+                        .copied()
+                } else {
+                    None
+                };
+                if let Some(cont_p) = cont_p {
                     // Instead of checking if other functions are stack-enabled, we add them to reqs, since they might be in any order
                     let mut reqs = Vec::new();
                     let good = self.uses(cont_p).iter().all(|&u| {
@@ -541,12 +546,12 @@ impl crate::ir::Module {
         let stack_enabled = self.stack_enabled();
 
         // Codegen all functions visible from the top level, and everything reachable from there
-        let mut to_gen: Vec<(Vec<(Val, Val)>, Val)> =
-            self.top_level().map(|x| (Vec::new(), x)).collect();
+        let mut to_gen: Vec<Val> = self.top_level().collect();
         // This explicit for loop allows us to add to to_gen in the body of the loop
         let mut i = 0;
         while i < to_gen.len() {
-            let (env, val) = to_gen[i].clone();
+            let val = to_gen[i].clone();
+            let env = self.env(val);
             i += 1;
 
             if let Node::Fun(fun) = self.get(val).unwrap() {
@@ -599,27 +604,9 @@ impl crate::ir::Module {
                                     },
                                 ))
                             } else {
-                                if !to_gen.iter().any(|(_, y)| *y == x) {
-                                    // This function is in `val`'s scope, so it must use its parameters
-                                    let env = fun
-                                        .params
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, &ty)| {
-                                            (
-                                                self.uses(val)
-                                                    .iter()
-                                                    .find(|&&x| {
-                                                        *self.get(x).unwrap()
-                                                            == Node::Param(val, i as u8)
-                                                    })
-                                                    .copied()
-                                                    .unwrap(),
-                                                ty,
-                                            )
-                                        })
-                                        .collect();
-                                    to_gen.push((env, x));
+                                // Mark it for generation, if it isn't marked already
+                                if !to_gen.contains(&x) {
+                                    to_gen.push(x);
                                 }
                                 None
                             }
@@ -1002,7 +989,7 @@ impl crate::ir::Module {
         // Otherwise, we're actually calling a function
         } else {
             // The mechanism depends on whether it's a known or unknown call
-            match cxt.functions.get(&callee) {
+            match cxt.functions.get(&callee.unredirect(self)) {
                 Some(LFunction {
                     known,
                     env,
@@ -1035,7 +1022,8 @@ impl crate::ir::Module {
                             args.push(self.gen_value(k, cxt));
                         }
                         let call = cxt.builder.build_call(*known, &args, "call");
-                        call.set_tail_call(true);
+                        // Tail calls are disabled until we stop using allocas
+                        // call.set_tail_call(true);
                         call.set_call_convention(TAILCC);
                         cxt.builder.build_return(None);
                     }
@@ -1062,7 +1050,8 @@ impl crate::ir::Module {
                     args.push(env);
 
                     let call = cxt.builder.build_call(fun_ptr, &args, "closure_call");
-                    call.set_tail_call(true);
+                    // Tail calls are disabled until we stop using allocas
+                    // call.set_tail_call(true);
                     call.set_call_convention(TAILCC);
                     cxt.builder.build_return(None);
                 }

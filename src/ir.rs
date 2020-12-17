@@ -4,6 +4,13 @@ use std::collections::HashSet;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Val(usize);
 impl Val {
+    pub fn unredirect(self, m: &Module) -> Val {
+        match m.nodes.get(self.num()) {
+            Some(Slot::Redirect(x)) => x.unredirect(m),
+            _ => self,
+        }
+    }
+
     pub fn get(self, m: &Module) -> &Node {
         m.get(self).unwrap()
     }
@@ -19,6 +26,7 @@ impl Val {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Slot {
     Full(Node),
+    Redirect(Val),
     Reserved,
     Open,
 }
@@ -67,14 +75,31 @@ impl Module {
     }
 
     pub fn get(&self, i: Val) -> Option<&Node> {
-        self.nodes.get(i.num()).map(|x| x.to_option()).flatten()
+        let mut i = i;
+        loop {
+            match self.nodes.get(i.num())? {
+                Slot::Full(x) => break Some(x),
+                Slot::Redirect(v) => i = *v,
+                Slot::Reserved | Slot::Open => break None,
+            }
+        }
     }
 
     pub fn get_mut(&mut self, i: Val) -> Option<&mut Node> {
-        self.nodes
-            .get_mut(i.num())
-            .map(|x| x.to_option_mut())
-            .flatten()
+        let mut i = i;
+        loop {
+            match self.nodes.get(i.num())? {
+                Slot::Full(_) => {
+                    break self
+                        .nodes
+                        .get_mut(i.num())
+                        .map(|x| x.to_option_mut())
+                        .unwrap()
+                }
+                Slot::Redirect(v) => i = *v,
+                Slot::Reserved | Slot::Open => break None,
+            }
+        }
     }
 
     pub fn uses(&self, i: Val) -> &Vec<Val> {
@@ -115,6 +140,10 @@ impl Module {
         v
     }
 
+    pub fn redirect(&mut self, from: Val, to: Val) {
+        self.nodes[from.num()] = Slot::Redirect(to);
+    }
+
     pub fn replace(&mut self, v: Val, x: Node) {
         // Since there aren't usually many arguments, it's simplest to just remove old uses and add new ones
         let old_args = self.nodes[v.num()]
@@ -136,22 +165,37 @@ impl Module {
 
     pub fn top_level<'a>(&'a self) -> impl Iterator<Item = Val> + 'a {
         (0..self.nodes.len()).map(|x| Val(x)).filter(move |x| {
-            fn has_param(m: &Module, x: Val, not: Val) -> bool {
+            // A node is top-level if it:
+            // 1. is a function (and not a redirect)
+            if !matches!(self.nodes.get(x.num()), Some(Slot::Full(Node::Fun(_)))) {
+                return false;
+            }
+
+            // 2. doesn't use parameters from other functions at runtime
+            fn has_param(m: &Module, x: Val, not: &mut HashSet<Val>) -> bool {
+                let x = x.unredirect(m);
                 match m.get(x) {
-                    None => true,
+                    None => unreachable!(),
                     Some(Node::Param(p, _)) => {
-                        *p != not
+                        !not.contains(p)
                             && if let Some(Node::Fun(_)) = m.get(*p) {
                                 true
                             } else {
                                 false
                             }
                     }
-                    Some(Node::Fun(_)) if x != not => false,
-                    Some(n) => n.args().iter().any(|x| has_param(m, *x, not)),
+                    Some(Node::Fun(_)) | Some(Node::FunType(_)) if !not.contains(&x) => {
+                        // If it calls another function, that function can use its own parameters
+                        let mut not = not.clone();
+                        not.insert(x);
+                        let b = has_param(m, x, &mut not);
+                        not.remove(&x);
+                        b
+                    }
+                    Some(n) => n.runtime_args().iter().any(|x| has_param(m, *x, not)),
                 }
             }
-            !has_param(self, *x, *x)
+            !has_param(self, *x, &mut std::iter::once(*x).collect())
         })
     }
 
@@ -159,6 +203,45 @@ impl Module {
         (0..self.nodes.len())
             .map(|x| Val(x))
             .filter(move |x| self.get(*x).is_some())
+    }
+
+    /// Returns a list of all foreign parameters this node depends on, with their types.
+    pub fn env(&self, v: Val) -> Vec<(Val, Val)> {
+        fn go(m: &Module, v: Val, seen: &mut HashSet<Val>, acc: &mut Vec<(Val, Val)>) {
+            match m.get(v).unwrap() {
+                Node::Param(f, i) => {
+                    if seen.contains(f) {
+                    } else {
+                        match m.get(*f).unwrap() {
+                            Node::Fun(Function { params, .. }) => {
+                                acc.push((v, params[*i as usize]))
+                            }
+                            // Parameters of function types don't count
+                            Node::FunType(_) => (),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                n @ Node::Fun(_) => {
+                    if seen.contains(&v) {
+                    } else {
+                        seen.insert(v);
+                        for i in n.args() {
+                            go(m, i, seen, acc)
+                        }
+                        seen.remove(&v);
+                    }
+                }
+                n => {
+                    for i in n.args() {
+                        go(m, i, seen, acc)
+                    }
+                }
+            }
+        }
+        let mut acc = Vec::new();
+        go(self, v, &mut HashSet::new(), &mut acc);
+        acc
     }
 
     /// Returns a list of everything that depends on `v`'s parameters (and so must be nested in `v`), transitively.
@@ -215,6 +298,27 @@ pub enum Node {
     BinOp(BinOp, Val, Val),
 }
 impl Node {
+    /// Arguments that, *if they're only known at runtime*, exist in the generated LLVM IR.
+    /// So, not types of things.
+    fn runtime_args(&self) -> SmallVec<[Val; 4]> {
+        match self {
+            Node::Fun(Function {
+                callee, call_args, ..
+            }) => call_args
+                .iter()
+                .copied()
+                .chain(std::iter::once(*callee))
+                .collect(),
+            Node::Product(_, v) => v.to_smallvec(),
+            Node::FunType(v) | Node::ProdType(v) | Node::SumType(v) => v.clone(),
+            Node::BinOp(_, a, b) => smallvec![*a, *b],
+            Node::IfCase(_, x) | Node::Proj(x, _) | Node::Inj(_, _, x) => smallvec![*x],
+            Node::Const(_) => SmallVec::new(),
+            // `f` not being known at runtime doesn't really make sense
+            Node::Param(f, _) => SmallVec::new(),
+        }
+    }
+
     pub fn args(&self) -> SmallVec<[Val; 4]> {
         match self {
             Node::Fun(Function {
