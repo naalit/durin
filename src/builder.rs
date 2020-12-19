@@ -6,6 +6,24 @@ pub struct Pi {
     from: Val,
 }
 
+pub struct Sigma {
+    val: Val,
+    tys: SmallVec<[Val; 4]>,
+}
+impl Sigma {
+    /// Returns the argument
+    pub fn add(&mut self, ty: Val, b: &mut Builder) -> Val {
+        let i = self.tys.len() as u8;
+        self.tys.push(ty);
+        b.module.add(Node::Param(self.val, i), None)
+    }
+
+    pub fn finish(self, b: &mut Builder) -> Val {
+        b.module.replace(self.val, Node::ProdType(self.tys));
+        self.val
+    }
+}
+
 /// Takes care of the transformation from direct style to CPS.
 pub struct Builder<'m> {
     module: &'m mut Module,
@@ -57,6 +75,15 @@ impl<'m> Builder<'m> {
         self.module.add(Node::Const(c), None)
     }
 
+    /// Starts an empty sigma type
+    pub fn sigma(&mut self) -> Sigma {
+        Sigma {
+            val: self.module.reserve(None),
+            tys: SmallVec::new(),
+        }
+    }
+
+    /// Shortcut function to create a non-dependent product type
     pub fn prod_type(&mut self, v: impl Into<SmallVec<[Val; 4]>>) -> Val {
         self.module.add(Node::ProdType(v.into()), None)
     }

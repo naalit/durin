@@ -1,10 +1,11 @@
 # Durin doesn't have a switch or case instruction, just `ifcase i x then else` which:
 # - If `x` is variant number `i`, passes the payload to `then`.
 # - Otherwise, calls `else` with no arguments.
-fun adt_fun (x : ((I32, I32) | I32), cont : fun (_:I32)) = ifcase 0 x then else;
+val pair = sig { _: I32, _: I32 };
+fun adt_fun (x : (pair | I32), cont : fun (_:I32)) = ifcase 0 x then else;
 
 # The argument has type `(I32, I32)` since that's variant number 0 of the type of `x`
-fun then (y : (I32, I32)) = cont (y.0);
+fun then (y : pair) = cont (y.0);
 # We do have to use `ifcase` again to extract variant 1
 fun else () = ifcase 1 x then2 else2;
 
@@ -13,4 +14,4 @@ fun then2 (z : I32) = cont z;
 fun else2 () = cont 184i32;
 
 # `t:i x` makes a value of a sum type
-fun make_adt (k : fun (_:I32)) = adt_fun (((I32, I32) | I32):0 { 3i32, 4i32 }) k;
+fun make_adt (k : fun (_:I32)) = adt_fun ((pair | I32):0 struct { 3i32, 4i32 } :: pair) k;

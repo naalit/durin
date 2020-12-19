@@ -161,9 +161,11 @@ impl<'a> Parser<'a> {
     }
 
     fn expr(&mut self) -> Val {
-        if self.matches("{") {
-            // A product type literal
-            // We can't use (x, y) b/c that's the syntax for product types, and * wouldn't work b/c that's multiplication
+        if self.matches("struct") {
+            self.skip_whitespace();
+            self.expect("{");
+            self.skip_whitespace();
+
             let mut v: SmallVec<[Val; 3]> = SmallVec::new();
             while !self.matches("}") {
                 self.skip_whitespace();
@@ -175,20 +177,41 @@ impl<'a> Parser<'a> {
                     self.expect(",");
                 }
             }
-            let ty = {
-                let v = v
-                    .iter()
-                    .map(|x| {
-                        self.module
-                            .get(*x)
-                            .expect("unknown type in product literal")
-                            .clone()
-                            .ty(&mut self.module)
-                    })
-                    .collect();
-                self.module.add(Node::ProdType(v), None)
-            };
+
+            self.skip_whitespace();
+            self.expect("::");
+            self.skip_whitespace();
+
+            let ty = self.expr();
+
             self.module.add(Node::Product(ty, v), None)
+        } else if self.matches("sig") {
+            self.skip_whitespace();
+            self.expect("{");
+            self.skip_whitespace();
+
+            let mut tys = SmallVec::new();
+            let mut names = Vec::new();
+            while !self.matches("}") {
+                let name = self.var();
+                self.skip_whitespace();
+                self.expect(":");
+                self.skip_whitespace();
+                names.push(name);
+                tys.push(self.expr());
+                self.skip_whitespace();
+                if self.matches("}") {
+                    break;
+                } else {
+                    self.expect(",");
+                    self.skip_whitespace();
+                }
+            }
+            let t = self.module.add(Node::ProdType(tys), None);
+            for (i, x) in names.into_iter().enumerate() {
+                self.module.replace(x, Node::Param(t, i as u8));
+            }
+            t
         } else if self.matches("(") {
             // A binop
             let lhs = self.expr();
@@ -269,6 +292,7 @@ impl<'a> Parser<'a> {
                 self.skip_whitespace();
                 names.push(name);
                 params.push(self.expr());
+                self.skip_whitespace();
                 if self.matches(")") {
                     break;
                 } else {
@@ -343,8 +367,7 @@ impl<'a> Parser<'a> {
                 self.expect("=");
                 self.skip_whitespace();
                 let val2 = self.expr();
-                let node = self.module.remove(val2).unwrap();
-                self.module.replace(val, node);
+                self.module.redirect(val, val2);
                 self.skip_whitespace();
                 self.expect(";");
                 continue;
