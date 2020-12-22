@@ -31,6 +31,8 @@ pub struct Builder<'m> {
     params: Vec<Val>,
     /// (fun, block, params, cont)
     funs: Vec<(Val, Val, Vec<Val>, Val)>,
+    /// (continuation, else block)
+    ifs: Vec<(Val, Option<Val>)>,
 }
 impl<'m> Builder<'m> {
     pub fn new(m: &'m mut Module) -> Self {
@@ -40,6 +42,7 @@ impl<'m> Builder<'m> {
             block,
             params: Vec::new(),
             funs: Vec::new(),
+            ifs: Vec::new(),
         }
     }
 
@@ -81,6 +84,123 @@ impl<'m> Builder<'m> {
             val: self.module.reserve(None),
             tys: SmallVec::new(),
         }
+    }
+
+    /// Turns `f (if a then b else c)` into something like:
+    /// ```no_test
+    /// fun f (x : T) = ...;
+    ///
+    /// fun _if () = if a b c;
+    /// fun _ifcont (x : T) = f x;
+    /// fun a () = _ifcont 3;
+    /// fun b () = _ifcont 4;
+    /// ```
+    /// Generated like:
+    /// ```no_test
+    /// builder.if(a);
+    /// b.lower();
+    /// builder.otherwise();
+    /// c.lower();
+    /// let x = builder.endif();
+    /// let f = f.lower();
+    /// builder.call(f, x);
+    /// ```
+    /// Returns the argument to the then block. Call `otherwise` afterwards, then `endif`.
+    pub fn ifcase(&mut self, case: usize, scrutinee: Val, case_ty: Val) -> Val {
+        // At the start of this function (in the example):
+        // - self.params is empty
+        // - we want self.block to be `_if`
+
+        // Make the call to ifcase: this is `_if`
+        let ifcase = self.module.add(Node::IfCase(case, scrutinee), None);
+        let yes = self.module.reserve(None);
+        let no = self.module.reserve(None);
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee: ifcase,
+                call_args: smallvec![yes, no],
+            }),
+        );
+
+        // Set up the continuation, `_ifcont`
+        let cont = self.module.reserve(None);
+
+        // Now set up generating the true block
+        self.block = yes;
+        self.params.push(case_ty);
+        self.ifs.push((cont, Some(no)));
+        self.module.add(Node::Param(yes, 0), None)
+    }
+
+    /// Switches from the `then` block, which returns the given expression, to the `else` block.
+    pub fn otherwise(&mut self, ret: Val) {
+        let (cont, no) = self
+            .ifs
+            .pop()
+            .expect("Called `otherwise` without calling `if` or `ifcase`!");
+        let no = no.expect("Called `otherwise` twice in a row!");
+        self.ifs.push((cont, None));
+
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee: cont,
+                call_args: smallvec![ret],
+            }),
+        );
+        self.block = no;
+    }
+
+    /// Ends an `else` block, returning the expression.
+    pub fn endif(&mut self, ret: Val, ret_ty: Val) -> Val {
+        let (cont, no) = self
+            .ifs
+            .pop()
+            .expect("Called `endif` without calling `if` or `ifcase`!");
+        if no.is_some() {
+            panic!("Called `endif` without calling `otherwise`!");
+        }
+
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee: cont,
+                call_args: smallvec![ret],
+            }),
+        );
+        self.block = cont;
+        self.params.push(ret_ty);
+        self.module.add(Node::Param(cont, 0), None)
+    }
+
+    pub fn project(&mut self, x: Val, i: usize) -> Val {
+        self.module.add(Node::Proj(x, i), None)
+    }
+
+    pub fn sum_idx(&self, x: Val, i: usize) -> Option<Val> {
+        match self.module.get(x) {
+            Some(Node::SumType(v)) => Some(v[i]),
+            _ => None,
+        }
+    }
+
+    pub fn unreachable(&mut self, ty: Val) -> Val {
+        let ur = self.cons(Constant::Unreachable);
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee: ur,
+                call_args: smallvec![],
+            }),
+        );
+        self.block = self.module.reserve(None);
+        self.params.push(ty);
+        self.module.add(Node::Param(self.block, 0), None)
     }
 
     /// Shortcut function to create a non-dependent product type

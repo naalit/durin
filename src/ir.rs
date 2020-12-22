@@ -184,11 +184,12 @@ impl Module {
                                 false
                             }
                     }
-                    Some(Node::Fun(_)) | Some(Node::FunType(_)) if !not.contains(&x) => {
+                    Some(Node::Fun(_)) | Some(Node::FunType(_)) | Some(Node::ProdType(_))
+                        if !not.contains(&x) =>
+                    {
                         // If it calls another function, that function can use its own parameters
-                        let mut not = not.clone();
                         not.insert(x);
-                        let b = has_param(m, x, &mut not);
+                        let b = has_param(m, x, not);
                         not.remove(&x);
                         b
                     }
@@ -216,8 +217,8 @@ impl Module {
                             Node::Fun(Function { params, .. }) => {
                                 acc.push((v, params[*i as usize]))
                             }
-                            // Parameters of function types don't count
-                            Node::FunType(_) => (),
+                            // Parameters of pi or sigma types don't count
+                            Node::FunType(_) | Node::ProdType(_) => (),
                             _ => unreachable!(),
                         }
                     }
@@ -315,7 +316,7 @@ impl Node {
             Node::IfCase(_, x) | Node::Proj(x, _) | Node::Inj(_, _, x) => smallvec![*x],
             Node::Const(_) => SmallVec::new(),
             // `f` not being known at runtime doesn't really make sense
-            Node::Param(f, _) => SmallVec::new(),
+            Node::Param(_f, _) => SmallVec::new(),
         }
     }
 
@@ -359,7 +360,9 @@ impl Node {
                     m.add(Node::Const(Constant::TypeType), None)
                 }
                 Constant::Int(w, _) => m.add(Node::Const(Constant::IntType(*w)), None),
-                Constant::Stop => m.add(Node::FunType(SmallVec::new()), None),
+                Constant::Stop | Constant::Unreachable => {
+                    m.add(Node::FunType(SmallVec::new()), None)
+                }
             },
             Node::BinOp(BinOp::IEq, _, _) => m.add(Node::Const(Constant::IntType(Width::W1)), None),
             Node::BinOp(_, a, _) => a.get(m).clone().ty(m),
@@ -414,6 +417,7 @@ impl Width {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Constant {
     Stop,
+    Unreachable,
     TypeType,
     IntType(Width),
     Int(Width, i64),
@@ -434,6 +438,7 @@ mod display {
     impl std::fmt::Display for Constant {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             match self {
+                Constant::Unreachable => write!(f, "unreachable"),
                 Constant::Stop => write!(f, "stop"),
                 Constant::TypeType => write!(f, "Type"),
                 Constant::IntType(w) => write!(f, "I{}", w),

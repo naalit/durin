@@ -220,8 +220,6 @@ impl crate::ir::Module {
             FunMode::Maybe(reqs) => Some((val, reqs)),
             _ => None,
         }) {
-            let before = reqs.len();
-
             let mut okay = true;
             // The new version of reqs - functions we're still waiting on
             let mut nreqs = Vec::new();
@@ -251,13 +249,6 @@ impl crate::ir::Module {
                 modes.insert(val, FunMode::NoStack);
             } else if nreqs.is_empty() {
                 modes.insert(val, FunMode::YesStack);
-            } else if nreqs.len() == before {
-                // TODO is this actually what we want? What if we need to resolve other things first?
-                eprintln!(
-                    "[Durin] Warning: disabling stack for stuck function {}",
-                    val.pretty(self)
-                );
-                modes.insert(val, FunMode::NoStack);
             } else {
                 modes.insert(val, FunMode::Maybe(nreqs));
             }
@@ -282,7 +273,9 @@ impl crate::ir::Module {
             Node::Const(c) => match c {
                 crate::ir::Constant::TypeType => cxt.size_ty().get_bit_width() as u64 / 4,
                 crate::ir::Constant::IntType(w) => w.bits() as u64 / 4,
-                crate::ir::Constant::Int(_, _) | crate::ir::Constant::Stop => {
+                crate::ir::Constant::Int(_, _)
+                | crate::ir::Constant::Stop
+                | crate::ir::Constant::Unreachable => {
                     unreachable!("not a type")
                 }
             },
@@ -308,7 +301,9 @@ impl crate::ir::Module {
                 crate::ir::Constant::IntType(w) => {
                     cxt.cxt.custom_width_int_type(w.bits()).as_basic_type_enum()
                 }
-                crate::ir::Constant::Int(_, _) | crate::ir::Constant::Stop => {
+                crate::ir::Constant::Int(_, _)
+                | crate::ir::Constant::Stop
+                | crate::ir::Constant::Unreachable => {
                     unreachable!("not a type")
                 }
             },
@@ -343,7 +338,8 @@ impl crate::ir::Module {
                 let &payload = v.iter().max_by_key(|&&x| self.static_size(x, cxt)).unwrap();
                 let payload = self.llvm_ty(payload, cxt);
                 let tag = match v.len() {
-                    0..=1 => cxt.cxt.custom_width_int_type(0),
+                    // No tag if there's only one element
+                    0..=1 => return payload,
                     2 => cxt.cxt.bool_type(),
                     3..=256 => cxt.cxt.i8_type(),
                     257..=65536 => cxt.cxt.i32_type(),
@@ -367,6 +363,8 @@ impl crate::ir::Module {
     }
 
     fn gen_value<'cxt>(&self, val: Val, cxt: &Cxt<'cxt>) -> BasicValueEnum<'cxt> {
+        let val = val.unredirect(self);
+
         if let Some(&v) = cxt.upvalues.get(&val) {
             return v;
         }
@@ -378,7 +376,10 @@ impl crate::ir::Module {
                     unknown,
                     env,
                     ..
-                } = cxt.functions.get(&val).unwrap();
+                } = cxt
+                    .functions
+                    .get(&val)
+                    .unwrap_or_else(|| panic!("Couldn't find {}", val.pretty(self)));
 
                 // Create the environment struct, then store it in an alloca and bitcast the pointer to i8*
                 // TODO heap allocation instead of alloca
@@ -441,6 +442,11 @@ impl crate::ir::Module {
                     .unwrap()
             }
             Node::Inj(ty, i, payload) => {
+                if matches!(self.get(*ty), Some(Node::SumType(v)) if v.len() == 1) {
+                    // No tag or casting needed
+                    return self.gen_value(*payload, cxt);
+                }
+
                 let payload = self.gen_value(*payload, cxt);
                 let payload_ptr = cxt.builder.build_alloca(payload.get_type(), "payload.ptr");
                 cxt.builder.build_store(payload_ptr, payload);
@@ -505,7 +511,9 @@ impl crate::ir::Module {
                     .custom_width_int_type(w.bits())
                     .const_int(*val as u64, false)
                     .as_basic_value_enum(),
-                crate::ir::Constant::Stop => panic!("stop isn't a first-class function!"),
+                crate::ir::Constant::Stop | crate::ir::Constant::Unreachable => {
+                    panic!("stop or unreachable isn't a first-class function!")
+                }
             },
             Node::BinOp(op, a, b) => {
                 let a = self.gen_value(*a, cxt);
@@ -577,6 +585,7 @@ impl crate::ir::Module {
                             // A function is eligible for turning into a basic block if it doesn't call an unknown continuation - it always branches to a known destination.
                             let is_block = match self.get(*callee).unwrap() {
                                 Node::Fun(_) => true,
+                                Node::IfCase(_, _) => true,
                                 // Calls a continuation parameter
                                 Node::Param(f, _) if *f == x => false,
                                 // Must be accessible from outside
@@ -588,7 +597,9 @@ impl crate::ir::Module {
                                 // This is, in theory, an arbitrary LLVM-specific restriction
                                 // In assembly and probably other IRs, basic blocks (labels) can be passed around just fine
                                 && self.uses(x).iter().all(|&u| match self.get(u).unwrap() {
-                                    Node::Fun(f) => f.call_args.iter().all(|a| *a != x),
+                                    Node::Fun(f) => f.call_args.iter().all(|a| *a != x)
+                                        // Using it as an argument to ifcase doesn't count
+                                        || matches!(self.get(f.callee), Some(Node::IfCase(_, _))),
                                     // Accessing its parameters is fine
                                     Node::Param(_, _) => true,
                                     _ => false,
@@ -679,7 +690,6 @@ impl crate::ir::Module {
                 let unknown = cxt.module.add_function(&uname, unknown_ty, None);
                 unknown.set_call_conventions(TAILCC);
 
-                // TODO only include live values in `env`
                 let env = args[0..env.len()]
                     .iter()
                     .zip(env)
@@ -825,6 +835,17 @@ impl crate::ir::Module {
                 if let Some(Node::IfCase(i, x)) = self.get(bfun.callee) {
                     let (&i, &x) = (i, x);
                     let payload_ty = match x.get(self).clone().ty(self).get(self) {
+                        Node::SumType(v) if v.len() == 1 => {
+                            // There's no tag, and no casting needed
+                            let x = self.gen_value(x, cxt);
+                            assert_eq!(bfun.call_args.len(), 2);
+                            let fthen = bfun.call_args[0];
+
+                            self.gen_call(fthen, vec![x], None, cxt);
+
+                            // Skip to the next basic block
+                            continue;
+                        }
                         Node::SumType(v) => v[i],
                         _ => unreachable!(),
                     };
@@ -907,7 +928,9 @@ impl crate::ir::Module {
                     .builder
                     .build_ptr_to_int(any, cxt.cxt.custom_width_int_type(w.bits()), "cast")
                     .as_basic_value_enum(),
-                crate::ir::Constant::Int(_, _) | crate::ir::Constant::Stop => {
+                crate::ir::Constant::Int(_, _)
+                | crate::ir::Constant::Stop
+                | crate::ir::Constant::Unreachable => {
                     unreachable!("not a type")
                 }
             },
@@ -986,6 +1009,9 @@ impl crate::ir::Module {
         // If we're stopping, return void
         } else if let Some(Node::Const(crate::ir::Constant::Stop)) = self.get(callee) {
             cxt.builder.build_return(None);
+        // If we're calling unreachable, emit a LLVM unreachable instruction
+        } else if let Some(Node::Const(crate::ir::Constant::Unreachable)) = self.get(callee) {
+            cxt.builder.build_unreachable();
         // Otherwise, we're actually calling a function
         } else {
             // The mechanism depends on whether it's a known or unknown call
