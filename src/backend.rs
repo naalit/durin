@@ -586,6 +586,7 @@ impl crate::ir::Module {
                             let is_block = match self.get(*callee).unwrap() {
                                 Node::Fun(_) => true,
                                 Node::IfCase(_, _) => true,
+                                Node::Const(crate::ir::Constant::Unreachable) => true,
                                 // Calls a continuation parameter
                                 Node::Param(f, _) if *f == x => false,
                                 // Must be accessible from outside
@@ -724,6 +725,10 @@ impl crate::ir::Module {
         {
             // First generate the unknown version, which just delegates to the known version
             {
+                // Remove any basic blocks and upvalues we generated last time, they're no longer accessible
+                cxt.blocks = HashMap::new();
+                cxt.upvalues = HashMap::new();
+
                 let uentry = cxt.cxt.append_basic_block(*unknown, "entry");
                 cxt.builder.position_at_end(uentry);
 
@@ -743,7 +748,6 @@ impl crate::ir::Module {
                     .into_struct_value();
 
                 // Add environment slots to the context
-                cxt.upvalues = HashMap::new();
                 for (i, &(val, _)) in env.iter().enumerate() {
                     let value = cxt
                         .builder
@@ -796,10 +800,7 @@ impl crate::ir::Module {
             // Declare all blocks and their parameters first
             // Block parameters are stored in allocas, which will be removed with mem2reg
             for (bval, bfun) in blocks {
-                let name = self
-                    .name(*bval)
-                    .cloned()
-                    .unwrap_or_else(|| format!("block${}", val.num()));
+                let name = format!("{}${}", val.pretty(self), bval.pretty(self));
                 let block = cxt.cxt.append_basic_block(fun, &name);
                 let mut params = Vec::new();
                 for &ty in &bfun.params {

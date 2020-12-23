@@ -451,6 +451,18 @@ impl<'a> Parser<'a> {
                         call_args: smallvec![fthen, felse],
                     }),
                 );
+            } else if self.matches("unreachable") {
+                self.skip_whitespace();
+                self.expect(";");
+                let callee = self.module.add(Node::Const(Constant::Unreachable), None);
+                self.module.replace(
+                    val,
+                    Node::Fun(Function {
+                        params,
+                        callee,
+                        call_args: SmallVec::new(),
+                    }),
+                );
             } else {
                 let callee = self.var();
                 self.skip_whitespace();
