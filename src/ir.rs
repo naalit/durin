@@ -273,6 +273,13 @@ impl Module {
                     vec.push(i);
                 }
             }
+            // Add functions only called from here to the scope, so they can be turned into basic blocks
+            for i in self.get(v).unwrap().runtime_args() {
+                if !seen.contains(&i) && self.uses(i).len() == 1 {
+                    seen.insert(i);
+                    vec.push(i);
+                }
+            }
             ix += 1;
         }
 

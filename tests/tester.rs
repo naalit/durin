@@ -31,6 +31,7 @@ fn basic() {
     let l = backend.codegen_module(&mut m);
     let s = l.print_to_string();
     let s = s.to_str().unwrap();
+    l.verify().unwrap();
     println!("{}", s);
     assert!(
         s.contains("define tailcc i32 @f("),

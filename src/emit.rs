@@ -22,17 +22,17 @@ impl<'a> Display for PrettyVal<'a> {
                 }
                 write!(f, ")")
             }
-            Node::ProdType(v) => {
-                write!(f, "(")?;
+            Node::ProdType(params) => {
+                write!(f, "sig {{ ")?;
                 let mut first = true;
-                for i in v {
+                for (i, ty) in params.iter().enumerate() {
                     if !first {
                         write!(f, ", ")?;
                     }
                     first = false;
-                    write!(f, "{}", i.pretty(m))?;
+                    write!(f, "{}: {}", m.param_name(v, i as u8), ty.pretty(m))?;
                 }
-                write!(f, ")")
+                write!(f, " }}")
             }
             Node::SumType(v) => {
                 write!(f, "(")?;
@@ -46,8 +46,8 @@ impl<'a> Display for PrettyVal<'a> {
                 }
                 write!(f, ")")
             }
-            Node::Product(_, v) => {
-                write!(f, "{{")?;
+            Node::Product(ty, v) => {
+                write!(f, "struct {{ ")?;
                 let mut first = true;
                 for i in v {
                     if !first {
@@ -56,7 +56,7 @@ impl<'a> Display for PrettyVal<'a> {
                     first = false;
                     write!(f, "{}", i.pretty(m))?;
                 }
-                write!(f, "}}")
+                write!(f, " }} :: {}", ty.pretty(m))
             }
             Node::Inj(t, i, v) => {
                 write!(f, "({}:{} {})", t.pretty(m), i, v.pretty(m))
