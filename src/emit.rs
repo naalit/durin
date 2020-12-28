@@ -58,6 +58,9 @@ impl<'a> Display for PrettyVal<'a> {
                 }
                 write!(f, " }} :: {}", ty.pretty(m))
             }
+            Node::Proj(x, i) => {
+                write!(f, "({}.{})", x.pretty(m), i)
+            }
             Node::Inj(t, i, v) => {
                 write!(f, "({}:{} {})", t.pretty(m), i, v.pretty(m))
             }

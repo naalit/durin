@@ -208,14 +208,14 @@ impl Module {
 
     /// Returns a list of all foreign parameters this node depends on, with their types.
     pub fn env(&self, v: Val) -> Vec<(Val, Val)> {
-        fn go(m: &Module, v: Val, seen: &mut HashSet<Val>, acc: &mut Vec<(Val, Val)>) {
+        fn go(m: &Module, v: Val, seen: &mut HashSet<Val>, acc: &mut HashSet<(Val, Val)>) {
             match m.get(v).unwrap() {
                 Node::Param(f, i) => {
                     if seen.contains(f) {
                     } else {
                         match m.get(*f).unwrap() {
                             Node::Fun(Function { params, .. }) => {
-                                acc.push((v, params[*i as usize]))
+                                acc.insert((v, params[*i as usize]));
                             }
                             // Parameters of pi or sigma types don't count
                             Node::FunType(_) | Node::ProdType(_) => (),
@@ -224,25 +224,24 @@ impl Module {
                     }
                 }
                 n @ Node::Fun(_) => {
-                    if seen.contains(&v) {
-                    } else {
+                    if !seen.contains(&v) {
                         seen.insert(v);
-                        for i in n.args() {
+                        for i in n.runtime_args() {
                             go(m, i, seen, acc)
                         }
                         seen.remove(&v);
                     }
                 }
                 n => {
-                    for i in n.args() {
+                    for i in n.runtime_args() {
                         go(m, i, seen, acc)
                     }
                 }
             }
         }
-        let mut acc = Vec::new();
+        let mut acc = HashSet::new();
         go(self, v, &mut HashSet::new(), &mut acc);
-        acc
+        acc.into_iter().collect()
     }
 
     /// Returns a list of everything that depends on `v`'s parameters (and so must be nested in `v`), transitively.
