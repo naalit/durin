@@ -68,7 +68,7 @@ pub struct LFunction<'cxt> {
     pub arity: u32,
     pub known: FunctionValue<'cxt>,
     pub unknown: FunctionValue<'cxt>,
-    pub env: Vec<(Val, BasicTypeEnum<'cxt>)>,
+    pub env: Vec<(Val, BasicTypeEnum<'cxt>, Val)>,
     pub stack_enabled: bool,
     pub blocks: VecDeque<(Val, Function)>,
     pub cont: Option<Val>,
@@ -271,18 +271,18 @@ impl crate::ir::Module {
     fn static_size<'cxt>(&self, val: Val, cxt: &Cxt<'cxt>) -> u64 {
         match self.get(val).unwrap() {
             Node::Const(c) => match c {
-                crate::ir::Constant::TypeType => cxt.size_ty().get_bit_width() as u64 / 4,
-                crate::ir::Constant::IntType(w) => w.bits() as u64 / 4,
+                crate::ir::Constant::TypeType => cxt.size_ty().get_bit_width() as u64 / 8,
+                crate::ir::Constant::IntType(w) => w.bits() as u64 / 8,
                 crate::ir::Constant::Int(_, _)
                 | crate::ir::Constant::Stop
                 | crate::ir::Constant::Unreachable => {
                     unreachable!("not a type")
                 }
             },
-            Node::FunType(_) => cxt.size_ty().get_bit_width() as u64 / 4 * 2,
+            Node::FunType(_) => cxt.size_ty().get_bit_width() as u64 / 8 * 2,
             Node::ProdType(v) => v.iter().map(|&x| self.static_size(x, cxt)).sum(),
             Node::SumType(v) => v.iter().map(|&x| self.static_size(x, cxt)).max().unwrap(),
-            Node::Param(_, _) => cxt.size_ty().get_bit_width() as u64 / 4,
+            Node::Param(_, _) => cxt.size_ty().get_bit_width() as u64 / 8,
             Node::Fun(_)
             | Node::BinOp(_, _, _)
             | Node::IfCase(_, _)
@@ -385,22 +385,35 @@ impl crate::ir::Module {
 
                 // Create the environment struct, then store it in an alloca and bitcast the pointer to i8*
                 // TODO heap allocation instead of alloca
-                let env_tys: Vec<_> = env.iter().map(|&(_, ty)| ty).collect();
-                let mut env_val = cxt.cxt.struct_type(&env_tys, false).get_undef();
-                for (i, &(val, _)) in env.iter().enumerate() {
-                    // TODO reuse values (all over the codebase but especially here)
-                    let val = self.gen_value(val, cxt);
-                    env_val = cxt
-                        .builder
-                        .build_insert_value(env_val, val, i as u32, "env_insert")
-                        .unwrap()
-                        .into_struct_value();
-                }
-                let env_ptr = cxt
-                    .builder
-                    .build_alloca(cxt.cxt.struct_type(&env_tys, false), "env_ptr");
-                cxt.builder.build_store(env_ptr, env_val);
-                let env = cxt.builder.build_bitcast(env_ptr, cxt.any_ty(), "env");
+                let env = match env.len() {
+                    0 => cxt.any_ty().into_pointer_type().get_undef(),
+                    1 => {
+                        // If there's only one upvalue, treat it like an `any`
+                        let (val, _, _) = env[0];
+                        let val = self.gen_value(val, cxt);
+                        self.to_any(val, cxt)
+                    }
+                    _ => {
+                        let env_tys: Vec<_> = env.iter().map(|&(_, ty, _)| ty).collect();
+                        let mut env_val = cxt.cxt.struct_type(&env_tys, false).get_undef();
+                        for (i, &(val, _, _)) in env.iter().enumerate() {
+                            // TODO reuse values (all over the codebase but especially here)
+                            let val = self.gen_value(val, cxt);
+                            env_val = cxt
+                                .builder
+                                .build_insert_value(env_val, val, i as u32, "env_insert")
+                                .unwrap()
+                                .into_struct_value();
+                        }
+                        let env_ptr = cxt
+                            .builder
+                            .build_alloca(cxt.cxt.struct_type(&env_tys, false), "env_ptr");
+                        cxt.builder.build_store(env_ptr, env_val);
+                        cxt.builder
+                            .build_bitcast(env_ptr, cxt.any_ty(), "env")
+                            .into_pointer_value()
+                    }
+                };
 
                 // We use the unknown version of the function, which takes one environment parameter and all of type i8* (any)
                 let arg_tys: Vec<_> = (0..arity + 1).map(|_| cxt.any_ty()).collect();
@@ -539,15 +552,6 @@ impl crate::ir::Module {
                         .builder
                         .build_int_signed_div(a.into_int_value(), b.into_int_value(), name)
                         .as_basic_value_enum(),
-                    crate::ir::BinOp::IEq => cxt
-                        .builder
-                        .build_int_compare(
-                            IntPredicate::EQ,
-                            a.into_int_value(),
-                            b.into_int_value(),
-                            name,
-                        )
-                        .as_basic_value_enum(),
                     crate::ir::BinOp::IAnd => cxt
                         .builder
                         .build_and(a.into_int_value(), b.into_int_value(), name)
@@ -570,6 +574,61 @@ impl crate::ir::Module {
                         .build_right_shift(a.into_int_value(), b.into_int_value(), true, name)
                         .as_basic_value_enum(),
                     crate::ir::BinOp::IExp => todo!("llvm.powi intrinsic"),
+
+                    crate::ir::BinOp::IEq => cxt
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            a.into_int_value(),
+                            b.into_int_value(),
+                            name,
+                        )
+                        .as_basic_value_enum(),
+                    crate::ir::BinOp::INEq => cxt
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::NE,
+                            a.into_int_value(),
+                            b.into_int_value(),
+                            name,
+                        )
+                        .as_basic_value_enum(),
+                    crate::ir::BinOp::IGt => cxt
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::SGT,
+                            a.into_int_value(),
+                            b.into_int_value(),
+                            name,
+                        )
+                        .as_basic_value_enum(),
+                    crate::ir::BinOp::ILt => cxt
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::SLT,
+                            a.into_int_value(),
+                            b.into_int_value(),
+                            name,
+                        )
+                        .as_basic_value_enum(),
+                    crate::ir::BinOp::IGeq => cxt
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::SGE,
+                            a.into_int_value(),
+                            b.into_int_value(),
+                            name,
+                        )
+                        .as_basic_value_enum(),
+                    crate::ir::BinOp::ILeq => cxt
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::SLE,
+                            a.into_int_value(),
+                            b.into_int_value(),
+                            name,
+                        )
+                        .as_basic_value_enum(),
                 }
             }
         }
@@ -645,8 +704,14 @@ impl crate::ir::Module {
                                 ))
                             } else {
                                 // Mark it for generation, if it isn't marked already
-                                if !to_add.contains(&x) && !to_gen.iter().any(|(y, _)| *y == x) {
-                                    to_add.push(x);
+                                if !to_add.iter().any(|(y, _)| *y == x) {
+                                    if to_gen.iter().any(|(y, _)| *y == x) {
+                                        let (_, v) = to_gen.iter().find(|(y, _)| *y == x).unwrap().clone();
+                                        to_gen.retain(|(y, _)| *y != x);
+                                        to_add.push((x, v));
+                                    } else {
+                                        to_add.push((x, Vec::new()));
+                                    }
                                 }
                                 // Things in its scope don't belong here, they'll be generated with it later
                                 for i in self.scope(x) {
@@ -666,17 +731,17 @@ impl crate::ir::Module {
                     .filter(|(x, _)| !not.contains(x))
                     .collect();
                 // Copy any basic blocks that the function uses
-                for x in to_add {
-                    let mut x_blocks = Vec::new();
+                for (x, mut x_blocks) in to_add {
+                    let mut xscope = self.scope(x);
+                    xscope.push(x);
+                    let xscope: Vec<_> = xscope
+                        .into_iter()
+                        .flat_map(|x| x.get(self).args())
+                        .collect();
                     for b in &blocks {
                         let &(v, _) = b;
                         let h: HashSet<_> = self.uses(v).iter().copied().collect();
-                        if self
-                            .scope(x)
-                            .into_iter()
-                            .flat_map(|x| x.get(self).args())
-                            .any(|x| h.contains(&x))
-                        {
+                        if xscope.iter().any(|x| h.contains(&x)) {
                             x_blocks.push(b.clone());
                         }
                     }
@@ -748,7 +813,7 @@ impl crate::ir::Module {
                 let env = args[0..env.len()]
                     .iter()
                     .zip(env)
-                    .map(|(&ty, (val, _))| (val, ty))
+                    .map(|(&ty, (val, ty2))| (val, ty, ty2))
                     .collect();
 
                 cxt.functions.insert(
@@ -788,30 +853,42 @@ impl crate::ir::Module {
 
                 // Unpack environment
                 let &env_ptr = unknown.get_params().last().unwrap();
+                env_ptr.set_name("env");
                 // TODO wait, what about dependently sized types?
-                let env_tys: Vec<_> = env.iter().map(|&(_, ty)| ty).collect();
-                let env_ty = cxt.cxt.struct_type(&env_tys, false);
-                let env_ptr = cxt.builder.build_bitcast(
-                    env_ptr,
-                    env_ty.ptr_type(AddressSpace::Generic),
-                    "env_ptr",
-                );
-                let env_val = cxt
-                    .builder
-                    .build_load(env_ptr.into_pointer_value(), "env")
-                    .into_struct_value();
+                match env.len() {
+                    0 => (),
+                    1 => {
+                        // There's only one upvalue, so treat the environment pointer as an `any`
+                        let (val, _, ty) = env[0];
+                        let value = self.from_any(env_ptr.into_pointer_value(), ty, cxt);
+                        cxt.upvalues.insert(val, value);
+                    }
+                    _ => {
+                        let env_tys: Vec<_> = env.iter().map(|&(_, ty, _)| ty).collect();
+                        let env_ty = cxt.cxt.struct_type(&env_tys, false);
+                        let env_ptr = cxt.builder.build_bitcast(
+                            env_ptr,
+                            env_ty.ptr_type(AddressSpace::Generic),
+                            "env_ptr",
+                        );
+                        let env_val = cxt
+                            .builder
+                            .build_load(env_ptr.into_pointer_value(), "env")
+                            .into_struct_value();
 
-                // Add environment slots to the context
-                for (i, &(val, _)) in env.iter().enumerate() {
-                    let value = cxt
-                        .builder
-                        .build_extract_value(
-                            env_val,
-                            i as u32,
-                            self.name(val).map(|x| x as &str).unwrap_or("upvalue"),
-                        )
-                        .unwrap();
-                    cxt.upvalues.insert(val, value);
+                        // Add environment slots to the context
+                        for (i, &(val, _, _)) in env.iter().enumerate() {
+                            let value = cxt
+                                .builder
+                                .build_extract_value(
+                                    env_val,
+                                    i as u32,
+                                    self.name(val).map(|x| x as &str).unwrap_or("upvalue"),
+                                )
+                                .unwrap();
+                            cxt.upvalues.insert(val, value);
+                        }
+                    }
                 }
 
                 // Call function
@@ -847,7 +924,7 @@ impl crate::ir::Module {
             cxt.upvalues = HashMap::new();
 
             // Add closed-over upvalues to the context
-            for ((val, _ty), param) in env.iter().zip(fun.get_params()) {
+            for ((val, _ty, _ty2), param) in env.iter().zip(fun.get_params()) {
                 cxt.upvalues.insert(*val, param);
             }
 
@@ -1009,16 +1086,41 @@ impl crate::ir::Module {
                     unreachable!("not a type")
                 }
             },
+            Node::ProdType(x) if x.len() == 1 => self.from_any(any, x[0], cxt),
+            Node::SumType(x) if x.len() == 1 => cxt
+                .builder
+                .build_insert_value(
+                    self.llvm_ty(ty, cxt).into_struct_type().get_undef(),
+                    self.from_any(any, x[0], cxt),
+                    0,
+                    "wrap_cast",
+                )
+                .unwrap()
+                .as_basic_value_enum(),
             Node::FunType(_) | Node::ProdType(_) | Node::SumType(_) => {
-                let ptr = cxt
-                    .builder
-                    .build_bitcast(
-                        any,
-                        self.llvm_ty(ty, cxt).ptr_type(AddressSpace::Generic),
-                        "ptr",
-                    )
-                    .into_pointer_value();
-                cxt.builder.build_load(ptr, "val")
+                match self.static_size(ty, cxt) {
+                    0 => self
+                        .llvm_ty(ty, cxt)
+                        .into_struct_type()
+                        .get_undef()
+                        .as_basic_value_enum(),
+                    // TODO cast to 2+ element structs or products without loading
+                    // x if x <= cxt.machine.get_target_data().get_pointer_byte_size(None).into() => {
+                    //     let int = cxt.builder.build_ptr_to_int(any, cxt.cxt.custom_width_int_type(x as u32 * 8), "shrink");
+                    //     cxt.builder.build_bitcast(int, self.llvm_ty(ty, cxt), "cast")
+                    // }
+                    _ => {
+                        let ptr = cxt
+                            .builder
+                            .build_bitcast(
+                                any,
+                                self.llvm_ty(ty, cxt).ptr_type(AddressSpace::Generic),
+                                "ptr",
+                            )
+                            .into_pointer_value();
+                        cxt.builder.build_load(ptr, "val")
+                    }
+                }
             }
             // Leave as an "any" since it's polymorphic
             Node::Param(_, _) => any.as_basic_value_enum(),
@@ -1041,6 +1143,16 @@ impl crate::ir::Module {
                 let val = val.into_int_value();
                 cxt.builder
                     .build_int_to_ptr(val, cxt.any_ty().into_pointer_type(), "cast")
+            }
+            BasicTypeEnum::StructType(x) if x.count_fields() == 0 => {
+                cxt.any_ty().into_pointer_type().get_undef()
+            }
+            BasicTypeEnum::StructType(x) if x.count_fields() == 1 => {
+                let x = cxt
+                    .builder
+                    .build_extract_value(val.into_struct_value(), 0, "unwrap_cast")
+                    .unwrap();
+                self.to_any(x, cxt)
             }
             BasicTypeEnum::ArrayType(_)
             | BasicTypeEnum::StructType(_)
@@ -1139,7 +1251,7 @@ impl crate::ir::Module {
                         .collect::<Vec<_>>();
                     let mut args: Vec<_> = env
                         .iter()
-                        .map(|&(val, _)| self.gen_value(val, cxt))
+                        .map(|&(val, _, _)| self.gen_value(val, cxt))
                         .chain(args)
                         .collect();
 

@@ -450,6 +450,11 @@ pub enum BinOp {
     IShl,
     IShr,
     IEq,
+    INEq,
+    IGt,
+    ILt,
+    IGeq,
+    ILeq,
 }
 
 mod display {
@@ -485,6 +490,11 @@ mod display {
                 BinOp::IXor => write!(f, "^"),
                 BinOp::IShl => write!(f, "<<"),
                 BinOp::IShr => write!(f, ">>"),
+                BinOp::INEq => write!(f, "!="),
+                BinOp::IGt => write!(f, ">"),
+                BinOp::ILt => write!(f, "<"),
+                BinOp::IGeq => write!(f, ">="),
+                BinOp::ILeq => write!(f, "<="),
             }
         }
     }
