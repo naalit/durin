@@ -86,6 +86,10 @@ impl<'m> Builder<'m> {
         }
     }
 
+    pub fn binop(&mut self, op: BinOp, a: Val, b: Val) -> Val {
+        self.module.add(Node::BinOp(op, a, b), None)
+    }
+
     /// Turns `f (if a then b else c)` into something like:
     /// ```no_test
     /// fun f (x : T) = ...;
@@ -132,6 +136,30 @@ impl<'m> Builder<'m> {
         self.params.push(case_ty);
         self.ifs.push((cont, Some(no)));
         self.module.add(Node::Param(yes, 0), None)
+    }
+
+    pub fn if_expr(&mut self, cond: Val) {
+        // Make the call to ifcase: this is `_if`
+        let ifexp = self.module.add(Node::If(cond), None);
+        let yes = self.module.reserve(None);
+        let no = self.module.reserve(None);
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee: ifexp,
+                call_args: smallvec![yes, no],
+            }),
+        );
+
+        // Set up the continuation, `_ifcont`
+        let cont = self.module.reserve(None);
+
+        // Now set up generating the true block
+        self.block = yes;
+        self.ifs.push((cont, Some(no)));
+
+        // No parameter since it's a normal if
     }
 
     /// Switches from the `then` block, which returns the given expression, to the `else` block.

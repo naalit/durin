@@ -294,6 +294,7 @@ pub enum Node {
     SumType(SmallVec<[Val; 4]>),
     /// IfCase(tag, x); then and else are passed to it as arguments
     IfCase(usize, Val),
+    If(Val),
     /// Projecting a numbered member of a product type
     Proj(Val, usize),
     /// Injecting a numbered member of a sum type (the type is the first argument)
@@ -319,7 +320,9 @@ impl Node {
             Node::Product(_, v) => v.to_smallvec(),
             Node::FunType(v) | Node::ProdType(v) | Node::SumType(v) => v.clone(),
             Node::BinOp(_, a, b) => smallvec![*a, *b],
-            Node::IfCase(_, x) | Node::Proj(x, _) | Node::Inj(_, _, x) => smallvec![*x],
+            Node::IfCase(_, x) | Node::Proj(x, _) | Node::Inj(_, _, x) | Node::If(x) => {
+                smallvec![*x]
+            }
             Node::Const(_) => SmallVec::new(),
             // `f` not being known at runtime doesn't really make sense
             Node::Param(_f, _) => SmallVec::new(),
@@ -343,7 +346,7 @@ impl Node {
             Node::Param(f, _) => smallvec![*f],
             Node::BinOp(_, a, b) | Node::Inj(a, _, b) => smallvec![*a, *b],
             Node::Const(_) => SmallVec::new(),
-            Node::IfCase(_, x) | Node::Proj(x, _) => smallvec![*x],
+            Node::IfCase(_, x) | Node::Proj(x, _) | Node::If(x) => smallvec![*x],
         }
     }
 
@@ -372,6 +375,11 @@ impl Node {
             },
             Node::BinOp(BinOp::IEq, _, _) => m.add(Node::Const(Constant::IntType(Width::W1)), None),
             Node::BinOp(_, a, _) => a.get(m).clone().ty(m),
+            Node::If(_) => {
+                let fty = m.add(Node::FunType(smallvec![]), None);
+                // Takes `then` and `else` blocks as arguments
+                m.add(Node::FunType(smallvec![fty, fty]), None)
+            }
             Node::IfCase(i, x) => {
                 let arg = match x.get(m).clone().ty(m).get(m) {
                     Node::SumType(v) => v[*i],
@@ -435,6 +443,12 @@ pub enum BinOp {
     ISub,
     IMul,
     IDiv,
+    IExp,
+    IAnd,
+    IOr,
+    IXor,
+    IShl,
+    IShr,
     IEq,
 }
 
@@ -465,6 +479,12 @@ mod display {
                 BinOp::ISub => write!(f, "-"),
                 BinOp::IMul => write!(f, "*"),
                 BinOp::IDiv => write!(f, "/"),
+                BinOp::IExp => write!(f, "**"),
+                BinOp::IAnd => write!(f, "&"),
+                BinOp::IOr => write!(f, "|"),
+                BinOp::IXor => write!(f, "^"),
+                BinOp::IShl => write!(f, "<<"),
+                BinOp::IShr => write!(f, ">>"),
             }
         }
     }

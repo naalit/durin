@@ -310,6 +310,18 @@ impl<'a> Parser<'a> {
         } else if self.matches("I32") {
             self.module
                 .add(Node::Const(Constant::IntType(Width::W32)), None)
+        } else if self.matches("I64") {
+            self.module
+                .add(Node::Const(Constant::IntType(Width::W64)), None)
+        } else if self.matches("I1") {
+            self.module
+                .add(Node::Const(Constant::IntType(Width::W1)), None)
+        } else if self.matches("I8") {
+            self.module
+                .add(Node::Const(Constant::IntType(Width::W8)), None)
+        } else if self.matches("I16") {
+            self.module
+                .add(Node::Const(Constant::IntType(Width::W16)), None)
         } else if self
             .peek()
             .expect("unexpected EOF, maybe missing ;")
@@ -443,6 +455,30 @@ impl<'a> Parser<'a> {
                 self.expect(";");
 
                 let callee = self.module.add(Node::IfCase(i, x), None);
+                self.module.replace(
+                    val,
+                    Node::Fun(Function {
+                        params,
+                        callee,
+                        call_args: smallvec![fthen, felse],
+                    }),
+                );
+            // Do ifcase first since `if` would match `ifcase` too
+            } else if self.matches("if") {
+                self.skip_whitespace();
+
+                let x = self.expr();
+                self.skip_whitespace();
+
+                let fthen = self.expr();
+                self.skip_whitespace();
+
+                let felse = self.expr();
+                self.skip_whitespace();
+
+                self.expect(";");
+
+                let callee = self.module.add(Node::If(x), None);
                 self.module.replace(
                     val,
                     Node::Fun(Function {

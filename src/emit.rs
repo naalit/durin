@@ -64,8 +64,14 @@ impl<'a> Display for PrettyVal<'a> {
             Node::Inj(t, i, v) => {
                 write!(f, "({}:{} {})", t.pretty(m), i, v.pretty(m))
             }
+            Node::If(x) => {
+                write!(f, "if {}", x.pretty(m))
+            }
             Node::IfCase(i, x) => {
                 write!(f, "ifcase {} {}", i, x.pretty(m))
+            }
+            Node::BinOp(op, a, b) => {
+                write!(f, "({} {} {})", a.pretty(m), op, b.pretty(m))
             }
             // Node::Param(a, b) => write!(f, "{}.{}", a.pretty(m), b),
             _ => match &m.names[v.num()] {
@@ -149,17 +155,6 @@ impl Module {
                             write!(buf, " {}", v.pretty(self)).unwrap();
                         }
                         writeln!(buf, ";").unwrap();
-                    }
-                    Node::BinOp(op, a, b) => {
-                        writeln!(
-                            buf,
-                            "val {} = ({} {} {});",
-                            self.name_or(num),
-                            a.pretty(self),
-                            op,
-                            b.pretty(self)
-                        )
-                        .unwrap();
                     }
                     _ => {
                         // Nothing, since constants and params are inlined

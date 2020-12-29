@@ -52,3 +52,5 @@ verify!(closures);
 verify!(pi);
 verify!(adt);
 verify!(sigma);
+verify!(ifs);
+verify!(blocks);

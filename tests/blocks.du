@@ -1,0 +1,15 @@
+fun root (x : I32, cont : fun(_: I32)) = if (0i32 == x) then else;
+
+fun then () = block 1i32;
+
+fun else () = tfun x nested;
+
+# This is a basic block inside `root`
+fun block (z : I32) = cont z;
+
+fun tfun (y : I32, f : fun(_: I32)) = f y;
+
+# This is a top-level function, since it's passed to a first-class function
+# But it still needs `block`, which is a basic block in `root`
+# So we should copy it to `nested` as well
+fun nested (w : I32) = block w;

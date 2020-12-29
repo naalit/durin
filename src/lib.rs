@@ -34,6 +34,7 @@ impl Node {
                 Node::Product(ty.mangle(m, map), v)
             }
             Node::IfCase(i, x) => Node::IfCase(i, x.mangle(m, map)),
+            Node::If(x) => Node::If(x.mangle(m, map)),
             Node::Proj(x, i) => Node::Proj(x.mangle(m, map), i),
             Node::Param(f, i) => Node::Param(f.mangle(m, map), i),
             Node::BinOp(op, a, b) => Node::BinOp(op, a.mangle(m, map), b.mangle(m, map)),

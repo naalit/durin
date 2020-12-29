@@ -288,7 +288,8 @@ impl crate::ir::Module {
             | Node::IfCase(_, _)
             | Node::Proj(_, _)
             | Node::Inj(_, _, _)
-            | Node::Product(_, _) => {
+            | Node::Product(_, _)
+            | Node::If(_) => {
                 unreachable!("not a type")
             }
         }
@@ -356,7 +357,8 @@ impl crate::ir::Module {
             | Node::IfCase(_, _)
             | Node::Proj(_, _)
             | Node::Inj(_, _, _)
-            | Node::Product(_, _) => {
+            | Node::Product(_, _)
+            | Node::If(_) => {
                 unreachable!("not a type")
             }
         }
@@ -494,6 +496,7 @@ impl crate::ir::Module {
                 agg.as_basic_value_enum()
             }
             Node::IfCase(_, _) => panic!("`ifcase _ _` isn't a first-class function!"),
+            Node::If(_) => panic!("`if _` isn't a first-class function!"),
             Node::Param(f, i) => {
                 let name = self.name(val).map(|x| x as &str).unwrap_or("param");
                 let ptr = cxt.blocks.get(f).unwrap().1[*i as usize];
@@ -545,6 +548,28 @@ impl crate::ir::Module {
                             name,
                         )
                         .as_basic_value_enum(),
+                    crate::ir::BinOp::IAnd => cxt
+                        .builder
+                        .build_and(a.into_int_value(), b.into_int_value(), name)
+                        .as_basic_value_enum(),
+                    crate::ir::BinOp::IOr => cxt
+                        .builder
+                        .build_or(a.into_int_value(), b.into_int_value(), name)
+                        .as_basic_value_enum(),
+                    crate::ir::BinOp::IXor => cxt
+                        .builder
+                        .build_xor(a.into_int_value(), b.into_int_value(), name)
+                        .as_basic_value_enum(),
+                    crate::ir::BinOp::IShl => cxt
+                        .builder
+                        .build_left_shift(a.into_int_value(), b.into_int_value(), name)
+                        .as_basic_value_enum(),
+                    crate::ir::BinOp::IShr => cxt
+                        .builder
+                        // TODO unsigned vs signed (division too)
+                        .build_right_shift(a.into_int_value(), b.into_int_value(), true, name)
+                        .as_basic_value_enum(),
+                    crate::ir::BinOp::IExp => todo!("llvm.powi intrinsic"),
                 }
             }
         }
@@ -554,11 +579,12 @@ impl crate::ir::Module {
         let stack_enabled = self.stack_enabled();
 
         // Codegen all functions visible from the top level, and everything reachable from there
-        let mut to_gen: Vec<Val> = self.top_level().collect();
+        let mut to_gen: Vec<(Val, Vec<(Val, crate::ir::Function)>)> =
+            self.top_level().map(|x| (x, Vec::new())).collect();
         // This explicit for loop allows us to add to to_gen in the body of the loop
         let mut i = 0;
         while i < to_gen.len() {
-            let val = to_gen[i].clone();
+            let (val, blocks) = to_gen[i].clone();
             let env = self.env(val);
             i += 1;
 
@@ -569,6 +595,7 @@ impl crate::ir::Module {
                 let scope = self.scope(val);
 
                 // Figure out which functions in `scope` can be basic blocks, and add others to `to_gen`
+                let mut to_add = Vec::new();
                 let mut not = HashSet::new();
                 let mut blocks: VecDeque<_> = scope
                     .into_iter()
@@ -586,7 +613,7 @@ impl crate::ir::Module {
                             // A function is eligible for turning into a basic block if it doesn't call an unknown continuation - it always branches to a known destination.
                             let is_block = match self.get(*callee).unwrap() {
                                 Node::Fun(_) => true,
-                                Node::IfCase(_, _) => true,
+                                Node::IfCase(_, _) | Node::If(_) => true,
                                 Node::Const(crate::ir::Constant::Unreachable) => true,
                                 // Calls a continuation parameter
                                 Node::Param(f, _) if *f == x => false,
@@ -600,8 +627,8 @@ impl crate::ir::Module {
                                 // In assembly and probably other IRs, basic blocks (labels) can be passed around just fine
                                 && self.uses(x).iter().all(|&u| match self.get(u).unwrap() {
                                     Node::Fun(f) => f.call_args.iter().all(|a| *a != x)
-                                        // Using it as an argument to ifcase doesn't count
-                                        || matches!(self.get(f.callee), Some(Node::IfCase(_, _))),
+                                        // Using it as an argument to if or ifcase doesn't count
+                                        || matches!(self.get(f.callee), Some(Node::If(_)) | Some(Node::IfCase(_, _))),
                                     // Accessing its parameters is fine
                                     Node::Param(_, _) => true,
                                     _ => false,
@@ -618,8 +645,8 @@ impl crate::ir::Module {
                                 ))
                             } else {
                                 // Mark it for generation, if it isn't marked already
-                                if !to_gen.contains(&x) {
-                                    to_gen.push(x);
+                                if !to_add.contains(&x) && !to_gen.iter().any(|(y, _)| *y == x) {
+                                    to_add.push(x);
                                 }
                                 // Things in its scope don't belong here, they'll be generated with it later
                                 for i in self.scope(x) {
@@ -635,8 +662,26 @@ impl crate::ir::Module {
                     // So we can borrow `not` again
                     .collect::<Vec<_>>()
                     .into_iter()
+                    .chain(blocks)
                     .filter(|(x, _)| !not.contains(x))
                     .collect();
+                // Copy any basic blocks that the function uses
+                for x in to_add {
+                    let mut x_blocks = Vec::new();
+                    for b in &blocks {
+                        let &(v, _) = b;
+                        let h: HashSet<_> = self.uses(v).iter().copied().collect();
+                        if self
+                            .scope(x)
+                            .into_iter()
+                            .flat_map(|x| x.get(self).args())
+                            .any(|x| h.contains(&x))
+                        {
+                            x_blocks.push(b.clone());
+                        }
+                    }
+                    to_gen.push((x, x_blocks));
+                }
 
                 // The first basic block is the actual function body
                 blocks.push_front((val, fun.clone()));
@@ -841,8 +886,28 @@ impl crate::ir::Module {
                 let (block, _) = cxt.blocks.get(&bval).unwrap();
                 cxt.builder.position_at_end(*block);
 
+                // If we're calling if x, do that
+                if let Some(Node::If(x)) = self.get(bfun.callee) {
+                    let &x = x;
+                    assert_eq!(bfun.call_args.len(), 2);
+                    let fthen = bfun.call_args[0];
+                    let felse = bfun.call_args[1];
+
+                    let cond = self.gen_value(x, cxt).into_int_value();
+
+                    let bstart = cxt.builder.get_insert_block().unwrap();
+                    let bthen = cxt.cxt.insert_basic_block_after(bstart, "if.then");
+                    let belse = cxt.cxt.insert_basic_block_after(bthen, "if.else");
+
+                    cxt.builder.build_conditional_branch(cond, bthen, belse);
+
+                    cxt.builder.position_at_end(bthen);
+                    self.gen_call(fthen, None, vec![], None, cxt);
+
+                    cxt.builder.position_at_end(belse);
+                    self.gen_call(felse, None, vec![], None, cxt);
                 // If we're calling ifcase i x, do that instead
-                if let Some(Node::IfCase(i, x)) = self.get(bfun.callee) {
+                } else if let Some(Node::IfCase(i, x)) = self.get(bfun.callee) {
                     let (&i, &x) = (i, x);
                     let payload_ty = match x.get(self).clone().ty(self).get(self) {
                         Node::SumType(v) if v.len() == 1 => {
@@ -963,7 +1028,8 @@ impl crate::ir::Module {
             | Node::IfCase(_, _)
             | Node::Proj(_, _)
             | Node::Inj(_, _, _)
-            | Node::Product(_, _) => {
+            | Node::Product(_, _)
+            | Node::If(_) => {
                 unreachable!("not a type")
             }
         }
@@ -1011,7 +1077,10 @@ impl crate::ir::Module {
         cont: Option<Val>,
         cxt: &Cxt<'cxt>,
     ) {
-        let tys = match callee_ty.unwrap_or_else(|| self.get(callee).unwrap().clone().ty(self)).get(self) {
+        let tys = match callee_ty
+            .unwrap_or_else(|| self.get(callee).unwrap().clone().ty(self))
+            .get(self)
+        {
             Node::FunType(tys) => tys.clone(),
             _ => unreachable!(),
         };
