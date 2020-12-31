@@ -209,6 +209,7 @@ impl Module {
     /// Returns a list of all foreign parameters this node depends on, with their types.
     pub fn env(&self, v: Val) -> Vec<(Val, Val)> {
         fn go(m: &Module, v: Val, seen: &mut HashSet<Val>, acc: &mut HashSet<(Val, Val)>) {
+            let v = v.unredirect(m);
             match m.get(v).unwrap() {
                 Node::Param(f, i) => {
                     if seen.contains(f) {
@@ -274,6 +275,7 @@ impl Module {
             }
             // Add functions only called from here to the scope, so they can be turned into basic blocks
             for i in self.get(v).unwrap().runtime_args() {
+                let i = i.unredirect(self);
                 if !seen.contains(&i) && self.uses(i).len() == 1 {
                     seen.insert(i);
                     vec.push(i);
@@ -318,11 +320,13 @@ impl Node {
                 .chain(std::iter::once(*callee))
                 .collect(),
             Node::Product(_, v) => v.to_smallvec(),
-            Node::FunType(v) | Node::ProdType(v) | Node::SumType(v) => v.clone(),
+            Node::ProdType(v) | Node::SumType(v) => v.clone(),
             Node::BinOp(_, a, b) => smallvec![*a, *b],
             Node::IfCase(_, x) | Node::Proj(x, _) | Node::Inj(_, _, x) | Node::If(x) => {
                 smallvec![*x]
             }
+            // We don't need to know parameter types at runtime
+            Node::FunType(_) => SmallVec::new(),
             Node::Const(_) => SmallVec::new(),
             // `f` not being known at runtime doesn't really make sense
             Node::Param(_f, _) => SmallVec::new(),

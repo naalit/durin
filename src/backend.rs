@@ -704,14 +704,8 @@ impl crate::ir::Module {
                                 ))
                             } else {
                                 // Mark it for generation, if it isn't marked already
-                                if !to_add.iter().any(|(y, _)| *y == x) {
-                                    if to_gen.iter().any(|(y, _)| *y == x) {
-                                        let (_, v) = to_gen.iter().find(|(y, _)| *y == x).unwrap().clone();
-                                        to_gen.retain(|(y, _)| *y != x);
-                                        to_add.push((x, v));
-                                    } else {
-                                        to_add.push((x, Vec::new()));
-                                    }
+                                if !to_add.iter().any(|(y, _)| *y == x) && !to_gen.iter().any(|(y, _)| *y == x) {
+                                    to_add.push((x, Vec::new()));
                                 }
                                 // Things in its scope don't belong here, they'll be generated with it later
                                 for i in self.scope(x) {
@@ -730,8 +724,14 @@ impl crate::ir::Module {
                     .chain(blocks)
                     .filter(|(x, _)| !not.contains(x))
                     .collect();
+
                 // Copy any basic blocks that the function uses
                 for (x, mut x_blocks) in to_add {
+                    // If it's in something else's scope, we'll generate it later
+                    if not.contains(&x) {
+                        continue;
+                    }
+
                     let mut xscope = self.scope(x);
                     xscope.push(x);
                     let xscope: Vec<_> = xscope
@@ -1086,8 +1086,8 @@ impl crate::ir::Module {
                     unreachable!("not a type")
                 }
             },
-            Node::ProdType(x) if x.len() == 1 => self.from_any(any, x[0], cxt),
-            Node::SumType(x) if x.len() == 1 => cxt
+            Node::SumType(x) if x.len() == 1 => self.from_any(any, x[0], cxt),
+            Node::ProdType(x) if x.len() == 1 => cxt
                 .builder
                 .build_insert_value(
                     self.llvm_ty(ty, cxt).into_struct_type().get_undef(),
