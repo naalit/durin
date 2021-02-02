@@ -752,17 +752,7 @@ impl crate::ir::Module {
                 blocks.push_front((val, fun.clone()));
 
                 let stack_enabled = stack_enabled.contains(&val);
-                let args: Vec<_> = env
-                    .iter()
-                    .map(|(_, ty)| ty)
-                    .chain(if stack_enabled {
-                        &fun.params[0..fun.params.len() - 1]
-                    } else {
-                        &fun.params
-                    })
-                    .map(|&x| self.llvm_ty(x, cxt))
-                    .collect();
-                let cont = if stack_enabled {
+                let cont = if stack_enabled && fun.params.last().and_then(|x| self.get(*x)).map_or(false, |n| matches!(n, Node::FunType(_))) {
                     self.uses(val)
                         .iter()
                         .find(|&&x| match self.get(x).unwrap() {
@@ -773,21 +763,31 @@ impl crate::ir::Module {
                 } else {
                     None
                 };
+                let args: Vec<_> = env
+                    .iter()
+                    .map(|(_, ty)| ty)
+                    .chain(if cont.is_some() {
+                        &fun.params[0..fun.params.len() - 1]
+                    } else {
+                        &fun.params
+                    })
+                    .map(|&x| self.llvm_ty(x, cxt))
+                    .collect();
 
-                let known_ty = if stack_enabled {
+                let known_ty = if cont.is_some() {
                     let &ret_ty = fun.params.last().unwrap();
-                    let ret_ty = match self.get(ret_ty).unwrap() {
+                    match self.get(ret_ty).unwrap() {
                         Node::FunType(v) => {
-                            if v.len() == 1 {
+                            let ret_ty = if v.len() == 1 {
                                 v[0]
                             } else {
                                 todo!("return a tuple?")
-                            }
+                            };
+                            let ret_ty = self.llvm_ty(ret_ty, cxt);
+                            ret_ty.fn_type(&args, false)
                         }
                         _ => unreachable!(),
-                    };
-                    let ret_ty = self.llvm_ty(ret_ty, cxt);
-                    ret_ty.fn_type(&args, false)
+                    }
                 } else {
                     cxt.cxt.void_type().fn_type(&args, false)
                 };
@@ -1238,6 +1238,7 @@ impl crate::ir::Module {
                     known,
                     env,
                     stack_enabled,
+                    cont: fcont,
                     ..
                 }) => {
                     // Known call
@@ -1256,7 +1257,7 @@ impl crate::ir::Module {
                         .collect();
 
                     // The actual call depends on whether we're using the LLVM stack or not
-                    if *stack_enabled {
+                    if *stack_enabled && fcont.is_some() {
                         let cont = cont.unwrap();
                         let call = cxt.builder.build_call(*known, &args, "stack_call");
                         call.set_tail_call(true);

@@ -184,14 +184,16 @@ impl Module {
                                 false
                             }
                     }
-                    Some(Node::Fun(_)) | Some(Node::FunType(_)) | Some(Node::ProdType(_))
-                        if !not.contains(&x) =>
+                    Some(Node::Fun(_)) | Some(Node::FunType(_)) | Some(Node::ProdType(_)) =>
+                        if !not.contains(&x)
                     {
                         // If it calls another function, that function can use its own parameters
                         not.insert(x);
-                        let b = has_param(m, x, not);
+                        let b = m.get(x).unwrap().runtime_args().iter().any(|x| has_param(m, *x, not));//has_param(m, x, not);
                         not.remove(&x);
                         b
+                    } else {
+                        false
                     }
                     Some(n) => n.runtime_args().iter().any(|x| has_param(m, *x, not)),
                 }
