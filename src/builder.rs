@@ -59,6 +59,11 @@ impl<'m> Builder<'m> {
         )
     }
 
+    /// Updates `from` to be an alias of `to`
+    pub fn redirect(&mut self, from: Val, to: Val) {
+        self.module.redirect(from, to);
+    }
+
     pub fn call(&mut self, f: Val, x: Val, ret_ty: Val) -> Val {
         let cont = self.module.reserve(None);
         self.module.replace(
