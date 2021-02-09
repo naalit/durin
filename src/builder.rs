@@ -64,14 +64,16 @@ impl<'m> Builder<'m> {
         self.module.redirect(from, to);
     }
 
-    pub fn call(&mut self, f: Val, x: Val, ret_ty: Val) -> Val {
+    pub fn call(&mut self, f: Val, args: impl Into<SmallVec<[Val; 3]>>, ret_ty: Val) -> Val {
         let cont = self.module.reserve(None);
+        let mut args = args.into();
+        args.push(cont);
         self.module.replace(
             self.block,
             Node::Fun(Function {
                 params: self.params.drain(0..).collect(),
                 callee: f,
-                call_args: smallvec![x, cont],
+                call_args: args,
             }),
         );
         self.block = cont;
@@ -281,14 +283,15 @@ impl<'m> Builder<'m> {
     }
 
     /// Returns the parameter value
-    pub fn push_fun(&mut self, param: Option<String>, param_ty: Val) -> Val {
+    pub fn push_fun(&mut self, params: impl Into<Vec<(Option<String>, Val)>>) -> Vec<Val> {
+        let params = params.into();
         let fun = self.module.reserve(None);
-        let cont = self.module.add(Node::Param(fun, 1), None);
+        let cont = self.module.add(Node::Param(fun, params.len() as u8), Some("$cont.return".into()));
         self.funs.push((fun, self.block, self.params.clone(), cont));
         self.block = fun;
         // Skip adding the continuation parameter and add it later, since we might not know the return type yet
-        self.params = vec![param_ty];
-        self.module.add(Node::Param(fun, 0), param)
+        self.params = params.iter().map(|(_, ty)| *ty).collect();
+        params.into_iter().enumerate().map(|(i, (name, _))| self.module.add(Node::Param(fun, i as u8), name)).collect()
     }
 
     pub fn pop_fun(&mut self, ret: Val, ret_ty: Val) -> Val {

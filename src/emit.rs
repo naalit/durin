@@ -18,7 +18,7 @@ impl<'a> Display for PrettyVal<'a> {
                         write!(f, ", ")?;
                     }
                     first = false;
-                    write!(f, "{}: {}", m.param_name(v, i as u8), ty.pretty(m))?;
+                    write!(f, "{}{}", m.param_name(v, i as u8), ty.pretty(m))?;
                 }
                 write!(f, ")")
             }
@@ -30,7 +30,7 @@ impl<'a> Display for PrettyVal<'a> {
                         write!(f, ", ")?;
                     }
                     first = false;
-                    write!(f, "{}: {}", m.param_name(v, i as u8), ty.pretty(m))?;
+                    write!(f, "{}{}", m.param_name(v, i as u8), ty.pretty(m))?;
                 }
                 write!(f, " }}")
             }
@@ -105,10 +105,12 @@ impl Module {
                 }
             })
             .collect();
-        if name.len() == 1 {
-            self.name_or(name[0].num())
+        if name.len() == 1 && !self.uses(*name[0]).is_empty() {
+            format!("{}: ", self.name_or(name[0].num()))
+        } else if name.len() > 1 {
+            format!("{}.{}: ", self.name_or(v.num()), pnum)
         } else {
-            format!("{}.{}", self.name_or(v.num()), pnum)
+            String::new()
         }
     }
 
