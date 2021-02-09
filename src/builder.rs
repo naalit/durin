@@ -59,6 +59,10 @@ impl<'m> Builder<'m> {
         )
     }
 
+    pub fn cont(&self) -> Option<Val> {
+        self.funs.last().map(|x| x.3)
+    }
+
     /// Updates `from` to be an alias of `to`
     pub fn redirect(&mut self, from: Val, to: Val) {
         self.module.redirect(from, to);
@@ -79,6 +83,32 @@ impl<'m> Builder<'m> {
         self.block = cont;
         self.params.push(ret_ty);
         self.module.add(Node::Param(cont, 0), None)
+    }
+
+    pub fn call_multi(
+        &mut self,
+        f: Val,
+        args: impl Into<SmallVec<[Val; 3]>>,
+        ret_tys: &[Val],
+    ) -> Vec<Val> {
+        let cont = self.module.reserve(None);
+        let mut args = args.into();
+        args.push(cont);
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee: f,
+                call_args: args,
+            }),
+        );
+        self.block = cont;
+        self.params.extend(ret_tys);
+        ret_tys
+            .iter()
+            .enumerate()
+            .map(|(i, _)| self.module.add(Node::Param(cont, i as u8), None))
+            .collect()
     }
 
     pub fn cons(&mut self, c: Constant) -> Val {
@@ -169,8 +199,8 @@ impl<'m> Builder<'m> {
         // No parameter since it's a normal if
     }
 
-    /// Switches from the `then` block, which returns the given expression, to the `else` block.
-    pub fn otherwise(&mut self, ret: Val) {
+    /// Switches from the `then` block, which returns the given expressions, to the `else` block.
+    pub fn otherwise(&mut self, rets: impl Into<SmallVec<[Val; 3]>>) {
         let (cont, no) = self
             .ifs
             .pop()
@@ -183,14 +213,14 @@ impl<'m> Builder<'m> {
             Node::Fun(Function {
                 params: self.params.drain(0..).collect(),
                 callee: cont,
-                call_args: smallvec![ret],
+                call_args: rets.into(),
             }),
         );
         self.block = no;
     }
 
-    /// Ends an `else` block, returning the expression.
-    pub fn endif(&mut self, ret: Val, ret_ty: Val) -> Val {
+    /// Ends an `else` block, returning the expressions.
+    pub fn endif(&mut self, rets: &[(Val, Val)]) -> Vec<Val> {
         let (cont, no) = self
             .ifs
             .pop()
@@ -199,17 +229,26 @@ impl<'m> Builder<'m> {
             panic!("Called `endif` without calling `otherwise`!");
         }
 
+        let vals = rets.iter().map(|&(x, _)| x).collect();
         self.module.replace(
             self.block,
             Node::Fun(Function {
                 params: self.params.drain(0..).collect(),
                 callee: cont,
-                call_args: smallvec![ret],
+                call_args: vals,
             }),
         );
         self.block = cont;
-        self.params.push(ret_ty);
-        self.module.add(Node::Param(cont, 0), None)
+        let tys = rets.iter().map(|&(_, x)| x);
+        self.params.extend(tys);
+        rets.iter()
+            .enumerate()
+            .map(|(i, _)| self.module.add(Node::Param(cont, i as u8), None))
+            .collect()
+    }
+
+    pub fn type_of(&mut self, x: Val) -> Val {
+        self.module.get(x).unwrap().clone().ty(self.module)
     }
 
     pub fn project(&mut self, x: Val, i: usize) -> Val {
@@ -328,6 +367,38 @@ impl<'m> Builder<'m> {
                 params: self.params.drain(0..).collect(),
                 callee: cont,
                 call_args: smallvec![ret],
+            }),
+        );
+        self.block = block;
+        self.params = params;
+        fun
+    }
+
+    pub fn pop_fun_multi(&mut self, rets: Vec<(Val, Val)>) -> Val {
+        let (fun, block, params, cont) = self.funs.pop().unwrap();
+
+        // Add the continuation parameter to the function
+        let tys = rets.iter().map(|&(_, ty)| ty).collect();
+        let cont_ty = self.module.add(Node::FunType(tys), None);
+        match self.module.get_mut(fun) {
+            Some(Node::Fun(f)) => {
+                f.params.push(cont_ty);
+            }
+            // The function returns a value directly, so we'll just add the continuation parameter to the function node we're making now
+            None => {
+                self.params.push(cont_ty);
+            }
+            _ => unreachable!(),
+        }
+
+        // We don't use self.call since we don't add the cont parameter here
+        let vals = rets.iter().map(|&(val, _)| val).collect();
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee: cont,
+                call_args: vals,
             }),
         );
         self.block = block;
