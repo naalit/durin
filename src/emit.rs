@@ -1,14 +1,19 @@
 use crate::ir::*;
 use std::fmt::{self, Display, Write};
 
-pub struct PrettyVal<'a>(&'a Module, Val);
+pub struct PrettyVal<'a>(&'a Module, Val, bool);
 impl<'a> Display for PrettyVal<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let PrettyVal(m, v) = *self;
+        let PrettyVal(m, v, force_write) = *self;
         if let None = m.get(v) {
             return write!(f, "<None>");
         }
-        match m.get(v).as_ref().unwrap() {
+        if !force_write {
+            if let Some(x) = &m.names[v.num()] {
+                return write!(f, "{}", x);
+            }
+        }
+        let x = match m.get(v).as_ref().unwrap() {
             Node::Const(c) => write!(f, "{}", c),
             Node::FunType(params) => {
                 write!(f, "fun(")?;
@@ -78,13 +83,14 @@ impl<'a> Display for PrettyVal<'a> {
                 Some(x) => write!(f, "{}", x),
                 None => write!(f, "%{}", v.num()),
             },
-        }
+        };
+        x
     }
 }
 
 impl Val {
     pub fn pretty(self, m: &Module) -> PrettyVal {
-        PrettyVal(m, self)
+        PrettyVal(m, self, false)
     }
 }
 
@@ -158,17 +164,22 @@ impl Module {
                         }
                         writeln!(buf, ";").unwrap();
                     }
+                    _ if !matches!(node, Node::Param(_, _)) && self.names[num].is_some() => {
+                        writeln!(
+                            buf,
+                            "val {} = {};",
+                            self.name_or(num),
+                            PrettyVal(self, Val::from_num(num), true),
+                        )
+                        .unwrap();
+                    }
                     _ => {
                         // Nothing, since constants and params are inlined
                     }
                 },
-                Slot::Redirect(v) => writeln!(
-                    buf,
-                    "val {} = {};",
-                    self.name_or(num),
-                    self.name_or(v.num())
-                )
-                .unwrap(),
+                Slot::Redirect(v) => {
+                    writeln!(buf, "val {} = {};", self.name_or(num), v.pretty(self),).unwrap()
+                }
                 _ => (),
             }
         }

@@ -752,7 +752,13 @@ impl crate::ir::Module {
                 blocks.push_front((val, fun.clone()));
 
                 let stack_enabled = stack_enabled.contains(&val);
-                let cont = if stack_enabled && fun.params.last().and_then(|x| self.get(*x)).map_or(false, |n| matches!(n, Node::FunType(_))) {
+                let cont = if stack_enabled
+                    && fun
+                        .params
+                        .last()
+                        .and_then(|x| self.get(*x))
+                        .map_or(false, |n| matches!(n, Node::FunType(_)))
+                {
                     self.uses(val)
                         .iter()
                         .find(|&&x| match self.get(x).unwrap() {

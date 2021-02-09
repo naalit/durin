@@ -261,6 +261,10 @@ impl<'m> Builder<'m> {
             .add(Node::FunType(smallvec![from, cont_ty]), None)
     }
 
+    pub fn fun_type_raw(&mut self, params: impl Into<SmallVec<[Val; 4]>>) -> Val {
+        self.module.add(Node::FunType(params.into()), None)
+    }
+
     pub fn start_pi(&mut self, param: Option<String>, from: Val) -> Pi {
         Pi {
             arg: self.module.reserve(param),
@@ -286,12 +290,19 @@ impl<'m> Builder<'m> {
     pub fn push_fun(&mut self, params: impl Into<Vec<(Option<String>, Val)>>) -> Vec<Val> {
         let params = params.into();
         let fun = self.module.reserve(None);
-        let cont = self.module.add(Node::Param(fun, params.len() as u8), Some("$cont.return".into()));
+        let cont = self.module.add(
+            Node::Param(fun, params.len() as u8),
+            Some("$cont.return".into()),
+        );
         self.funs.push((fun, self.block, self.params.clone(), cont));
         self.block = fun;
         // Skip adding the continuation parameter and add it later, since we might not know the return type yet
         self.params = params.iter().map(|(_, ty)| *ty).collect();
-        params.into_iter().enumerate().map(|(i, (name, _))| self.module.add(Node::Param(fun, i as u8), name)).collect()
+        params
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, _))| self.module.add(Node::Param(fun, i as u8), name))
+            .collect()
     }
 
     pub fn pop_fun(&mut self, ret: Val, ret_ty: Val) -> Val {
