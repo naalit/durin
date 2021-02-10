@@ -111,6 +111,46 @@ impl<'m> Builder<'m> {
             .collect()
     }
 
+    /// Calls a function without adding and passing a continuation frame; leaves the current block in a detached state.
+    /// Only for continuation manipulation, not direct-style code.
+    pub fn call_raw(&mut self, f: Val, args: impl Into<SmallVec<[Val; 3]>>) {
+        let args = args.into();
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee: f,
+                call_args: args,
+            }),
+        );
+        self.block = self.module.reserve(None);
+    }
+
+    /// Adds a continuation frame which is immediately called with the given arguments, returning the continuation function as well as the arguments.
+    /// Only for continuation manipulation, not direct-style code.
+    pub fn push_frame(&mut self, args: Vec<(Val, Val)>) -> (Val, Vec<Val>) {
+        let callee = self.module.reserve(None);
+        let call_args = args.iter().map(|&(x, _)| x).collect();
+        let tys: Vec<_> = args.iter().map(|&(_, x)| x).collect();
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee,
+                call_args,
+            }),
+        );
+        self.block = callee;
+        self.params.extend(&tys);
+        (
+            callee,
+            tys.iter()
+                .enumerate()
+                .map(|(i, _)| self.module.add(Node::Param(callee, i as u8), None))
+                .collect(),
+        )
+    }
+
     pub fn cons(&mut self, c: Constant) -> Val {
         self.module.add(Node::Const(c), None)
     }
@@ -325,7 +365,7 @@ impl<'m> Builder<'m> {
         self.module.reserve(name)
     }
 
-    /// Returns the parameter value
+    /// Returns the parameter values
     pub fn push_fun(&mut self, params: impl Into<Vec<(Option<String>, Val)>>) -> Vec<Val> {
         let params = params.into();
         let fun = self.module.reserve(None);
@@ -344,8 +384,50 @@ impl<'m> Builder<'m> {
             .collect()
     }
 
+    /// Starts a function without a continuation, returning the parameter values.
+    /// Only for continuation manipulation, not direct-style code.
+    pub fn push_fun_raw(&mut self, params: impl Into<Vec<(Option<String>, Val)>>) -> Vec<Val> {
+        let params = params.into();
+        let fun = self.module.reserve(None);
+        self.funs
+            .push((fun, self.block, self.params.clone(), Val::INVALID));
+        self.block = fun;
+        self.params = params.iter().map(|(_, ty)| *ty).collect();
+        params
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, _))| self.module.add(Node::Param(fun, i as u8), name))
+            .collect()
+    }
+
+    /// Ends a function without a continuation by calling another function, returning the created function value.
+    /// Like `call_raw` but returns the function instead of leaving it detached.
+    /// Only for continuation manipulation, not direct-style code.
+    pub fn pop_fun_raw(&mut self, callee: Val, args: impl Into<SmallVec<[Val; 3]>>) -> Val {
+        let (fun, block, params, cont) = self.funs.pop().unwrap();
+        assert_eq!(
+            cont,
+            Val::INVALID,
+            "Called pop_fun_raw() without push_fun_raw()"
+        );
+
+        // We don't use self.call since we don't add the cont parameter here
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee,
+                call_args: args.into(),
+            }),
+        );
+        self.block = block;
+        self.params = params;
+        fun
+    }
+
     pub fn pop_fun(&mut self, ret: Val, ret_ty: Val) -> Val {
         let (fun, block, params, cont) = self.funs.pop().unwrap();
+        assert!(cont != Val::INVALID, "Called pop_fun() with push_fun_raw()");
 
         // Add the continuation parameter to the function
         let cont_ty = self.module.add(Node::FunType(smallvec![ret_ty]), None);
@@ -376,6 +458,10 @@ impl<'m> Builder<'m> {
 
     pub fn pop_fun_multi(&mut self, rets: Vec<(Val, Val)>) -> Val {
         let (fun, block, params, cont) = self.funs.pop().unwrap();
+        assert!(
+            cont != Val::INVALID,
+            "Called pop_fun_multi() with push_fun_raw()"
+        );
 
         // Add the continuation parameter to the function
         let tys = rets.iter().map(|&(_, ty)| ty).collect();
