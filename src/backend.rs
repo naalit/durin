@@ -640,6 +640,7 @@ impl crate::ir::Module {
         // Codegen all functions visible from the top level, and everything reachable from there
         let mut to_gen: Vec<(Val, Vec<(Val, crate::ir::Function)>)> =
             self.top_level().map(|x| (x, Vec::new())).collect();
+        let scopes = self.top_level_scopes();
         // This explicit for loop allows us to add to to_gen in the body of the loop
         let mut i = 0;
         while i < to_gen.len() {
@@ -651,7 +652,7 @@ impl crate::ir::Module {
                 // Codegen it
 
                 // Everything in `scope` will either be generated as a basic block, or added to `to_gen`
-                let scope = self.scope(val);
+                let scope = scopes.get(&val).cloned().unwrap_or_else(Vec::new);
 
                 // Figure out which functions in `scope` can be basic blocks, and add others to `to_gen`
                 let mut to_add = Vec::new();
@@ -708,7 +709,7 @@ impl crate::ir::Module {
                                     to_add.push((x, Vec::new()));
                                 }
                                 // Things in its scope don't belong here, they'll be generated with it later
-                                for i in self.scope(x) {
+                                for i in scopes.get(&x).cloned().unwrap_or_else(Vec::new) {
                                     not.insert(i);
                                 }
                                 None
@@ -732,7 +733,7 @@ impl crate::ir::Module {
                         continue;
                     }
 
-                    let mut xscope = self.scope(x);
+                    let mut xscope = scopes.get(&x).cloned().unwrap_or_else(Vec::new);
                     xscope.push(x);
                     let xscope: Vec<_> = xscope
                         .into_iter()

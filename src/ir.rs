@@ -1,5 +1,5 @@
 use smallvec::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Val(usize);
@@ -256,46 +256,66 @@ impl Module {
         acc.into_iter().collect()
     }
 
-    /// Returns a list of everything that depends on `v`'s parameters (and so must be nested in `v`), transitively.
-    /// `v` must be a function.
-    pub fn scope(&self, v: Val) -> Vec<Val> {
-        match self.get(v).unwrap() {
-            Node::Fun(_) => (),
-            _ => panic!("Called scope() on non-function"),
-        };
-
-        let mut vec = Vec::new();
-        let mut ix = 0;
+    /// Returns all functions that `v` depends on the parameters of, and so must be within.
+    /// Doesn't recurse past function boundaries:
+    /// if `v` depends on a parameter of `f`, and `f` depends on a parameter of `g`, this will only return `f`, not `g`.
+    pub fn dependencies(&self, v: Val) -> Vec<Val> {
         let mut seen = HashSet::new();
-        // Don't include the function itself in the scope
         seen.insert(v);
-        for &i in self.uses(v) {
-            if let Node::Param(_, _) = self.get(i).unwrap() {
-                vec.push(i);
-                seen.insert(i);
-            }
-        }
-
-        // Instead of using a stack, we use one vec that we go through in order, since we're going to return it too
-        while let Some(&v) = vec.get(ix) {
-            for &i in self.uses(v) {
-                if !seen.contains(&i) {
-                    seen.insert(i);
-                    vec.push(i);
+        let mut vret = Vec::new();
+        let mut vcur = vec![v];
+        let mut ix = 0;
+        while let Some(&v) = vcur.get(ix) {
+            if let Node::Param(f, _) = self.get(v).unwrap() {
+                if !seen.contains(f) {
+                    seen.insert(*f);
+                    // Not recursive
+                    // vcur.push(*f);
+                    vret.push(*f);
                 }
-            }
-            // Add functions only called from here to the scope, so they can be turned into basic blocks
-            for i in self.get(v).unwrap().runtime_args() {
-                let i = i.unredirect(self);
-                if !seen.contains(&i) && self.uses(i).len() == 1 {
-                    seen.insert(i);
-                    vec.push(i);
+            } else {
+                for i in self.get(v).unwrap().runtime_args() {
+                    let i = i.unredirect(self);
+                    if !seen.contains(&i) {
+                        seen.insert(i);
+                        vcur.push(i);
+                    }
                 }
             }
             ix += 1;
         }
+        vret
+    }
 
-        vec
+    /// Returns the scope of each function in this module, i.e. for each function, everything that must be nested directly within it.
+    pub fn top_level_scopes(&self) -> HashMap<Val, Vec<Val>> {
+        let mut top_level = Vec::new();
+        let mut scopes = HashMap::new();
+        for i in 0..self.nodes.len() {
+            let i = Val(i);
+            // Skip redirects for this
+            if i != i.unredirect(self) {
+                continue;
+            }
+            // Also skip anything but functions
+            if !matches!(self.get(i), Some(Node::Fun(_))) {
+                continue;
+            }
+
+            let deps = self.dependencies(i);
+            if deps.is_empty() {
+                top_level.push(i);
+            } else {
+                for d in deps {
+                    scopes.entry(d).or_insert_with(Vec::new).push(i);
+                }
+            }
+        }
+        // top_level
+        //     .into_iter()
+        //     .map(|x| (x, scopes.remove(&x).unwrap_or_else(Vec::new)))
+        //     .collect()
+        scopes
     }
 }
 
