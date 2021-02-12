@@ -44,6 +44,21 @@ impl Backend {
         Backend { cxt, machine }
     }
 
+    pub fn codegen_and_run(&self, m: &mut crate::ir::Module) -> bool {
+        let m = self.codegen_module(m);
+        let ee = m
+            .create_jit_execution_engine(inkwell::OptimizationLevel::Less)
+            .expect("Failed to create LLVM execution engine");
+        if let Ok(main_fun) = unsafe { ee.get_function::<unsafe extern "C" fn()>("main") } {
+            unsafe {
+                main_fun.call();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn codegen_module(&self, m: &mut crate::ir::Module) -> inkwell::module::Module {
         let mut cxt = self.cxt();
         m.codegen(&mut cxt);
