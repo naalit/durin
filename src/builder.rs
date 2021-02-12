@@ -288,7 +288,24 @@ impl<'m> Builder<'m> {
     }
 
     pub fn type_of(&mut self, x: Val) -> Val {
-        self.module.get(x).unwrap().clone().ty(self.module)
+        let node = self.module.get(x).unwrap().clone();
+        if let Node::Param(f, n) = &node {
+            let n = *n as usize;
+            // It's a parameter of a function that we're in the process of generating, so we have the type stored somewhere
+            if self.module.get(*f).is_none() {
+                let mut ix = self.funs.len();
+                let mut p = self.params.get(n).copied();
+                while let Some(i) = ix.checked_sub(1) {
+                    if *f == self.funs[i].0 {
+                        return p.unwrap();
+                    } else {
+                        p = self.funs[i].2.get(n).copied();
+                    }
+                    ix = i;
+                }
+            }
+        }
+        node.ty(self.module)
     }
 
     pub fn project(&mut self, x: Val, i: usize) -> Val {
