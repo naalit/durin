@@ -2,8 +2,15 @@ use crate::ir::*;
 use smallvec::*;
 
 pub struct Pi {
-    pub arg: Val,
-    from: Val,
+    pub args: SmallVec<[Val; 4]>,
+    tys: SmallVec<[Val; 4]>,
+}
+impl Pi {
+    pub fn add_arg(&mut self, ty: Val, builder: &mut Builder) {
+        self.tys.push(ty);
+        let arg = builder.reserve(None);
+        self.args.push(arg);
+    }
 }
 
 pub struct Sigma {
@@ -363,18 +370,19 @@ impl<'m> Builder<'m> {
 
     pub fn start_pi(&mut self, param: Option<String>, from: Val) -> Pi {
         Pi {
-            arg: self.module.reserve(param),
-            from,
+            args: smallvec![self.module.reserve(param)],
+            tys: smallvec![from],
         }
     }
 
     pub fn end_pi(&mut self, pi: Pi, to: Val) -> Val {
-        let Pi { arg, from } = pi;
+        let Pi { args, mut tys } = pi;
         let cont_ty = self.module.add(Node::FunType(smallvec![to]), None);
-        let fun = self
-            .module
-            .add(Node::FunType(smallvec![from, cont_ty]), None);
-        self.module.replace(arg, Node::Param(fun, 0));
+        tys.push(cont_ty);
+        let fun = self.module.add(Node::FunType(tys), None);
+        for (i, arg) in args.into_iter().enumerate() {
+            self.module.replace(arg, Node::Param(fun, i as u8));
+        }
         fun
     }
 
