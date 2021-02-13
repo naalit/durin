@@ -15,6 +15,18 @@ impl<'a> Display for PrettyVal<'a> {
         }
         let x = match m.get(v).as_ref().unwrap() {
             Node::Const(c) => write!(f, "{}", c),
+            Node::ExternFunType(params, r) => {
+                write!(f, "extern fun(")?;
+                let mut first = true;
+                for (i, ty) in params.iter().enumerate() {
+                    if !first {
+                        write!(f, ", ")?;
+                    }
+                    first = false;
+                    write!(f, "{}{}", m.param_name(v, i as u8), ty.pretty(m))?;
+                }
+                write!(f, ") -> {}", r.pretty(m))
+            }
             Node::FunType(params) => {
                 write!(f, "fun(")?;
                 let mut first = true;
@@ -74,6 +86,9 @@ impl<'a> Display for PrettyVal<'a> {
             }
             Node::IfCase(i, x) => {
                 write!(f, "ifcase {} {}", i, x.pretty(m))
+            }
+            Node::ExternCall(x) => {
+                write!(f, "externcall {}", x.pretty(m))
             }
             Node::BinOp(op, a, b) => {
                 write!(f, "({} {} {})", a.pretty(m), op, b.pretty(m))
@@ -163,6 +178,19 @@ impl Module {
                             write!(buf, " {}", v.pretty(self)).unwrap();
                         }
                         writeln!(buf, ";").unwrap();
+                    }
+                    Node::ExternFun(name, params, ret) => {
+                        write!(buf, "extern fun {} (", name).unwrap();
+                        let mut first = true;
+                        for i in params {
+                            if first {
+                                first = false;
+                            } else {
+                                write!(buf, ", ").unwrap();
+                            }
+                            write!(buf, "{}", i.pretty(self)).unwrap()
+                        }
+                        writeln!(buf, ": {};", ret.pretty(self)).unwrap();
                     }
                     _ if !matches!(node, Node::Param(_, _)) && self.names[num].is_some() => {
                         writeln!(
