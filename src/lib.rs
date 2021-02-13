@@ -17,6 +17,14 @@ impl Node {
                 f.call_args.iter_mut().for_each(|x| *x = x.mangle(m, map));
                 Node::Fun(f)
             }
+            Node::ExternFun(n, mut v, r) => {
+                v.iter_mut().for_each(|x| *x = x.mangle(m, map));
+                Node::ExternFun(n, v, r.mangle(m, map))
+            }
+            Node::ExternFunType(mut v, r) => {
+                v.iter_mut().for_each(|x| *x = x.mangle(m, map));
+                Node::ExternFunType(v, r.mangle(m, map))
+            }
             Node::FunType(mut v) => {
                 v.iter_mut().for_each(|x| *x = x.mangle(m, map));
                 Node::FunType(v)
@@ -35,6 +43,7 @@ impl Node {
             }
             Node::IfCase(i, x) => Node::IfCase(i, x.mangle(m, map)),
             Node::If(x) => Node::If(x.mangle(m, map)),
+            Node::ExternCall(x) => Node::ExternCall(x.mangle(m, map)),
             Node::Proj(x, i) => Node::Proj(x.mangle(m, map), i),
             Node::Param(f, i) => Node::Param(f.mangle(m, map), i),
             Node::BinOp(op, a, b) => Node::BinOp(op, a.mangle(m, map), b.mangle(m, map)),

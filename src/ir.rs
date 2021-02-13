@@ -323,10 +323,14 @@ impl Module {
 pub enum Node {
     Fun(Function),
     FunType(SmallVec<[Val; 4]>),
+    ExternFun(String, SmallVec<[Val; 3]>, Val),
+    /// Extern functions have a return type
+    ExternFunType(SmallVec<[Val; 3]>, Val),
     ProdType(SmallVec<[Val; 4]>),
     SumType(SmallVec<[Val; 4]>),
     /// IfCase(tag, x); then and else are passed to it as arguments
     IfCase(usize, Val),
+    ExternCall(Val),
     If(Val),
     /// Projecting a numbered member of a product type
     Proj(Val, usize),
@@ -353,11 +357,16 @@ impl Node {
             Node::Product(_, v) => v.to_smallvec(),
             Node::ProdType(v) | Node::SumType(v) => v.clone(),
             Node::BinOp(_, a, b) => smallvec![*a, *b],
-            Node::IfCase(_, x) | Node::Proj(x, _) | Node::Inj(_, _, x) | Node::If(x) => {
+            Node::IfCase(_, x)
+            | Node::Proj(x, _)
+            | Node::Inj(_, _, x)
+            | Node::If(x)
+            | Node::ExternCall(x) => {
                 smallvec![*x]
             }
             // We don't need to know parameter types at runtime
             Node::FunType(_) => SmallVec::new(),
+            Node::ExternFun(_, _, _) | Node::ExternFunType(_, _) => SmallVec::new(),
             Node::Const(_) => SmallVec::new(),
             // `f` not being known at runtime doesn't really make sense
             Node::Param(_f, _) => SmallVec::new(),
@@ -378,17 +387,33 @@ impl Node {
                 .collect(),
             Node::Product(ty, v) => v.iter().copied().chain(std::iter::once(*ty)).collect(),
             Node::FunType(v) | Node::ProdType(v) | Node::SumType(v) => v.clone(),
+            Node::ExternFun(_, v, r) | Node::ExternFunType(v, r) => {
+                v.iter().copied().chain(std::iter::once(*r)).collect()
+            }
             Node::Param(f, _) => smallvec![*f],
             Node::BinOp(_, a, b) | Node::Inj(a, _, b) => smallvec![*a, *b],
             Node::Const(_) => SmallVec::new(),
-            Node::IfCase(_, x) | Node::Proj(x, _) | Node::If(x) => smallvec![*x],
+            Node::IfCase(_, x) | Node::Proj(x, _) | Node::If(x) | Node::ExternCall(x) => {
+                smallvec![*x]
+            }
         }
     }
 
     pub fn ty(&self, m: &mut Module) -> Val {
         match self {
             Node::Fun(f) => m.add(Node::FunType(f.params.as_slice().to_smallvec()), None),
-            Node::FunType(_) | Node::ProdType(_) | Node::SumType(_) => {
+            Node::ExternFun(_, p, r) => m.add(Node::ExternFunType(p.clone(), *r), None),
+            Node::ExternCall(t) => match t.get(m).clone().ty(m).get(m) {
+                Node::ExternFunType(p, r) => {
+                    let mut p = p.as_slice().to_smallvec();
+                    let &r = r;
+                    let cont = m.add(Node::FunType(smallvec![r]), None);
+                    p.push(cont);
+                    m.add(Node::FunType(p), None)
+                }
+                _ => unreachable!(),
+            },
+            Node::FunType(_) | Node::ProdType(_) | Node::SumType(_) | Node::ExternFunType(_, _) => {
                 m.add(Node::Const(Constant::TypeType), None)
             }
             Node::Product(ty, _) => *ty,

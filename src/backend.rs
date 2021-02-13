@@ -297,8 +297,12 @@ impl crate::ir::Module {
             Node::FunType(_) => cxt.size_ty().get_bit_width() as u64 / 8 * 2,
             Node::ProdType(v) => v.iter().map(|&x| self.static_size(x, cxt)).sum(),
             Node::SumType(v) => v.iter().map(|&x| self.static_size(x, cxt)).max().unwrap(),
-            Node::Param(_, _) => cxt.size_ty().get_bit_width() as u64 / 8,
+            Node::Param(_, _) | Node::ExternFunType(_, _) => {
+                cxt.size_ty().get_bit_width() as u64 / 8
+            }
             Node::Fun(_)
+            | Node::ExternFun(_, _, _)
+            | Node::ExternCall(_)
             | Node::BinOp(_, _, _)
             | Node::IfCase(_, _)
             | Node::Proj(_, _)
@@ -345,6 +349,13 @@ impl crate::ir::Module {
                     )
                     .as_basic_type_enum()
             }
+            Node::ExternFunType(p, r) => {
+                let r = self.llvm_ty(*r, cxt);
+                let v: Vec<_> = p.iter().map(|&t| self.llvm_ty(t, cxt)).collect();
+                r.fn_type(&v, false)
+                    .ptr_type(AddressSpace::Generic)
+                    .as_basic_type_enum()
+            }
             Node::ProdType(v) => {
                 let v: Vec<_> = v.iter().map(|&x| self.llvm_ty(x, cxt)).collect();
                 cxt.cxt.struct_type(&v, false).as_basic_type_enum()
@@ -368,6 +379,8 @@ impl crate::ir::Module {
             // Polymorphic
             Node::Param(_, _) => cxt.any_ty(),
             Node::Fun(_)
+            | Node::ExternFun(_, _, _)
+            | Node::ExternCall(_)
             | Node::BinOp(_, _, _)
             | Node::IfCase(_, _)
             | Node::Proj(_, _)
@@ -458,6 +471,24 @@ impl crate::ir::Module {
                 let ty = cxt.cxt.struct_type(&[cxt.any_ty(), cxt.any_ty()], false);
                 ty.size_of().unwrap().as_basic_value_enum()
             }
+            Node::ExternFunType(_, _) => {
+                // Just a function pointer
+                cxt.any_ty().size_of().unwrap().as_basic_value_enum()
+            }
+            Node::ExternFun(name, params, ret) => {
+                let fun = match cxt.module.get_function(name) {
+                    Some(fun) => fun,
+                    None => {
+                        let rty = self.llvm_ty(*ret, cxt);
+                        let ptys: Vec<_> = params.iter().map(|t| self.llvm_ty(*t, cxt)).collect();
+                        let fty = rty.fn_type(&ptys, false);
+                        cxt.module.add_function(name, fty, None)
+                    }
+                };
+                fun.as_global_value()
+                    .as_pointer_value()
+                    .as_basic_value_enum()
+            }
             Node::ProdType(_) | Node::SumType(_) => {
                 // TODO boxing??
                 self.llvm_ty(val, cxt)
@@ -546,6 +577,7 @@ impl crate::ir::Module {
                     panic!("stop or unreachable isn't a first-class function!")
                 }
             },
+            Node::ExternCall(_) => panic!("externcall isn't a first-class function!"),
             Node::BinOp(op, a, b) => {
                 let a = self.gen_value(*a, cxt);
                 let b = self.gen_value(*b, cxt);
@@ -1144,11 +1176,19 @@ impl crate::ir::Module {
                     }
                 }
             }
+            Node::ExternFunType(_, _) => {
+                let lty = self.llvm_ty(ty, cxt);
+                cxt.builder
+                    .build_bitcast(any, lty, "extern_fun_ptr")
+                    .as_basic_value_enum()
+            }
             // Leave as an "any" since it's polymorphic
             Node::Param(_, _) => any.as_basic_value_enum(),
             // TODO Proj should be allowed as a type
             Node::BinOp(_, _, _)
             | Node::Fun(_)
+            | Node::ExternFun(_, _, _)
+            | Node::ExternCall(_)
             | Node::IfCase(_, _)
             | Node::Proj(_, _)
             | Node::Inj(_, _, _)
@@ -1252,6 +1292,23 @@ impl crate::ir::Module {
         // If we're calling unreachable, emit a LLVM unreachable instruction
         } else if let Some(Node::Const(crate::ir::Constant::Unreachable)) = self.get(callee) {
             cxt.builder.build_unreachable();
+        // If we're calling an extern function, do that
+        } else if let Some(Node::ExternCall(f)) = self.get(callee) {
+            let f = self.gen_value(*f, cxt);
+            let call = cxt
+                .builder
+                .build_call(f.into_pointer_value(), &args, "extern_call");
+            call.set_tail_call(true);
+
+            let cont = cont.unwrap();
+            let cont_ty = tys.last().copied();
+            self.gen_call(
+                cont,
+                cont_ty,
+                vec![call.try_as_basic_value().left().unwrap()],
+                None,
+                cxt,
+            )
         // Otherwise, we're actually calling a function
         } else {
             // The mechanism depends on whether it's a known or unknown call

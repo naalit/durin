@@ -54,3 +54,4 @@ verify!(adt);
 verify!(sigma);
 verify!(ifs);
 verify!(blocks);
+verify!(dec);

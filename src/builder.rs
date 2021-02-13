@@ -516,4 +516,38 @@ impl<'m> Builder<'m> {
         self.params = params;
         fun
     }
+
+    pub fn extern_declare(
+        &mut self,
+        name: String,
+        params: impl Into<SmallVec<[Val; 3]>>,
+        ret: Val,
+    ) -> Val {
+        self.module.add(
+            Node::ExternFun(name.clone(), params.into(), ret),
+            Some(name),
+        )
+    }
+
+    pub fn extern_call(&mut self, f: Val, args: impl Into<SmallVec<[Val; 3]>>) -> Val {
+        let cont = self.module.reserve(None);
+        let mut args = args.into();
+        args.push(cont);
+        let callee = self.module.add(Node::ExternCall(f), None);
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee,
+                call_args: args.into(),
+            }),
+        );
+        self.block = cont;
+        let ret_ty = match f.get(self.module).clone().ty(self.module).get(self.module) {
+            Node::ExternFunType(_, r) => *r,
+            _ => panic!("extern_call() requires extern fun!"),
+        };
+        self.params.push(ret_ty);
+        self.module.add(Node::Param(cont, 0), None)
+    }
 }

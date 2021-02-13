@@ -139,6 +139,7 @@ impl<'a> Parser<'a> {
     fn binop(&mut self) -> BinOp {
         match self.peek().unwrap() {
             '=' if self.matches("==") => BinOp::IEq,
+            '!' if self.matches("!=") => BinOp::INEq,
             '*' if self.matches("**") => self.error("Exponentiation not supported yet"),
             '*' => {
                 self.next();
@@ -155,6 +156,22 @@ impl<'a> Parser<'a> {
             '/' => {
                 self.next();
                 BinOp::IDiv
+            }
+            '<' => {
+                if self.matches("<=") {
+                    BinOp::ILeq
+                } else {
+                    self.next();
+                    BinOp::ILt
+                }
+            }
+            '>' => {
+                if self.matches(">=") {
+                    BinOp::IGeq
+                } else {
+                    self.next();
+                    BinOp::IGt
+                }
             }
             _ => self.error("Expected operator"),
         }
@@ -383,6 +400,62 @@ impl<'a> Parser<'a> {
                 self.skip_whitespace();
                 self.expect(";");
                 continue;
+            } else if self.matches("extern") {
+                // Parse an extern function declaration
+                self.skip_whitespace();
+                self.expect("fun");
+                self.skip_whitespace();
+
+                let name = self.name();
+                let val = self
+                    .names
+                    .get(name)
+                    .filter(|&&(x, _)| self.module.get(x).is_none())
+                    .map(|&(x, _)| x)
+                    .unwrap_or_else(|| {
+                        let v = self.module.reserve(Some(name.to_owned()));
+                        self.names.insert(name, (v, self.pos));
+                        v
+                    });
+                self.skip_whitespace();
+
+                let mut params = SmallVec::new();
+                // Arguments are optional, if present look like `(x : I32, y : fun)`
+                if self.matches("(") {
+                    self.skip_whitespace();
+                    while !self.matches(")") {
+                        let name = self.name();
+                        self.skip_whitespace();
+                        self.expect(":");
+                        self.skip_whitespace();
+                        let ty = self.expr();
+                        self.skip_whitespace();
+
+                        let i = params.len();
+                        let val = self
+                            .module
+                            .add(Node::Param(val, i as _), Some(name.to_owned()));
+                        self.names.insert(name, (val, self.pos));
+                        params.push(ty);
+                        if self.matches(")") {
+                            break;
+                        } else {
+                            self.expect(",");
+                            self.skip_whitespace();
+                        }
+                    }
+                    self.skip_whitespace();
+                }
+
+                self.expect(":");
+                self.skip_whitespace();
+                let ret_ty = self.expr();
+                self.skip_whitespace();
+                self.expect(";");
+
+                self.module
+                    .replace(val, Node::ExternFun(name.into(), params, ret_ty));
+                continue;
             }
 
             // Parse a function
@@ -499,6 +572,27 @@ impl<'a> Parser<'a> {
                         call_args: SmallVec::new(),
                     }),
                 );
+            } else if self.matches("externcall") {
+                self.skip_whitespace();
+
+                let x = self.expr();
+                self.skip_whitespace();
+
+                let mut call_args = SmallVec::new();
+                while !self.matches(";") {
+                    call_args.push(self.expr());
+                    self.skip_whitespace();
+                }
+
+                let callee = self.module.add(Node::ExternCall(x), None);
+                self.module.replace(
+                    val,
+                    Node::Fun(Function {
+                        params,
+                        callee,
+                        call_args,
+                    }),
+                )
             } else {
                 let callee = self.var();
                 self.skip_whitespace();
