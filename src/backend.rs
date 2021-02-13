@@ -508,22 +508,22 @@ impl crate::ir::Module {
                     return self.gen_value(*payload, cxt);
                 }
 
-                let payload = self.gen_value(*payload, cxt);
-                let payload_ptr = cxt.builder.build_alloca(payload.get_type(), "payload.ptr");
-                cxt.builder.build_store(payload_ptr, payload);
-
                 let ty = self.llvm_ty(*ty, cxt).into_struct_type();
                 let payload_ty = ty.get_field_type_at_index(1).unwrap();
-                let payload_ptr = cxt
+
+                // Alloca the larger type, then bitcast to store the smaller one in the alloca
+                let payload = self.gen_value(*payload, cxt);
+                let payload_ptr = cxt.builder.build_alloca(payload_ty, "payload.ptr");
+                let casted = cxt
                     .builder
                     .build_bitcast(
                         payload_ptr,
-                        payload_ty.ptr_type(AddressSpace::Generic),
-                        "payload.ptr.casted",
+                        payload.get_type().ptr_type(AddressSpace::Generic),
+                        "payload.casted",
                     )
                     .into_pointer_value();
-                // This load can go past the alloca, but I don't think that causes any problems because we don't look at it.
-                // TODO: We might want a larger alloca if this is actually undefined behaviour.
+                cxt.builder.build_store(casted, payload);
+                // Then load the original non-casted pointer to the larger type
                 let payload = cxt.builder.build_load(payload_ptr, "payload.casted");
 
                 let tag = ty
