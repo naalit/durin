@@ -190,7 +190,7 @@ impl Module {
                             }
                             write!(buf, "{}", i.pretty(self)).unwrap()
                         }
-                        writeln!(buf, ": {};", ret.pretty(self)).unwrap();
+                        writeln!(buf, "): {};", ret.pretty(self)).unwrap();
                     }
                     _ if !matches!(node, Node::Param(_, _)) && self.names[num].is_some() => {
                         writeln!(

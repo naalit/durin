@@ -77,6 +77,7 @@ impl Backend {
 /// One function is used for known calls, and one for unknown calls.
 /// The `known` function has precise types, can use the LLVM stack, and accepts any closed-over values as typed parameters before the rest.
 /// The `unknown` function takes all parameters as `i8*`, has one closure parameter at the end, and can't use the LLVM stack to return.
+#[derive(Clone, Debug)]
 pub struct LFunction<'cxt> {
     /// The arity of the function as written in Durin.
     /// So the LLVM unknown version has arity `arity+1`, and the known version has arity `arity-(if stack_enabled then 1 else 0)+env.len()`.
@@ -139,14 +140,91 @@ enum FunMode {
 }
 
 impl crate::ir::Module {
-    // Figure out which functions can use the LLVM stack
+    /// A helper for `stack_enabled()`: returns whether we can call `callee` on the stack, adding requirements to `reqs`.
+    fn try_stack_call(
+        &mut self,
+        callee: Val,
+        cont: Option<Val>,
+        call_args: &[Val],
+        reqs: &mut Vec<Val>,
+    ) -> bool {
+        match self.get(callee).unwrap() {
+            Node::Param(f, i) => match cont {
+                // If we call another function's parameter, we can't be stack enabled.
+                // Even if this is another function's continuation, we have our own continuation.
+                Some(cont) => return callee == cont,
+                // If we don't have our own continuation, we can call other functions' continuations
+                None => {
+                    if let Node::Fun(Function { params, .. }) = f.get(self) {
+                        if params.len() == *i as usize + 1 {
+                            reqs.push(*f)
+                        } else {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+            },
+            // If it's calling ifcase or if, it could call any of the call arguments
+            Node::IfCase(_, _) | Node::If(_) => {
+                for i in call_args {
+                    reqs.push(*i)
+                }
+            }
+            // If it's calling an extern function, it calls passed the continuation
+            Node::ExternCall(_) => reqs.push(*call_args.last().unwrap()),
+            // Unreachable and Stop don't call any other functions
+            Node::Const(_) => (),
+            Node::Fun(_) => {
+                reqs.push(callee);
+                match callee.get(self).clone().ty(self).get(self) {
+                    // If it has a continuation, that must be stack-enabled as well
+                    Node::FunType(v) => {
+                        if v.last()
+                            .map_or(false, |x| matches!(self.get(*x), Some(Node::FunType(_))))
+                        {
+                            // If it has a continuation, that must be stack-enabled as well, and not have its own continuation
+                            let callee2 = call_args.last().unwrap();
+                            match callee2.get(self).clone().ty(self).get(self) {
+                                Node::FunType(v) => {
+                                    if v.last().map_or(false, |x| {
+                                        matches!(self.get(*x), Some(Node::FunType(_)))
+                                    }) {
+                                        return false;
+                                    } else {
+                                        reqs.push(*callee2);
+                                    }
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // It's an unknown function, which might not be stack-enabled
+            _ => return false,
+        }
+        true
+    }
+
+    /// Figure out which functions can use the LLVM stack
     fn stack_enabled(&self) -> HashSet<Val> {
         let mut modes = HashMap::new();
+        let mut tmp_mod = self.clone();
         for val in self.vals() {
-            // For a function to use the stack it must:
-            // 1. be a function
-            if let Node::Fun(Function { params, callee, .. }) = self.get(val).unwrap() {
-                // 2. have a last parameter with a function type - the continuation - and use it
+            if val.unredirect(self) != val {
+                continue;
+            }
+            // Ignore non-functions
+            if let Node::Fun(Function {
+                params,
+                callee,
+                call_args,
+            }) = self.get(val).unwrap()
+            {
+                // If the last parameter is of function type and used, that's the continuation
                 let cont_p = if matches!(
                     params.last().and_then(|&x| self.get(x)),
                     Some(Node::FunType(_))
@@ -159,14 +237,30 @@ impl crate::ir::Module {
                 } else {
                     None
                 };
+
+                // If it has other parameters of function type, which are used, it can't be stack enabled
+                if !params.is_empty()
+                    && params[0..params.len() - 1].iter().any(|&x| {
+                        matches!(self.get(x), Some(Node::FunType(_))) && !self.uses(x).is_empty()
+                    })
+                {
+                    modes.insert(val, FunMode::NoStack);
+                    continue;
+                }
+
+                // A list of other functions that must be stack-enabled for this one to be
+                // Instead of checking if other functions are stack-enabled, we add them to reqs, since they might be in any order
+                let mut reqs = Vec::new();
+                // This function must only call other stack-enabled functions - we won't have a continuation to pass other functions
+                let mut good = tmp_mod.try_stack_call(*callee, cont_p, call_args, &mut reqs);
+
                 if let Some(cont_p) = cont_p {
-                    // Instead of checking if other functions are stack-enabled, we add them to reqs, since they might be in any order
-                    let mut reqs = Vec::new();
-                    let good = self.uses(cont_p).iter().all(|&u| {
-                        // 3. only use its continuation in known calls, not passing it around
+                    good &= self.uses(cont_p).iter().all(|&u| {
+                        // The continuation must only be used in known calls, not passed it around
                         match self.get(u).unwrap() {
                             Node::Fun(Function { callee, .. }) if *callee == cont_p => true,
                             // Although passing it as the continuation (last) parameter to another stack-enabled function is fine.
+                            // That's just a tail call.
                             Node::Fun(Function {
                                 callee, call_args, ..
                             }) if call_args.last().map_or(false, |&x| x == cont_p) => {
@@ -176,96 +270,112 @@ impl crate::ir::Module {
                             _ => false,
                         }
                     });
-                    // 4. only call other stack-enabled functions - we won't have a continuation to pass other functions
-                    if !reqs.contains(callee) {
-                        reqs.push(*callee);
-                    }
-
-                    if !good {
-                        modes.insert(val, FunMode::NoStack);
-                    } else {
-                        if reqs.is_empty() {
-                            modes.insert(val, FunMode::YesStack);
-                        } else {
-                            modes.insert(val, FunMode::Maybe(reqs));
-                        }
-                    }
                 } else {
                     // This function doesn't have a continuation.
                     // It can still be stack-enabled as long as it only calls stack-enabled functions or their continuations.
-                    if params.iter().any(|x| {
-                        if let Node::FunType(_) = x.get(self) {
-                            !self.uses(*x).is_empty()
-                        } else {
-                            false
-                        }
-                    }) {
-                        // This function has a parameter of function type (and uses it), so it can't use the stack.
-                        modes.insert(val, FunMode::NoStack);
-                    } else {
-                        let req = match callee.get(self) {
-                            // Check if this is the last parameter of a function.
-                            // If so, we require that *that* function is stack-enabled, so it has a continuation.
-                            Node::Param(f, i) => {
-                                if let Node::Fun(Function { params, .. }) = f.get(self) {
-                                    if params.len() == *i as usize + 1 {
-                                        Some(*f)
+                    // The function must also not be used as a first-class function (not passed around, just called)
+                    // That's because we're going to turn it into a basic block
+                    for &u in self.uses(val) {
+                        match self.get(u).unwrap() {
+                            Node::Fun(f) => {
+                                // Using it as an argument to if or ifcase doesn't count
+                                if f.callee != val
+                                    && !matches!(
+                                        self.get(f.callee),
+                                        Some(Node::If(_)) | Some(Node::IfCase(_, _))
+                                    )
+                                {
+                                    // Or as a continuation to a stack_enabled function
+                                    if f.call_args.iter().rev().skip(1).all(|a| *a != val)
+                                        && f.call_args.last() == Some(&val)
+                                    {
+                                        // If it's the continuation to an externcall, we don't need to add that to reqs
+                                        if !matches!(self.get(u), Some(Node::Fun(Function { callee, .. })) if matches!(self.get(*callee), Some(Node::ExternCall(_))))
+                                        {
+                                            reqs.push(u)
+                                        }
                                     } else {
-                                        None
+                                        // It's passed to another function, which isn't allowed for blocks
+                                        good = false;
                                     }
-                                } else {
-                                    None
                                 }
                             }
-                            // The called function isn't a continuation, so we require that it's stack-enabled.
-                            _ => Some(*callee),
-                        };
-                        if let Some(req) = req {
-                            modes.insert(val, FunMode::Maybe(vec![req]));
-                        } else {
-                            modes.insert(val, FunMode::NoStack);
+                            // Accessing its parameters is fine
+                            Node::Param(_, _) => (),
+                            _ => good = false,
                         }
+                    }
+                }
+
+                if !good {
+                    modes.insert(val, FunMode::NoStack);
+                } else {
+                    if reqs.is_empty() {
+                        modes.insert(val, FunMode::YesStack);
+                    } else {
+                        modes.insert(val, FunMode::Maybe(reqs));
                     }
                 }
             }
         }
 
         // Now look at requirements and figure out which functions can actually use the stack
-        while let Some((val, reqs)) = modes.iter().find_map(|(&val, mode)| match mode {
-            FunMode::Maybe(reqs) => Some((val, reqs)),
-            _ => None,
+        // We go over the list repeatedly until all functions are resolved
+        while modes.iter().any(|(_val, mode)| match mode {
+            FunMode::Maybe(_) => true,
+            _ => false,
         }) {
-            let mut okay = true;
-            // The new version of reqs - functions we're still waiting on
-            let mut nreqs = Vec::new();
-            for v in reqs.clone() {
-                // Single recursion is fine
-                if v == val {
-                    continue;
-                }
-                match modes.get(&v) {
-                    Some(FunMode::YesStack) => {
-                        // We won't add it to nreqs, since we know it's good
-                    }
-                    // If it's None, it means it's an unknown function, which could be NoStack
-                    Some(FunMode::NoStack) | None => {
-                        okay = false;
-                        break;
-                    }
-                    Some(FunMode::Maybe(rs)) => {
-                        // Transfer that functions requirements to this one.
-                        // We'll come back next iteration.
-                        nreqs.extend(rs.iter().copied().filter(|&x| x != v && x != val));
-                    }
-                }
-            }
+            let v: Vec<_> = modes
+                .iter()
+                .filter_map(|(&val, mode)| match mode {
+                    FunMode::Maybe(reqs) => Some((val, reqs.clone())),
+                    _ => None,
+                })
+                .collect();
+            for (val, reqs) in v {
+                let mut okay = true;
 
-            if !okay {
-                modes.insert(val, FunMode::NoStack);
-            } else if nreqs.is_empty() {
-                modes.insert(val, FunMode::YesStack);
-            } else {
-                modes.insert(val, FunMode::Maybe(nreqs));
+                // The new version of reqs - functions we're still waiting on
+                let mut nreqs = Vec::new();
+                for v in reqs {
+                    let v = v.unredirect(self);
+                    // Single recursion is fine
+                    if v == val {
+                        continue;
+                    }
+                    match modes.get(&v) {
+                        Some(FunMode::YesStack) => {
+                            // We won't add it to nreqs, since we know it's good
+                        }
+                        // If it's None, it means it's an unknown function, which could be NoStack
+                        Some(FunMode::NoStack) | None => {
+                            okay = false;
+                            break;
+                        }
+                        Some(FunMode::Maybe(rs)) => {
+                            if rs.iter().any(|&x| x == val) {
+                                // That function depends on this one, so we'll let it figure itself out.
+                            } else {
+                                // Transfer that function's requirements to this one.
+                                // We'll come back next iteration.
+                                nreqs.extend(
+                                    rs.iter()
+                                        .copied()
+                                        .filter(|&x| x != v && x != val && !nreqs.contains(&x))
+                                        .collect::<Vec<_>>(),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if !okay {
+                    modes.insert(val, FunMode::NoStack);
+                } else if nreqs.is_empty() {
+                    modes.insert(val, FunMode::YesStack);
+                } else {
+                    modes.insert(val, FunMode::Maybe(nreqs));
+                }
             }
         }
 
@@ -717,29 +827,12 @@ impl crate::ir::Module {
                             call_args,
                         })) = self.get(x)
                         {
-                            // A function is eligible for turning into a basic block if it doesn't call an unknown continuation - it always branches to a known destination.
-                            let is_block = match self.get(*callee).unwrap() {
-                                Node::Fun(_) => true,
-                                Node::IfCase(_, _) | Node::If(_) => true,
-                                Node::Const(crate::ir::Constant::Unreachable) => true,
-                                // Calls a continuation parameter
-                                Node::Param(f, _) if *f == x => false,
-                                // Must be accessible from outside
-                                Node::Param(_, _) => true,
-                                // TODO detect if this is known from outside
-                                _ => false,
-                            }
-                                // The function must also not be used as a first-class function (not passed around, just called)
-                                // This is, in theory, an arbitrary LLVM-specific restriction
-                                // In assembly and probably other IRs, basic blocks (labels) can be passed around just fine
-                                && self.uses(x).iter().all(|&u| match self.get(u).unwrap() {
-                                    Node::Fun(f) => f.call_args.iter().all(|a| *a != x)
-                                        // Using it as an argument to if or ifcase doesn't count
-                                        || matches!(self.get(f.callee), Some(Node::If(_)) | Some(Node::IfCase(_, _))),
-                                    // Accessing its parameters is fine
-                                    Node::Param(_, _) => true,
-                                    _ => false,
-                                });
+                            // It must be stack enabled and not have its own continuation
+                            let is_block = stack_enabled.contains(&x)
+                                && !matches!(
+                                    params.iter().last().and_then(|&x| self.get(x)),
+                                    Some(Node::FunType(_))
+                                );
 
                             if is_block {
                                 Some((
@@ -752,7 +845,9 @@ impl crate::ir::Module {
                                 ))
                             } else {
                                 // Mark it for generation, if it isn't marked already
-                                if !to_add.iter().any(|(y, _)| *y == x) && !to_gen.iter().any(|(y, _)| *y == x) {
+                                if !to_add.iter().any(|(y, _)| *y == x)
+                                    && !to_gen.iter().any(|(y, _)| *y == x)
+                                {
                                     to_add.push((x, Vec::new()));
                                 }
                                 // Things in its scope don't belong here, they'll be generated with it later
@@ -833,11 +928,12 @@ impl crate::ir::Module {
                     match self.get(ret_ty).unwrap() {
                         Node::FunType(v) => {
                             let ret_ty = if v.len() == 1 {
-                                v[0]
+                                self.llvm_ty(v[0], cxt)
                             } else {
-                                todo!("return a tuple?")
+                                let v: Vec<_> =
+                                    v.iter().copied().map(|x| self.llvm_ty(x, cxt)).collect();
+                                cxt.cxt.struct_type(&v, false).as_basic_type_enum()
                             };
-                            let ret_ty = self.llvm_ty(ret_ty, cxt);
                             ret_ty.fn_type(&args, false)
                         }
                         _ => unreachable!(),
@@ -894,7 +990,7 @@ impl crate::ir::Module {
                 env,
                 ..
             },
-        ) in &cxt.functions
+        ) in cxt.functions.clone()
         {
             // First generate the unknown version, which just delegates to the known version
             {
@@ -902,7 +998,7 @@ impl crate::ir::Module {
                 cxt.blocks = HashMap::new();
                 cxt.upvalues = HashMap::new();
 
-                let uentry = cxt.cxt.append_basic_block(*unknown, "entry");
+                let uentry = cxt.cxt.append_basic_block(unknown, "entry");
                 cxt.builder.position_at_end(uentry);
 
                 // Unpack environment
@@ -961,14 +1057,14 @@ impl crate::ir::Module {
                     // But we only ever need one of these at once, so we use `Val::INVALID`, which exists for this purpose
                     let cont = Val::INVALID;
                     cxt.upvalues.insert(cont, vcont);
-                    self.gen_call(*val, None, args, Some(cont), &cxt);
+                    self.gen_call(val, None, args, Some(cont), cxt);
                 } else {
-                    self.gen_call(*val, None, args, None, &cxt);
+                    self.gen_call(val, None, args, None, cxt);
                 }
             }
 
-            let &fun = known;
-            cxt.cont = *cont;
+            let fun = known;
+            cxt.cont = cont;
 
             let entry = cxt.cxt.append_basic_block(fun, "entry");
             cxt.builder.position_at_end(entry);
@@ -984,7 +1080,7 @@ impl crate::ir::Module {
 
             // Declare all blocks and their parameters first
             // Block parameters are stored in allocas, which will be removed with mem2reg
-            for (bval, bfun) in blocks {
+            for (bval, bfun) in &blocks {
                 let name = format!("{}${}", val.pretty(self), bval.pretty(self));
                 let block = cxt.cxt.append_basic_block(fun, &name);
                 let mut params = Vec::new();
@@ -1249,7 +1345,7 @@ impl crate::ir::Module {
         callee_ty: Option<Val>,
         mut args: Vec<BasicValueEnum<'cxt>>,
         cont: Option<Val>,
-        cxt: &Cxt<'cxt>,
+        cxt: &mut Cxt<'cxt>,
     ) {
         let tys = match callee_ty
             .unwrap_or_else(|| self.get(callee).unwrap().clone().ty(self))
@@ -1266,11 +1362,24 @@ impl crate::ir::Module {
             }
             let args = args
                 .into_iter()
-                .zip(tys)
-                .map(|(x, ty)| self.cast(x, ty, cxt))
+                .zip(&tys)
+                .map(|(x, &ty)| self.cast(x, ty, cxt))
                 .collect::<Vec<_>>();
-            assert_eq!(args.len(), 1);
-            cxt.builder.build_return(Some(&args[0]));
+            let ret = if args.len() == 1 {
+                args[0]
+            } else {
+                let tys: Vec<_> = tys.into_iter().map(|x| self.llvm_ty(x, cxt)).collect();
+                let ty = cxt.cxt.struct_type(&tys, false);
+                let mut agg = ty.get_undef().as_aggregate_value_enum();
+                for (i, x) in args.into_iter().enumerate() {
+                    agg = cxt
+                        .builder
+                        .build_insert_value(agg, x, i as u32, "product")
+                        .unwrap();
+                }
+                agg.as_basic_value_enum()
+            };
+            cxt.builder.build_return(Some(&ret));
         // If we're calling a basic block, jump there
         } else if let Some((target, params)) = cxt.blocks.get(&callee) {
             if let Some(k) = cont {
@@ -1291,6 +1400,10 @@ impl crate::ir::Module {
             cxt.builder.build_return(None);
         // If we're calling unreachable, emit a LLVM unreachable instruction
         } else if let Some(Node::Const(crate::ir::Constant::Unreachable)) = self.get(callee) {
+            cxt.builder.build_unreachable();
+        // Even if it goes through a function
+        } else if matches!(self.get(callee), Some(Node::Fun(Function { callee, .. })) if matches!(self.get(*callee), Some(Node::Const(crate::ir::Constant::Unreachable))))
+        {
             cxt.builder.build_unreachable();
         // If we're calling an extern function, do that
         } else if let Some(Node::ExternCall(f)) = self.get(callee) {
@@ -1341,13 +1454,31 @@ impl crate::ir::Module {
                         let call = cxt.builder.build_call(*known, &args, "stack_call");
                         call.set_tail_call(true);
                         call.set_call_convention(TAILCC);
-                        self.gen_call(
-                            cont,
-                            cont_ty,
-                            vec![call.try_as_basic_value().left().unwrap()],
-                            None,
-                            cxt,
-                        )
+
+                        let call = call.try_as_basic_value().left().unwrap();
+                        let nargs = match self.get(cont_ty.unwrap()).unwrap() {
+                            Node::FunType(v) => v.len(),
+                            _ => unreachable!(),
+                        };
+                        let mut args = if nargs == 1 {
+                            vec![call]
+                        } else {
+                            let call = call.into_struct_value();
+                            (0..nargs as u32)
+                                .map(|i| {
+                                    cxt.builder
+                                        .build_extract_value(call, i, "extract_return")
+                                        .unwrap()
+                                })
+                                .collect()
+                        };
+                        let acont = args.pop().map(|x| {
+                            let v = self.reserve(None);
+                            cxt.upvalues.insert(v, x);
+                            v
+                        });
+
+                        self.gen_call(cont, cont_ty, args, acont, cxt)
                     } else {
                         if let Some(k) = cont {
                             let v = self.gen_value(k, cxt);

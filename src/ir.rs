@@ -256,41 +256,49 @@ impl Module {
         acc.into_iter().collect()
     }
 
-    /// Returns all functions that `v` depends on the parameters of, and so must be within.
-    /// Doesn't recurse past function boundaries:
-    /// if `v` depends on a parameter of `f`, and `f` depends on a parameter of `g`, this will only return `f`, not `g`.
+    /// Returns all functions that `v` depends on the parameters of, and so must be within, recursively.
     pub fn dependencies(&self, v: Val) -> Vec<Val> {
-        let mut seen = HashSet::new();
-        seen.insert(v);
-        let mut vret = Vec::new();
-        let mut vcur = vec![v];
-        let mut ix = 0;
-        while let Some(&v) = vcur.get(ix) {
-            if let Node::Param(f, _) = self.get(v).unwrap() {
-                if !seen.contains(f) {
-                    seen.insert(*f);
-                    // Not recursive
-                    // vcur.push(*f);
-                    vret.push(*f);
+        fn go(m: &Module, v: Val, seen: &mut HashSet<Val>, acc: &mut HashSet<Val>) {
+            let v = v.unredirect(m);
+            match m.get(v).unwrap() {
+                Node::Param(f, _) => {
+                    if seen.contains(f) {
+                    } else {
+                        match m.get(*f).unwrap() {
+                            Node::Fun(Function { .. }) => {
+                                acc.insert(*f);
+                            }
+                            // Parameters of pi or sigma types don't count
+                            Node::FunType(_) | Node::ProdType(_) => (),
+                            _ => unreachable!(),
+                        }
+                    }
                 }
-            } else {
-                for i in self.get(v).unwrap().runtime_args() {
-                    let i = i.unredirect(self);
-                    if !seen.contains(&i) {
-                        seen.insert(i);
-                        vcur.push(i);
+                n @ Node::Fun(_) => {
+                    if !seen.contains(&v) {
+                        seen.insert(v);
+                        for i in n.runtime_args() {
+                            go(m, i, seen, acc)
+                        }
+                        seen.remove(&v);
+                    }
+                }
+                n => {
+                    for i in n.runtime_args() {
+                        go(m, i, seen, acc)
                     }
                 }
             }
-            ix += 1;
         }
-        vret
+        let mut acc = HashSet::new();
+        go(self, v, &mut HashSet::new(), &mut acc);
+        acc.into_iter().collect()
     }
 
     /// Returns the scope of each function in this module, i.e. for each function, everything that must be nested directly within it.
     pub fn top_level_scopes(&self) -> HashMap<Val, Vec<Val>> {
         let mut top_level = Vec::new();
-        let mut scopes = HashMap::new();
+        let mut scopes: HashMap<Val, Vec<Val>> = HashMap::new();
         for i in 0..self.nodes.len() {
             let i = Val(i);
             // Skip redirects for this
