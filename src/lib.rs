@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use smallvec::*;
 pub mod backend;
 pub mod builder;
 mod emit;
 pub mod ir;
 pub mod parse;
 use ir::*;
+pub use inkwell;
 
 impl Node {
     pub fn mangle(self, m: &mut Module, map: &HashMap<Val, Val>) -> Self {
@@ -127,6 +127,7 @@ pub fn lift(m: &mut Module, vfun: Val, to_lift: Val) -> Val {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::*;
 
     #[test]
     fn test_lifting() {

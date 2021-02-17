@@ -396,7 +396,7 @@ impl<'m> Builder<'m> {
         let fun = self.module.reserve(None);
         let cont = self.module.add(
             Node::Param(fun, params.len() as u8),
-            Some("$cont.return".into()),
+            Some(format!("$cont.return.%{}", fun.num())),
         );
         self.funs.push((fun, self.block, self.params.clone(), cont));
         self.block = fun;

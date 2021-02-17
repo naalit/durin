@@ -146,6 +146,12 @@ impl Module {
 
     pub fn redirect(&mut self, from: Val, to: Val) {
         self.nodes[from.num()] = Slot::Redirect(to);
+        // If we use redirect() to give this node a name, transfer that over
+        if self.name(to).is_none() {
+            if let Some(name) = self.name(from) {
+                self.names[to.num()] = Some(name.clone());
+            }
+        }
     }
 
     pub fn replace(&mut self, v: Val, x: Node) {

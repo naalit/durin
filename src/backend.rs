@@ -405,8 +405,34 @@ impl crate::ir::Module {
                 }
             },
             Node::FunType(_) => cxt.size_ty().get_bit_width() as u64 / 8 * 2,
-            Node::ProdType(v) => v.iter().map(|&x| self.static_size(x, cxt)).sum(),
-            Node::SumType(v) => v.iter().map(|&x| self.static_size(x, cxt)).max().unwrap(),
+            Node::ProdType(v) => {
+                // TODO alignment should probably be a property of types separate from size
+                let mut size = 0;
+                for &i in v {
+                    let x = self.static_size(i, cxt);
+                    let align = x.min(8);
+                    if align > 0 {
+                        while size % align != 0 {
+                            size += 1;
+                        }
+                    }
+                    size += x;
+                }
+                size
+            }
+            Node::SumType(v) => {
+                let payload = v.iter().map(|&x| self.static_size(x, cxt)).max().unwrap();
+                let mut tag = match v.len() {
+                    0..=1 => 0,
+                    2 => 1,
+                    257..=65536 => 4,
+                    _ => 8,
+                };
+                if payload > 1 {
+                    tag = 8;
+                }
+                tag + payload
+            }
             Node::Param(_, _) | Node::ExternFunType(_, _) => {
                 cxt.size_ty().get_bit_width() as u64 / 8
             }
@@ -471,9 +497,14 @@ impl crate::ir::Module {
                 cxt.cxt.struct_type(&v, false).as_basic_type_enum()
             }
             Node::SumType(v) => {
+                if v.len() == 1 {
+                    // No tag if there's only one element
+                    return self.llvm_ty(v[0], cxt);
+                }
+
                 // TODO size probably isn't a constant
-                let &payload = v.iter().max_by_key(|&&x| self.static_size(x, cxt)).unwrap();
-                let payload = self.llvm_ty(payload, cxt);
+                let size = v.iter().map(|&x| self.static_size(x, cxt)).max().unwrap();
+                let payload = cxt.cxt.i8_type().array_type(size as u32).as_basic_type_enum();
                 let tag = match v.len() {
                     // No tag if there's only one element
                     0..=1 => return payload,
@@ -545,7 +576,8 @@ impl crate::ir::Module {
                         }
                         let env_ptr = cxt
                             .builder
-                            .build_alloca(cxt.cxt.struct_type(&env_tys, false), "env_ptr");
+                            .build_malloc(cxt.cxt.struct_type(&env_tys, false), "env_ptr")
+                            .unwrap();
                         cxt.builder.build_store(env_ptr, env_val);
                         cxt.builder
                             .build_bitcast(env_ptr, cxt.any_ty(), "env")
@@ -1316,8 +1348,8 @@ impl crate::ir::Module {
             | BasicTypeEnum::StructType(_)
             | BasicTypeEnum::VectorType(_) => {
                 let ty = val.get_type();
-                // TODO heap allocate instead
-                let ptr = cxt.builder.build_alloca(ty, "cast_slot");
+                // TODO garbage collection
+                let ptr = cxt.builder.build_malloc(ty, "cast_slot").unwrap();
                 cxt.builder.build_store(ptr, val);
                 cxt.builder
                     .build_bitcast(ptr, cxt.any_ty(), "casted")
