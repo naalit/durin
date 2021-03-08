@@ -173,7 +173,7 @@ impl crate::ir::Module {
                 }
             }
             // If it's calling an extern function, it calls passed the continuation
-            Node::ExternCall(_) => reqs.push(*call_args.last().unwrap()),
+            Node::ExternCall(_) | Node::Ref(_) => reqs.push(*call_args.last().unwrap()),
             // Unreachable and Stop don't call any other functions
             Node::Const(_) => (),
             Node::Fun(_) => {
@@ -264,9 +264,11 @@ impl crate::ir::Module {
                             Node::Fun(Function {
                                 callee, call_args, ..
                             }) if call_args.last().map_or(false, |&x| x == cont_p) => {
+                                // TODO what if it's e.g. if or ref or externcall?
                                 reqs.push(*callee);
                                 true
                             }
+                            // And if it's the continuation of an externcall
                             _ => false,
                         }
                     });
@@ -282,7 +284,9 @@ impl crate::ir::Module {
                                 if f.callee != val
                                     && !matches!(
                                         self.get(f.callee),
-                                        Some(Node::If(_)) | Some(Node::IfCase(_, _))
+                                        Some(Node::If(_))
+                                            | Some(Node::IfCase(_, _))
+                                            | Some(Node::Ref(_))
                                     )
                                 {
                                     // Or as a continuation to a stack_enabled function
@@ -309,22 +313,20 @@ impl crate::ir::Module {
 
                 if !good {
                     modes.insert(val, FunMode::NoStack);
+                } else if reqs.is_empty() {
+                    modes.insert(val, FunMode::YesStack);
                 } else {
-                    if reqs.is_empty() {
-                        modes.insert(val, FunMode::YesStack);
-                    } else {
-                        modes.insert(val, FunMode::Maybe(reqs));
-                    }
+                    modes.insert(val, FunMode::Maybe(reqs));
                 }
             }
         }
 
         // Now look at requirements and figure out which functions can actually use the stack
         // We go over the list repeatedly until all functions are resolved
-        while modes.iter().any(|(_val, mode)| match mode {
-            FunMode::Maybe(_) => true,
-            _ => false,
-        }) {
+        while modes
+            .iter()
+            .any(|(_val, mode)| matches!(mode, FunMode::Maybe(_)))
+        {
             let v: Vec<_> = modes
                 .iter()
                 .filter_map(|(&val, mode)| match mode {
@@ -381,13 +383,7 @@ impl crate::ir::Module {
 
         modes
             .into_iter()
-            .filter(|(_, m)| {
-                if let FunMode::YesStack = m {
-                    true
-                } else {
-                    false
-                }
-            })
+            .filter(|(_, m)| matches!(m, FunMode::YesStack))
             .map(|(v, _)| v)
             .collect()
     }
@@ -433,7 +429,7 @@ impl crate::ir::Module {
                 }
                 tag + payload
             }
-            Node::Param(_, _) | Node::ExternFunType(_, _) => {
+            Node::Param(_, _) | Node::ExternFunType(_, _) | Node::RefTy(_) => {
                 cxt.size_ty().get_bit_width() as u64 / 8
             }
             Node::Fun(_)
@@ -444,6 +440,7 @@ impl crate::ir::Module {
             | Node::Proj(_, _)
             | Node::Inj(_, _, _)
             | Node::Product(_, _)
+            | Node::Ref(_)
             | Node::If(_) => {
                 unreachable!("not a type")
             }
@@ -504,12 +501,16 @@ impl crate::ir::Module {
 
                 // TODO size probably isn't a constant
                 let size = v.iter().map(|&x| self.static_size(x, cxt)).max().unwrap();
-                let payload = cxt.cxt.i8_type().array_type(size as u32).as_basic_type_enum();
+                let payload = cxt
+                    .cxt
+                    .i8_type()
+                    .array_type(size as u32)
+                    .as_basic_type_enum();
                 let tag = match v.len() {
                     // No tag if there's only one element
                     0..=1 => return payload,
-                    2 => cxt.cxt.bool_type(),
-                    3..=256 => cxt.cxt.i8_type(),
+                    // 2 => cxt.cxt.bool_type(),
+                    2..=256 => cxt.cxt.i8_type(),
                     257..=65536 => cxt.cxt.i32_type(),
                     _ => cxt.cxt.i64_type(),
                 };
@@ -517,6 +518,10 @@ impl crate::ir::Module {
                     .struct_type(&[tag.as_basic_type_enum(), payload], false)
                     .as_basic_type_enum()
             }
+            Node::RefTy(v) => self
+                .llvm_ty(*v, cxt)
+                .ptr_type(AddressSpace::Generic)
+                .as_basic_type_enum(),
             // Polymorphic
             Node::Param(_, _) => cxt.any_ty(),
             Node::Fun(_)
@@ -527,6 +532,7 @@ impl crate::ir::Module {
             | Node::Proj(_, _)
             | Node::Inj(_, _, _)
             | Node::Product(_, _)
+            | Node::Ref(_)
             | Node::If(_) => {
                 unreachable!("not a type")
             }
@@ -613,7 +619,7 @@ impl crate::ir::Module {
                 let ty = cxt.cxt.struct_type(&[cxt.any_ty(), cxt.any_ty()], false);
                 ty.size_of().unwrap().as_basic_value_enum()
             }
-            Node::ExternFunType(_, _) => {
+            Node::ExternFunType(_, _) | Node::RefTy(_) => {
                 // Just a function pointer
                 cxt.any_ty().size_of().unwrap().as_basic_value_enum()
             }
@@ -698,9 +704,16 @@ impl crate::ir::Module {
             }
             Node::IfCase(_, _) => panic!("`ifcase _ _` isn't a first-class function!"),
             Node::If(_) => panic!("`if _` isn't a first-class function!"),
+            Node::Ref(_) => {
+                panic!("`refset`, `refget`, and `refnew` aren't first-class functions!")
+            }
             Node::Param(f, i) => {
                 let name = self.name(val).map(|x| x as &str).unwrap_or("param");
-                let ptr = cxt.blocks.get(f).unwrap().1[*i as usize];
+                let ptr = cxt
+                    .blocks
+                    .get(f)
+                    .unwrap_or_else(|| panic!("Couldn't find param {} of {}", i, f.pretty(self)))
+                    .1[*i as usize];
                 cxt.builder.build_load(ptr, name)
             }
             Node::Const(c) => match c {
@@ -1181,7 +1194,7 @@ impl crate::ir::Module {
                             continue;
                         }
                         Node::SumType(v) => v[i],
-                        _ => unreachable!(),
+                        x => unreachable!("{:?}", x),
                     };
                     assert_eq!(bfun.call_args.len(), 2);
                     let fthen = bfun.call_args[0];
@@ -1215,6 +1228,12 @@ impl crate::ir::Module {
                     let payload_ptr = cxt
                         .builder
                         .build_alloca(payload.get_type(), "union.payload.ptr");
+                    // TODO query the needed alignment for the target type
+                    payload_ptr
+                        .as_instruction_value()
+                        .unwrap()
+                        .set_alignment(8)
+                        .unwrap();
                     cxt.builder.build_store(payload_ptr, payload);
                     let payload_ptr = cxt.builder.build_bitcast(
                         payload_ptr,
@@ -1310,6 +1329,12 @@ impl crate::ir::Module {
                     .build_bitcast(any, lty, "extern_fun_ptr")
                     .as_basic_value_enum()
             }
+            Node::RefTy(_) => {
+                let lty = self.llvm_ty(ty, cxt);
+                cxt.builder
+                    .build_bitcast(any, lty, "ref_casted")
+                    .as_basic_value_enum()
+            }
             // Leave as an "any" since it's polymorphic
             Node::Param(_, _) => any.as_basic_value_enum(),
             // TODO Proj should be allowed as a type
@@ -1321,6 +1346,7 @@ impl crate::ir::Module {
             | Node::Proj(_, _)
             | Node::Inj(_, _, _)
             | Node::Product(_, _)
+            | Node::Ref(_)
             | Node::If(_) => {
                 unreachable!("not a type")
             }
@@ -1355,7 +1381,10 @@ impl crate::ir::Module {
                     .build_bitcast(ptr, cxt.any_ty(), "casted")
                     .into_pointer_value()
             }
-            BasicTypeEnum::PointerType(_) => val.into_pointer_value(),
+            BasicTypeEnum::PointerType(_) => cxt
+                .builder
+                .build_bitcast(val, cxt.any_ty(), "casted")
+                .into_pointer_value(),
             BasicTypeEnum::FloatType(_) => unimplemented!(),
         }
     }
@@ -1384,7 +1413,7 @@ impl crate::ir::Module {
             .get(self)
         {
             Node::FunType(tys) => tys.clone(),
-            _ => unreachable!(),
+            x => unreachable!("{:?}", x),
         };
 
         // If we're calling the return continuation, emit a return instruction
@@ -1427,6 +1456,37 @@ impl crate::ir::Module {
                 cxt.builder.build_store(ptr, value);
             }
             cxt.builder.build_unconditional_branch(*target);
+        // Execute a ref op if we're doing one
+        } else if let Some(Node::Ref(op)) = self.get(callee) {
+            // Execute the operation
+            let args = match op {
+                crate::ir::RefOp::RefNew(ty) => {
+                    let ty = self.llvm_ty(*ty, cxt);
+                    let ptr = cxt.builder.build_malloc(ty, "refnew").unwrap();
+                    vec![ptr.as_basic_value_enum()]
+                }
+                crate::ir::RefOp::RefGet(r) => {
+                    let ptr = self.gen_value(*r, cxt).into_pointer_value();
+                    let val = cxt.builder.build_load(ptr, "refget");
+                    vec![val]
+                }
+                crate::ir::RefOp::RefSet(r, v) => {
+                    let ptr = self.gen_value(*r, cxt).into_pointer_value();
+                    let val = self.gen_value(*v, cxt);
+                    cxt.builder.build_store(ptr, val);
+                    Vec::new()
+                }
+            };
+
+            // Call the continuation
+            let cont = cont.unwrap();
+            let cont_ty = tys.last().copied();
+            let cont2 = args.last().map(|&v| {
+                let n = self.reserve(None);
+                cxt.upvalues.insert(n, v);
+                n
+            });
+            self.gen_call(cont, cont_ty, Vec::new(), cont2, cxt)
         // If we're stopping, return void
         } else if let Some(Node::Const(crate::ir::Constant::Stop)) = self.get(callee) {
             cxt.builder.build_return(None);
@@ -1482,7 +1542,9 @@ impl crate::ir::Module {
 
                     // The actual call depends on whether we're using the LLVM stack or not
                     if *stack_enabled && fcont.is_some() {
-                        let cont = cont.unwrap();
+                        let cont = cont.unwrap_or_else(|| {
+                            panic!("No continuation given for {}", callee.pretty(self))
+                        });
                         let call = cxt.builder.build_call(*known, &args, "stack_call");
                         call.set_tail_call(true);
                         call.set_call_convention(TAILCC);

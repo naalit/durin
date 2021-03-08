@@ -5,8 +5,8 @@ pub mod builder;
 mod emit;
 pub mod ir;
 pub mod parse;
-use ir::*;
 pub use inkwell;
+use ir::*;
 
 impl Node {
     pub fn mangle(self, m: &mut Module, map: &HashMap<Val, Val>) -> Self {
@@ -41,8 +41,14 @@ impl Node {
                 v.iter_mut().for_each(|x| *x = x.mangle(m, map));
                 Node::Product(ty.mangle(m, map), v)
             }
+            Node::Ref(RefOp::RefNew(a)) => Node::Ref(RefOp::RefNew(a.mangle(m, map))),
+            Node::Ref(RefOp::RefGet(a)) => Node::Ref(RefOp::RefGet(a.mangle(m, map))),
+            Node::Ref(RefOp::RefSet(a, b)) => {
+                Node::Ref(RefOp::RefSet(a.mangle(m, map), b.mangle(m, map)))
+            }
             Node::IfCase(i, x) => Node::IfCase(i, x.mangle(m, map)),
             Node::If(x) => Node::If(x.mangle(m, map)),
+            Node::RefTy(x) => Node::RefTy(x.mangle(m, map)),
             Node::ExternCall(x) => Node::ExternCall(x.mangle(m, map)),
             Node::Proj(x, i) => Node::Proj(x.mangle(m, map), i),
             Node::Param(f, i) => Node::Param(f.mangle(m, map), i),
@@ -57,13 +63,11 @@ impl Val {
     pub fn mangle(self, m: &mut Module, map: &HashMap<Val, Val>) -> Self {
         if let Some(&x) = map.get(&self) {
             x
+        } else if let Some(new) = m.get(self).cloned().map(|x| x.mangle(m, map)) {
+            m.add(new, m.name(self).cloned())
         } else {
-            if let Some(new) = m.get(self).cloned().map(|x| x.mangle(m, map)) {
-                m.add(new, m.name(self).cloned())
-            } else {
-                // Assume it doesn't use things in `map`, I guess?
-                self
-            }
+            // Assume it doesn't use things in `map`, I guess?
+            self
         }
     }
 }

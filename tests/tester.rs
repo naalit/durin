@@ -56,3 +56,4 @@ verify!(ifs);
 verify!(blocks);
 verify!(dec);
 verify!(stuff);
+verify!(refs);

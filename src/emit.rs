@@ -5,7 +5,7 @@ pub struct PrettyVal<'a>(&'a Module, Val, bool);
 impl<'a> Display for PrettyVal<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let PrettyVal(m, v, force_write) = *self;
-        if let None = m.get(v) {
+        if m.get(v).is_none() {
             return write!(f, "<None>");
         }
         if !force_write {
@@ -87,6 +87,11 @@ impl<'a> Display for PrettyVal<'a> {
             Node::IfCase(i, x) => {
                 write!(f, "ifcase {} {}", i, x.pretty(m))
             }
+            Node::Ref(op) => match op {
+                RefOp::RefNew(ty) => write!(f, "refnew {}", ty.pretty(m)),
+                RefOp::RefGet(ptr) => write!(f, "refget {}", ptr.pretty(m)),
+                RefOp::RefSet(ptr, val) => write!(f, "refset {} {}", ptr.pretty(m), val.pretty(m)),
+            },
             Node::ExternCall(x) => {
                 write!(f, "externcall {}", x.pretty(m))
             }
@@ -191,6 +196,10 @@ impl Module {
                             write!(buf, "{}", i.pretty(self)).unwrap()
                         }
                         writeln!(buf, "): {};", ret.pretty(self)).unwrap();
+                    }
+                    Node::RefTy(x) => {
+                        writeln!(buf, "val {} = ref {};", self.name_or(num), x.pretty(self),)
+                            .unwrap();
                     }
                     _ if !matches!(node, Node::Param(_, _)) && self.names[num].is_some() => {
                         writeln!(

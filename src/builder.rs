@@ -364,6 +364,13 @@ impl<'m> Builder<'m> {
             .add(Node::FunType(smallvec![from, cont_ty]), None)
     }
 
+    pub fn fun_type_multi(&mut self, params: impl Into<SmallVec<[Val; 4]>>, to: Val) -> Val {
+        let mut params = params.into();
+        let cont_ty = self.module.add(Node::FunType(smallvec![to]), None);
+        params.push(cont_ty);
+        self.module.add(Node::FunType(params), None)
+    }
+
     pub fn fun_type_raw(&mut self, params: impl Into<SmallVec<[Val; 4]>>) -> Val {
         self.module.add(Node::FunType(params.into()), None)
     }
@@ -539,7 +546,7 @@ impl<'m> Builder<'m> {
             Node::Fun(Function {
                 params: self.params.drain(0..).collect(),
                 callee,
-                call_args: args.into(),
+                call_args: args,
             }),
         );
         self.block = cont;
@@ -549,5 +556,68 @@ impl<'m> Builder<'m> {
         };
         self.params.push(ret_ty);
         self.module.add(Node::Param(cont, 0), None)
+    }
+
+    pub fn ref_type(&mut self, inner_ty: Val) -> Val {
+        self.module.add(Node::RefTy(inner_ty), None)
+    }
+
+    pub fn refnew(&mut self, inner_ty: Val) -> Val {
+        let cont = self.module.reserve(None);
+        let callee = self.module.add(Node::Ref(RefOp::RefNew(inner_ty)), None);
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee,
+                call_args: smallvec![cont],
+            }),
+        );
+        self.block = cont;
+        let ret_ty = self.module.add(Node::RefTy(inner_ty), None);
+        self.params.push(ret_ty);
+        self.module.add(Node::Param(cont, 0), None)
+    }
+
+    pub fn refget(&mut self, vref: Val) -> Val {
+        let cont = self.module.reserve(None);
+        let callee = self.module.add(Node::Ref(RefOp::RefGet(vref)), None);
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee,
+                call_args: smallvec![cont],
+            }),
+        );
+        self.block = cont;
+        let ret_ty = match vref
+            .get(self.module)
+            .clone()
+            .ty(self.module)
+            .get(self.module)
+        {
+            Node::RefTy(r) => *r,
+            _ => panic!("refget() requires ref value!"),
+        };
+        self.params.push(ret_ty);
+        self.module.add(Node::Param(cont, 0), None)
+    }
+
+    pub fn refset(&mut self, vref: Val, new_val: Val) {
+        let cont = self.module.reserve(None);
+        let callee = self
+            .module
+            .add(Node::Ref(RefOp::RefSet(vref, new_val)), None);
+        self.module.replace(
+            self.block,
+            Node::Fun(Function {
+                params: self.params.drain(0..).collect(),
+                callee,
+                call_args: smallvec![cont],
+            }),
+        );
+        self.block = cont;
+        // No return value from `refset`
     }
 }

@@ -115,7 +115,7 @@ impl<'a> Parser<'a> {
             }
         }
         if self.pos == start {
-            self.error(format!("Expected name"))
+            self.error("Expected name".to_string())
         }
         &self.input[start..self.pos]
     }
@@ -339,6 +339,10 @@ impl<'a> Parser<'a> {
         } else if self.matches("I16") {
             self.module
                 .add(Node::Const(Constant::IntType(Width::W16)), None)
+        } else if self.matches("ref") {
+            self.skip_whitespace();
+            let ty = self.expr();
+            self.module.add(Node::RefTy(ty), None)
         } else if self
             .peek()
             .expect("unexpected EOF, maybe missing ;")
@@ -570,6 +574,69 @@ impl<'a> Parser<'a> {
                         params,
                         callee,
                         call_args: SmallVec::new(),
+                    }),
+                );
+            } else if self.matches("refnew") {
+                self.skip_whitespace();
+
+                let ty = self.expr();
+                self.skip_whitespace();
+
+                let cont = self.expr();
+                self.skip_whitespace();
+
+                self.expect(";");
+
+                let callee = self.module.add(Node::Ref(RefOp::RefNew(ty)), None);
+                self.module.replace(
+                    val,
+                    Node::Fun(Function {
+                        params,
+                        callee,
+                        call_args: smallvec![cont],
+                    }),
+                );
+            } else if self.matches("refset") {
+                self.skip_whitespace();
+
+                let ptr = self.expr();
+                self.skip_whitespace();
+
+                let v = self.expr();
+                self.skip_whitespace();
+
+                let cont = self.expr();
+                self.skip_whitespace();
+
+                self.expect(";");
+
+                let callee = self.module.add(Node::Ref(RefOp::RefSet(ptr, v)), None);
+                self.module.replace(
+                    val,
+                    Node::Fun(Function {
+                        params,
+                        callee,
+                        call_args: smallvec![cont],
+                    }),
+                );
+            } else if self.matches("refget") {
+                self.skip_whitespace();
+
+                let ptr = self.expr();
+                self.skip_whitespace();
+
+                let cont = self.expr();
+                self.skip_whitespace();
+
+                self.expect(";");
+
+                let callee = self.module.add(Node::Ref(RefOp::RefGet(ptr)), None);
+                self.module.replace(
+                    val,
+                    Node::Fun(Function {
+                        params,
+                        callee,
+                        call_args: smallvec![cont],
                     }),
                 );
             } else if self.matches("externcall") {

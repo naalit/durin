@@ -173,8 +173,8 @@ impl Module {
         self.nodes[v.num()] = Slot::Full(x);
     }
 
-    pub fn top_level<'a>(&'a self) -> impl Iterator<Item = Val> + 'a {
-        (0..self.nodes.len()).map(|x| Val(x)).filter(move |x| {
+    pub fn top_level(&self) -> impl Iterator<Item = Val> + '_ {
+        (0..self.nodes.len()).map(Val).filter(move |x| {
             // A node is top-level if it:
             // 1. is a function (and not a redirect)
             if !matches!(self.nodes.get(x.num()), Some(Slot::Full(Node::Fun(_)))) {
@@ -187,12 +187,7 @@ impl Module {
                 match m.get(x) {
                     None => unreachable!(),
                     Some(Node::Param(p, _)) => {
-                        !not.contains(p)
-                            && if let Some(Node::Fun(_)) = m.get(*p) {
-                                true
-                            } else {
-                                false
-                            }
+                        !not.contains(p) && matches!(m.get(*p), Some(Node::Fun(_)))
                     }
                     Some(Node::Fun(_)) | Some(Node::FunType(_)) | Some(Node::ProdType(_)) => {
                         if !not.contains(&x) {
@@ -217,9 +212,9 @@ impl Module {
         })
     }
 
-    pub fn vals<'a>(&'a self) -> impl Iterator<Item = Val> + 'a {
+    pub fn vals(&self) -> impl Iterator<Item = Val> + '_ {
         (0..self.nodes.len())
-            .map(|x| Val(x))
+            .map(Val)
             .filter(move |x| self.get(*x).is_some())
     }
 
@@ -333,6 +328,31 @@ impl Module {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RefOp {
+    /// RefNew(inner_ty)
+    RefNew(Val),
+    /// RefGet(ref)
+    RefGet(Val),
+    /// RefSet(ref, new_val)
+    RefSet(Val, Val),
+}
+impl RefOp {
+    pub fn runtime_args(self) -> SmallVec<[Val; 4]> {
+        match self {
+            RefOp::RefNew(_) => smallvec!(),
+            RefOp::RefGet(v) => smallvec![v],
+            RefOp::RefSet(v, n) => smallvec![v, n],
+        }
+    }
+    pub fn args(self) -> SmallVec<[Val; 4]> {
+        match self {
+            RefOp::RefGet(v) | RefOp::RefNew(v) => smallvec![v],
+            RefOp::RefSet(v, n) => smallvec![v, n],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Node {
     Fun(Function),
@@ -346,6 +366,8 @@ pub enum Node {
     IfCase(usize, Val),
     ExternCall(Val),
     If(Val),
+    Ref(RefOp),
+    RefTy(Val),
     /// Projecting a numbered member of a product type
     Proj(Val, usize),
     /// Injecting a numbered member of a sum type (the type is the first argument)
@@ -375,6 +397,7 @@ impl Node {
             | Node::Proj(x, _)
             | Node::Inj(_, _, x)
             | Node::If(x)
+            | Node::RefTy(x)
             | Node::ExternCall(x) => {
                 smallvec![*x]
             }
@@ -384,6 +407,7 @@ impl Node {
             Node::Const(_) => SmallVec::new(),
             // `f` not being known at runtime doesn't really make sense
             Node::Param(_f, _) => SmallVec::new(),
+            Node::Ref(r) => r.runtime_args(),
         }
     }
 
@@ -407,9 +431,14 @@ impl Node {
             Node::Param(f, _) => smallvec![*f],
             Node::BinOp(_, a, b) | Node::Inj(a, _, b) => smallvec![*a, *b],
             Node::Const(_) => SmallVec::new(),
-            Node::IfCase(_, x) | Node::Proj(x, _) | Node::If(x) | Node::ExternCall(x) => {
+            Node::IfCase(_, x)
+            | Node::Proj(x, _)
+            | Node::If(x)
+            | Node::ExternCall(x)
+            | Node::RefTy(x) => {
                 smallvec![*x]
             }
+            Node::Ref(r) => r.args(),
         }
     }
 
@@ -427,17 +456,17 @@ impl Node {
                 }
                 _ => unreachable!(),
             },
-            Node::FunType(_) | Node::ProdType(_) | Node::SumType(_) | Node::ExternFunType(_, _) => {
-                m.add(Node::Const(Constant::TypeType), None)
-            }
+            Node::FunType(_)
+            | Node::ProdType(_)
+            | Node::SumType(_)
+            | Node::ExternFunType(_, _)
+            | Node::RefTy(_) => m.add(Node::Const(Constant::TypeType), None),
             Node::Product(ty, _) => *ty,
-            Node::Param(f, i) => {
-                if let Node::Fun(f) = m.get(*f).unwrap() {
-                    f.params[*i as usize]
-                } else {
-                    panic!("non-function has no params")
-                }
-            }
+            Node::Param(f, i) => match m.get(*f).unwrap() {
+                Node::Fun(f) => f.params[*i as usize],
+                Node::FunType(p) | Node::ProdType(p) => p[*i as usize],
+                _ => unreachable!(),
+            },
             Node::Const(c) => match c {
                 Constant::TypeType | Constant::IntType(_) => {
                     m.add(Node::Const(Constant::TypeType), None)
@@ -453,6 +482,25 @@ impl Node {
                 let fty = m.add(Node::FunType(smallvec![]), None);
                 // Takes `then` and `else` blocks as arguments
                 m.add(Node::FunType(smallvec![fty, fty]), None)
+            }
+            Node::Ref(RefOp::RefSet(_, _)) => {
+                let fty = m.add(Node::FunType(smallvec![]), None);
+                // Takes an empty continuation
+                m.add(Node::FunType(smallvec![fty]), None)
+            }
+            Node::Ref(RefOp::RefGet(i)) => {
+                let rty = i.get(m).clone().ty(m);
+                let rty = match rty.get(m) {
+                    Node::RefTy(t) => *t,
+                    _ => unreachable!(),
+                };
+                let fty = m.add(Node::FunType(smallvec![rty]), None);
+                m.add(Node::FunType(smallvec![fty]), None)
+            }
+            Node::Ref(RefOp::RefNew(t)) => {
+                let rty = m.add(Node::RefTy(*t), None);
+                let fty = m.add(Node::FunType(smallvec![rty]), None);
+                m.add(Node::FunType(smallvec![fty]), None)
             }
             Node::IfCase(i, x) => {
                 let arg = match x.get(m).clone().ty(m).get(m) {
