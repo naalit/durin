@@ -172,7 +172,7 @@ impl crate::ir::Module {
                     reqs.push(*i)
                 }
             }
-            // If it's calling an extern function, it calls passed the continuation
+            // If it's calling an extern function, it calls the passed continuation
             Node::ExternCall(_) | Node::Ref(_) => reqs.push(*call_args.last().unwrap()),
             // Unreachable and Stop don't call any other functions
             Node::Const(_) => (),
@@ -339,7 +339,7 @@ impl crate::ir::Module {
 
                 // The new version of reqs - functions we're still waiting on
                 let mut nreqs = Vec::new();
-                for v in reqs {
+                for &v in &reqs {
                     let v = v.unredirect(self);
                     // Single recursion is fine
                     if v == val {
@@ -355,18 +355,19 @@ impl crate::ir::Module {
                             break;
                         }
                         Some(FunMode::Maybe(rs)) => {
-                            if rs.iter().any(|&x| x == val) {
-                                // That function depends on this one, so we'll let it figure itself out.
-                            } else {
-                                // Transfer that function's requirements to this one.
-                                // We'll come back next iteration.
-                                nreqs.extend(
-                                    rs.iter()
-                                        .copied()
-                                        .filter(|&x| x != v && x != val && !nreqs.contains(&x))
-                                        .collect::<Vec<_>>(),
-                                );
-                            }
+                            // Transfer that function's requirements to this one.
+                            // We'll come back next iteration.
+                            nreqs.extend(
+                                rs.iter()
+                                    .copied()
+                                    .filter(|&x| {
+                                        x != v
+                                            && x != val
+                                            && !nreqs.contains(&x)
+                                            && !reqs.contains(&x)
+                                    })
+                                    .collect::<Vec<_>>(),
+                            );
                         }
                     }
                 }
@@ -1435,7 +1436,7 @@ impl crate::ir::Module {
                 for (i, x) in args.into_iter().enumerate() {
                     agg = cxt
                         .builder
-                        .build_insert_value(agg, x, i as u32, "product")
+                        .build_insert_value(agg, x, i as u32, "ret_product")
                         .unwrap();
                 }
                 agg.as_basic_value_enum()
