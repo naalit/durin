@@ -1,4 +1,4 @@
-fun range (from : I32, to : I32, f : fun(_:I32, _:fun()), ret : fun(I32)) = if (from == to) then else;
+fun range (from : I32, to : I32, f : fun 2, ret : fun 1) = if (from == to) then else;
 fun then () = ret;
 fun else () = f from cont;
 fun cont () = range (from + 1i32) to f ret;

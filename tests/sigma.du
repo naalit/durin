@@ -1,2 +1,2 @@
 # Making sure sigma types (dependent product types) work
-fun f (x : sig { y: Type, _: y }, g : fun (y: Type, _: y)) = g (x.0) (x.1);
+fun f (x : sig { y: Type, _: y }, g : fun 2) = g (x.0) (x.1);

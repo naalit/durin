@@ -27,17 +27,8 @@ impl<'a> Display for PrettyVal<'a> {
                 }
                 write!(f, ") -> {}", r.pretty(m))
             }
-            Node::FunType(params) => {
-                write!(f, "fun(")?;
-                let mut first = true;
-                for (i, ty) in params.iter().enumerate() {
-                    if !first {
-                        write!(f, ", ")?;
-                    }
-                    first = false;
-                    write!(f, "{}{}", m.param_name(v, i as u8), ty.pretty(m))?;
-                }
-                write!(f, ")")
+            Node::FunType(i) => {
+                write!(f, "fun {}", i)
             }
             Node::ProdType(params) => {
                 write!(f, "sig {{ ")?;

@@ -1,2 +1,2 @@
 # Do pi types work in Durin?
-fun f (x: fun(y: Type, z: y)) = x Type Type;
+fun f (x: fun 2) = x Type Type;

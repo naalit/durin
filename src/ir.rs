@@ -340,8 +340,7 @@ pub enum RefOp {
 impl RefOp {
     pub fn runtime_args(self) -> SmallVec<[Val; 4]> {
         match self {
-            RefOp::RefNew(_) => smallvec!(),
-            RefOp::RefGet(v) => smallvec![v],
+            RefOp::RefGet(v) | RefOp::RefNew(v) => smallvec![v],
             RefOp::RefSet(v, n) => smallvec![v, n],
         }
     }
@@ -356,7 +355,7 @@ impl RefOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Node {
     Fun(Function),
-    FunType(SmallVec<[Val; 4]>),
+    FunType(usize),
     ExternFun(String, SmallVec<[Val; 3]>, Val),
     /// Extern functions have a return type
     ExternFunType(SmallVec<[Val; 3]>, Val),
@@ -391,7 +390,7 @@ impl Node {
                 .chain(std::iter::once(*callee))
                 .collect(),
             Node::Product(_, v) => v.to_smallvec(),
-            Node::ProdType(v) | Node::SumType(v) => v.clone(),
+            Node::ProdType(v) => v.clone(),
             Node::BinOp(_, a, b) => smallvec![*a, *b],
             Node::IfCase(_, x)
             | Node::Proj(x, _)
@@ -401,8 +400,7 @@ impl Node {
             | Node::ExternCall(x) => {
                 smallvec![*x]
             }
-            // We don't need to know parameter types at runtime
-            Node::FunType(_) => SmallVec::new(),
+            Node::FunType(_) | Node::SumType(_) => SmallVec::new(),
             Node::ExternFun(_, _, _) | Node::ExternFunType(_, _) => SmallVec::new(),
             Node::Const(_) => SmallVec::new(),
             // `f` not being known at runtime doesn't really make sense
@@ -424,13 +422,13 @@ impl Node {
                 .chain(std::iter::once(*callee))
                 .collect(),
             Node::Product(ty, v) => v.iter().copied().chain(std::iter::once(*ty)).collect(),
-            Node::FunType(v) | Node::ProdType(v) | Node::SumType(v) => v.clone(),
+            Node::ProdType(v) | Node::SumType(v) => v.clone(),
             Node::ExternFun(_, v, r) | Node::ExternFunType(v, r) => {
                 v.iter().copied().chain(std::iter::once(*r)).collect()
             }
             Node::Param(f, _) => smallvec![*f],
             Node::BinOp(_, a, b) | Node::Inj(a, _, b) => smallvec![*a, *b],
-            Node::Const(_) => SmallVec::new(),
+            Node::FunType(_) | Node::Const(_) => SmallVec::new(),
             Node::IfCase(_, x)
             | Node::Proj(x, _)
             | Node::If(x)
@@ -444,15 +442,12 @@ impl Node {
 
     pub fn ty(&self, m: &mut Module) -> Val {
         match self {
-            Node::Fun(f) => m.add(Node::FunType(f.params.as_slice().to_smallvec()), None),
+            Node::Fun(f) => m.add(Node::FunType(f.params.len()), None),
             Node::ExternFun(_, p, r) => m.add(Node::ExternFunType(p.clone(), *r), None),
             Node::ExternCall(t) => match t.get(m).clone().ty(m).get(m) {
-                Node::ExternFunType(p, r) => {
-                    let mut p = p.as_slice().to_smallvec();
-                    let &r = r;
-                    let cont = m.add(Node::FunType(smallvec![r]), None);
-                    p.push(cont);
-                    m.add(Node::FunType(p), None)
+                Node::ExternFunType(p, _) => {
+                    let l = p.len();
+                    m.add(Node::FunType(l + 1), None)
                 }
                 _ => unreachable!(),
             },
@@ -464,7 +459,7 @@ impl Node {
             Node::Product(ty, _) => *ty,
             Node::Param(f, i) => match m.get(*f).unwrap() {
                 Node::Fun(f) => f.params[*i as usize],
-                Node::FunType(p) | Node::ProdType(p) => p[*i as usize],
+                Node::ProdType(p) => p[*i as usize],
                 _ => unreachable!(),
             },
             Node::Const(c) => match c {
@@ -472,44 +467,21 @@ impl Node {
                     m.add(Node::Const(Constant::TypeType), None)
                 }
                 Constant::Int(w, _) => m.add(Node::Const(Constant::IntType(*w)), None),
-                Constant::Stop | Constant::Unreachable => {
-                    m.add(Node::FunType(SmallVec::new()), None)
-                }
+                Constant::Stop | Constant::Unreachable => m.add(Node::FunType(0), None),
             },
             Node::BinOp(BinOp::IEq, _, _) => m.add(Node::Const(Constant::IntType(Width::W1)), None),
             Node::BinOp(_, a, _) => a.get(m).clone().ty(m),
             Node::If(_) => {
-                let fty = m.add(Node::FunType(smallvec![]), None);
                 // Takes `then` and `else` blocks as arguments
-                m.add(Node::FunType(smallvec![fty, fty]), None)
+                m.add(Node::FunType(2), None)
             }
-            Node::Ref(RefOp::RefSet(_, _)) => {
-                let fty = m.add(Node::FunType(smallvec![]), None);
-                // Takes an empty continuation
-                m.add(Node::FunType(smallvec![fty]), None)
+            Node::Ref(_) => {
+                // Takes just a continuation
+                m.add(Node::FunType(1), None)
             }
-            Node::Ref(RefOp::RefGet(i)) => {
-                let rty = i.get(m).clone().ty(m);
-                let rty = match rty.get(m) {
-                    Node::RefTy(t) => *t,
-                    _ => unreachable!(),
-                };
-                let fty = m.add(Node::FunType(smallvec![rty]), None);
-                m.add(Node::FunType(smallvec![fty]), None)
-            }
-            Node::Ref(RefOp::RefNew(t)) => {
-                let rty = m.add(Node::RefTy(*t), None);
-                let fty = m.add(Node::FunType(smallvec![rty]), None);
-                m.add(Node::FunType(smallvec![fty]), None)
-            }
-            Node::IfCase(i, x) => {
-                let arg = match x.get(m).clone().ty(m).get(m) {
-                    Node::SumType(v) => v[*i],
-                    _ => unreachable!(),
-                };
-                let fone = m.add(Node::FunType(smallvec![arg]), None);
-                let ftwo = m.add(Node::FunType(smallvec![]), None);
-                m.add(Node::FunType(smallvec![fone, ftwo]), None)
+            Node::IfCase(_, _) => {
+                // Takes `then` and `else` blocks as arguments
+                m.add(Node::FunType(2), None)
             }
             Node::Proj(x, i) => match x.get(m).clone().ty(m).get(m) {
                 Node::ProdType(v) => v[*i],

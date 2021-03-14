@@ -358,39 +358,9 @@ impl<'m> Builder<'m> {
         self.module.add(Node::Inj(ty, idx, val), None)
     }
 
-    pub fn fun_type(&mut self, from: Val, to: Val) -> Val {
-        let cont_ty = self.module.add(Node::FunType(smallvec![to]), None);
-        self.module
-            .add(Node::FunType(smallvec![from, cont_ty]), None)
-    }
-
-    pub fn fun_type_multi(&mut self, params: impl Into<SmallVec<[Val; 4]>>, to: Val) -> Val {
-        let mut params = params.into();
-        let cont_ty = self.module.add(Node::FunType(smallvec![to]), None);
-        params.push(cont_ty);
-        self.module.add(Node::FunType(params), None)
-    }
-
-    pub fn fun_type_raw(&mut self, params: impl Into<SmallVec<[Val; 4]>>) -> Val {
-        self.module.add(Node::FunType(params.into()), None)
-    }
-
-    pub fn start_pi(&mut self, param: Option<String>, from: Val) -> Pi {
-        Pi {
-            args: smallvec![self.module.reserve(param)],
-            tys: smallvec![from],
-        }
-    }
-
-    pub fn end_pi(&mut self, pi: Pi, to: Val) -> Val {
-        let Pi { args, mut tys } = pi;
-        let cont_ty = self.module.add(Node::FunType(smallvec![to]), None);
-        tys.push(cont_ty);
-        let fun = self.module.add(Node::FunType(tys), None);
-        for (i, arg) in args.into_iter().enumerate() {
-            self.module.replace(arg, Node::Param(fun, i as u8));
-        }
-        fun
+    /// `nargs` is the number of function arguments, plus one for the continuation
+    pub fn fun_type(&mut self, nargs: usize) -> Val {
+        self.module.add(Node::FunType(nargs), None)
     }
 
     pub fn reserve(&mut self, name: Option<String>) -> Val {
@@ -457,12 +427,12 @@ impl<'m> Builder<'m> {
         fun
     }
 
-    pub fn pop_fun(&mut self, ret: Val, ret_ty: Val) -> Val {
+    pub fn pop_fun(&mut self, ret: Val) -> Val {
         let (fun, block, params, cont) = self.funs.pop().unwrap();
         assert!(cont != Val::INVALID, "Called pop_fun() with push_fun_raw()");
 
         // Add the continuation parameter to the function
-        let cont_ty = self.module.add(Node::FunType(smallvec![ret_ty]), None);
+        let cont_ty = self.module.add(Node::FunType(1), None);
         match self.module.get_mut(fun) {
             Some(Node::Fun(f)) => {
                 f.params.push(cont_ty);
@@ -496,8 +466,7 @@ impl<'m> Builder<'m> {
         );
 
         // Add the continuation parameter to the function
-        let tys = rets.iter().map(|&(_, ty)| ty).collect();
-        let cont_ty = self.module.add(Node::FunType(tys), None);
+        let cont_ty = self.module.add(Node::FunType(rets.len()), None);
         match self.module.get_mut(fun) {
             Some(Node::Fun(f)) => {
                 f.params.push(cont_ty);

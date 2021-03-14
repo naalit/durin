@@ -25,10 +25,6 @@ impl Node {
                 v.iter_mut().for_each(|x| *x = x.mangle(m, map));
                 Node::ExternFunType(v, r.mangle(m, map))
             }
-            Node::FunType(mut v) => {
-                v.iter_mut().for_each(|x| *x = x.mangle(m, map));
-                Node::FunType(v)
-            }
             Node::SumType(mut v) => {
                 v.iter_mut().for_each(|x| *x = x.mangle(m, map));
                 Node::SumType(v)
@@ -54,6 +50,7 @@ impl Node {
             Node::Param(f, i) => Node::Param(f.mangle(m, map), i),
             Node::BinOp(op, a, b) => Node::BinOp(op, a.mangle(m, map), b.mangle(m, map)),
             Node::Inj(a, i, b) => Node::Inj(a.mangle(m, map), i, b.mangle(m, map)),
+            Node::FunType(i) => Node::FunType(i),
             // Constants can't use other values
             Node::Const(c) => Node::Const(c),
         }

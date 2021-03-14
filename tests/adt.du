@@ -2,7 +2,7 @@
 # - If `x` is variant number `i`, passes the payload to `then`.
 # - Otherwise, calls `else` with no arguments.
 val pair = sig { _: I32, _: I32 };
-fun adt_fun (x : (pair | I32), cont : fun (_:I32)) = ifcase 0 x then else;
+fun adt_fun (x : (pair | I32), cont : fun 1) = ifcase 0 x then else;
 
 # The argument has type `(I32, I32)` since that's variant number 0 of the type of `x`
 fun then (y : pair) = cont (y.0);
@@ -13,4 +13,4 @@ fun then2 (z : I32) = cont z;
 fun else2 () = unreachable;
 
 # `t:i x` makes a value of a sum type
-fun make_adt (k : fun (_:I32)) = adt_fun ((pair | I32):0 struct { 3i32, 4i32 } :: pair) k;
+fun make_adt (k : fun 1) = adt_fun ((pair | I32):0 struct { 3i32, 4i32 } :: pair) k;

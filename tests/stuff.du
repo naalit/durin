@@ -1,7 +1,7 @@
-fun curry1 (a : I1, cont1 : fun(_:fun(_:I1, _:fun(_:fun(_:I1, _:fun(_:I1)))))) = cont1 curry2;
-fun curry2 (b : I1, cont2 : fun(_:fun(_:I1, _:fun(_:I1)))) = cont2 and_or;
+fun curry1 (a : I1, cont1 : fun 1) = cont1 curry2;
+fun curry2 (b : I1, cont2 : fun 1) = cont2 and_or;
 
-fun and_or (c : I1, rcont : fun(_:I1)) = if a then else;
+fun and_or (c : I1, rcont : fun 1) = if a then else;
 fun then () = next b;
 fun else () = next 0i1;
 
@@ -11,9 +11,9 @@ fun else2 () = next2 c;
 
 fun next2 (r : I1) = rcont r;
 
-fun curry (cont: fun(_:fun(_:fun()))) = curry cont;
-fun do_something (cont: fun()) = cont;
+fun curry (cont: fun 1) = curry cont;
+fun do_something (cont: fun 0) = cont;
 # let f = curry(); do_something(); f();
-fun one (ocont: fun()) = curry two;
-fun two (f: fun(_:fun())) = do_something three;
+fun one (ocont: fun 0) = curry two;
+fun two (f: fun 1) = do_something three;
 fun three () = f ocont;
