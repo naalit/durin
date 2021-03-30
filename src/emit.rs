@@ -5,15 +5,15 @@ pub struct PrettyVal<'a>(&'a Module, Val, bool);
 impl<'a> Display for PrettyVal<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let PrettyVal(m, v, force_write) = *self;
-        if m.get(v).is_none() {
+        if m.slots().node(v).is_none() {
             return write!(f, "<None>");
         }
         if !force_write {
-            if let Some(x) = &m.names[v.num()] {
+            if let Some(x) = m.name(v) {
                 return write!(f, "{}", x);
             }
         }
-        let x = match m.get(v).as_ref().unwrap() {
+        let x = match m.slots().node(v).as_ref().unwrap() {
             Node::Const(c) => write!(f, "{}", c),
             Node::ExternFunType(params, r) => {
                 write!(f, "extern fun(")?;
@@ -90,42 +90,48 @@ impl<'a> Display for PrettyVal<'a> {
                 write!(f, "({} {} {})", a.pretty(m), op, b.pretty(m))
             }
             // Node::Param(a, b) => write!(f, "{}.{}", a.pretty(m), b),
-            _ => match &m.names[v.num()] {
+            _ => match m.name(v) {
                 Some(x) => write!(f, "{}", x),
-                None => write!(f, "%{}", v.num()),
+                None => write!(f, "%{}", v.id()),
             },
         };
         x
     }
 }
 
-impl Val {
-    pub fn pretty(self, m: &Module) -> PrettyVal {
+pub trait ValPretty {
+    fn pretty(self, m: &Module) -> PrettyVal;
+}
+impl ValPretty for Val {
+    fn pretty(self, m: &Module) -> PrettyVal {
         PrettyVal(m, self, false)
     }
 }
 
 impl Module {
-    pub fn name_or(&self, n: usize) -> String {
-        self.names[n].clone().unwrap_or_else(|| format!("%{}", n))
+    pub fn name_or(&self, v: Val) -> String {
+        self.name(v).unwrap_or_else(|| format!("%{}", v.id()))
     }
 
     pub fn param_name(&self, v: Val, pnum: u8) -> String {
         let name: Vec<_> = self
-            .uses(v)
+            .uses()
+            .get(v)
+            .unwrap()
             .iter()
             .filter(|&&x| {
-                if let Some(Node::Param(_, i)) = self.get(x) {
+                if let Some(Node::Param(_, i)) = self.slots().node(x) {
                     *i == pnum
                 } else {
                     false
                 }
             })
+            .copied()
             .collect();
-        if name.len() == 1 && !self.uses(*name[0]).is_empty() {
-            format!("{}: ", self.name_or(name[0].num()))
+        if name.len() == 1 && !self.uses().get(name[0]).unwrap().is_empty() {
+            format!("{}: ", self.name_or(name[0]))
         } else if name.len() > 1 {
-            format!("{}.{}: ", self.name_or(v.num()), pnum)
+            format!("{}.{}: ", self.name_or(v), pnum)
         } else {
             String::new()
         }
@@ -133,7 +139,7 @@ impl Module {
 
     pub fn emit(&self) -> String {
         let mut buf = String::new();
-        for (num, node) in self.nodes.iter().enumerate() {
+        for (val, node) in (&self.world.entities(), &self.world.read_storage::<Slot>()).join() {
             match node {
                 Slot::Full(node) => match node {
                     Node::Fun(Function {
@@ -141,23 +147,27 @@ impl Module {
                         callee,
                         call_args,
                     }) => {
-                        write!(buf, "\nfun {} (", self.name_or(num)).unwrap();
+                        write!(buf, "\nfun {} (", self.name_or(val)).unwrap();
                         for (pnum, pty) in params.iter().enumerate() {
                             let name = {
-                                let name: Vec<_> = self.uses[num]
+                                let name: Vec<_> = self
+                                    .uses()
+                                    .get(val)
+                                    .unwrap()
                                     .iter()
                                     .filter(|&&x| {
-                                        if let Some(Node::Param(_, i)) = self.get(x) {
+                                        if let Some(Node::Param(_, i)) = self.slots().node(x) {
                                             *i as usize == pnum
                                         } else {
                                             false
                                         }
                                     })
+                                    .copied()
                                     .collect();
                                 if name.len() == 1 {
-                                    self.name_or(name[0].num())
+                                    self.name_or(name[0])
                                 } else {
-                                    format!("{}.{}", self.name_or(num), pnum)
+                                    format!("{}.{}", self.name_or(val), pnum)
                                 }
                             };
                             write!(
@@ -189,15 +199,15 @@ impl Module {
                         writeln!(buf, "): {};", ret.pretty(self)).unwrap();
                     }
                     Node::RefTy(x) => {
-                        writeln!(buf, "val {} = ref {};", self.name_or(num), x.pretty(self),)
+                        writeln!(buf, "val {} = ref {};", self.name_or(val), x.pretty(self),)
                             .unwrap();
                     }
-                    _ if !matches!(node, Node::Param(_, _)) && self.names[num].is_some() => {
+                    _ if !matches!(node, Node::Param(_, _)) && self.name(val).is_some() => {
                         writeln!(
                             buf,
                             "val {} = {};",
-                            self.name_or(num),
-                            PrettyVal(self, Val::from_num(num), true),
+                            self.name_or(val),
+                            PrettyVal(self, val, true),
                         )
                         .unwrap();
                     }
@@ -206,9 +216,8 @@ impl Module {
                     }
                 },
                 Slot::Redirect(v) => {
-                    writeln!(buf, "val {} = {};", self.name_or(num), v.pretty(self),).unwrap()
+                    writeln!(buf, "val {} = {};", self.name_or(val), v.pretty(self),).unwrap()
                 }
-                _ => (),
             }
         }
         buf

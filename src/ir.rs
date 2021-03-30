@@ -1,6 +1,29 @@
 use smallvec::*;
+pub use specs::prelude::{Join, World, WorldExt};
+use specs::{prelude::*, Component};
 use std::collections::{HashMap, HashSet};
 
+pub type Val = Entity;
+
+pub trait ValExt {
+    fn get<'a>(self, slots: &'a ReadStorage<Slot>) -> &'a Node;
+
+    fn ty(self, m: &mut Module) -> Self;
+}
+impl ValExt for Val {
+    fn get<'a>(self, slots: &'a ReadStorage<Slot>) -> &'a Node {
+        slots.node(self).unwrap()
+    }
+
+    fn ty(self, m: &mut Module) -> Self {
+        let slots = m.slots();
+        let n = self.get(&slots).clone();
+        drop(slots);
+        n.ty(m)
+    }
+}
+
+/*
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Val(usize);
 impl Val {
@@ -26,13 +49,12 @@ impl Val {
     /// An invalid value that can't have a Node associated with it
     pub const INVALID: Self = Val(usize::MAX);
 }
+*/
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Component)]
 pub enum Slot {
     Full(Node),
     Redirect(Val),
-    Reserved,
-    Open,
 }
 impl Slot {
     pub fn to_option_mut(&mut self) -> Option<&mut Node> {
@@ -60,173 +82,270 @@ impl Slot {
     }
 }
 
-#[derive(Default, Debug, Clone, Eq, PartialEq)]
-pub struct Module {
-    pub nodes: Vec<Slot>,
-    pub uses: Vec<Vec<Val>>,
-    pub names: Vec<Option<String>>,
+pub trait Slots {
+    fn node(&self, i: Val) -> Option<&Node>;
 }
-impl Module {
-    /// Removes a node from the module. Panics if that node is used by anything.
-    pub fn remove(&mut self, i: Val) -> Option<Node> {
-        if !self.uses[i.num()].is_empty() {
-            panic!("Error: cannot delete node with uses!")
-        }
-        self.uses[i.num()] = Vec::new();
-        self.names[i.num()] = None;
-        // Why isn't there a Vec::replace()?
-        std::mem::replace(&mut self.nodes[i.num()], Slot::Open).into_option()
-    }
-
-    pub fn get(&self, i: Val) -> Option<&Node> {
+impl Slots for ReadStorage<'_, Slot> {
+    fn node(&self, i: Val) -> Option<&Node> {
         let mut i = i;
         loop {
-            match self.nodes.get(i.num())? {
+            match self.get(i)? {
                 Slot::Full(x) => break Some(x),
                 Slot::Redirect(v) => i = *v,
-                Slot::Reserved | Slot::Open => break None,
             }
         }
     }
+}
 
-    pub fn get_mut(&mut self, i: Val) -> Option<&mut Node> {
-        let mut i = i;
-        loop {
-            match self.nodes.get(i.num())? {
-                Slot::Full(_) => {
-                    break self
-                        .nodes
-                        .get_mut(i.num())
-                        .map(|x| x.to_option_mut())
-                        .unwrap()
-                }
-                Slot::Redirect(v) => i = *v,
-                Slot::Reserved | Slot::Open => break None,
+macro_rules! wrapper {
+    {} => {};
+    {
+        #[derive $traits:tt]
+        pub struct $n:ident($inner:ty); $($rest:tt)*
+    } => {
+        #[derive $traits]
+        pub struct $n($inner);
+        impl std::ops::Deref for $n {
+            type Target = $inner;
+            fn deref(&self) -> &$inner {
+                &self.0
             }
         }
+        impl std::ops::DerefMut for $n {
+            fn deref_mut(&mut self) -> &mut $inner {
+                &mut self.0
+            }
+        }
+
+        wrapper!{$($rest)*}
+    };
+}
+
+wrapper! {
+    #[derive(Clone, Debug, Component)]
+    pub struct Uses(Vec<Val>);
+
+    #[derive(Clone, Debug, Component)]
+    pub struct Name(String);
+}
+
+//#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Module {
+    pub world: World,
+}
+impl Module {
+    pub fn new() -> Self {
+        let mut world = World::new();
+        world.register::<Slot>();
+        world.register::<Uses>();
+        world.register::<Name>();
+        Module { world }
     }
 
-    pub fn uses(&self, i: Val) -> &Vec<Val> {
-        self.uses.get(i.num()).unwrap()
+    /// Removes a node from the module. Panics if that node is used by anything.
+    pub fn remove(&mut self, i: Val) {
+        if !self.uses().get(i).map_or(true, |x| x.0.is_empty()) {
+            panic!("Error: cannot delete node with uses!")
+        }
+        self.world.delete_entity(i).unwrap();
     }
 
-    pub fn name(&self, i: Val) -> Option<&String> {
-        self.names.get(i.num()).map(|x| x.as_ref()).flatten()
+    pub fn slots(&self) -> ReadStorage<Slot> {
+        self.world.read_storage()
     }
 
-    pub fn set_name(&mut self, i: Val, n: Option<String>) {
-        self.names[i.num()] = n;
+    pub fn slots_mut(&self) -> WriteStorage<Slot> {
+        self.world.write_storage()
     }
 
-    // TODO deduplicate constants, or just everything (implicit CSE)
+    // pub fn get(&self, i: Val) -> Option<&Node> {
+    //     let mut i = i;
+    //     loop {
+    //         match self.world.read_storage().get(i)? {
+    //             Slot::Full(x) => break Some(x),
+    //             Slot::Redirect(v) => i = *v,
+    //         }
+    //     }
+    // }
+
+    // pub fn get_mut(&mut self, i: Val) -> Option<&mut Node> {
+    //     let mut i = i;
+    //     loop {
+    //         match self.world.read_storage().get(i)? {
+    //             Slot::Full(_) => {
+    //                 break self
+    //                     .world
+    //                     .write_storage::<Slot>()
+    //                     .get_mut(i)
+    //                     .map(|x| x.to_option_mut())
+    //                     .unwrap()
+    //             }
+    //             Slot::Redirect(v) => i = *v,
+    //         }
+    //     }
+    // }
+
+    pub fn uses(&self) -> ReadStorage<Uses> {
+        //}, i: Val) -> &Vec<Val> {
+        self.world.read_storage()
+    }
+
+    pub fn name(&self, i: Val) -> Option<String> {
+        self.world
+            .read_storage::<Name>()
+            .get(i)
+            .map(|x| x.0.clone())
+    }
+
+    pub fn set_name(&mut self, i: Val, n: String) {
+        self.world
+            .write_storage::<Name>()
+            .insert(i, Name(n))
+            .unwrap();
+    }
+
+    // TODO deduplicate constants, or just everything except functions (implicit CSE)
     pub fn add(&mut self, x: Node, n: Option<String>) -> Val {
         let args = x.args();
-        let v = Val(self.nodes.len());
-        self.nodes.push(Slot::Full(x));
-        self.uses.push(Vec::new());
-        self.names.push(n);
+
+        // Add to the ECS
+        let e = self
+            .world
+            .create_entity()
+            .with(Slot::Full(x))
+            .with(Uses(Vec::new()));
+        let e = if let Some(n) = n { e.with(Name(n)) } else { e };
+        let e = e.build();
 
         // Add uses for the things the new value uses
         for i in args {
-            self.uses[i.num()].push(v);
+            self.world
+                .write_storage::<Uses>()
+                .get_mut(i)
+                .unwrap()
+                .0
+                .push(e);
         }
-
-        v
+        e
     }
 
     /// Reserves space for a value. Used for forward references.
     /// Fill the value later with `replace()`.
     pub fn reserve(&mut self, n: Option<String>) -> Val {
-        let v = Val(self.nodes.len());
-        self.nodes.push(Slot::Reserved);
-        self.uses.push(Vec::new());
-        self.names.push(n);
-        v
+        // Add to the ECS, without a Slot component
+        let e = self.world.create_entity().with(Uses(Vec::new()));
+        let e = if let Some(n) = n { e.with(Name(n)) } else { e };
+        e.build()
     }
 
     pub fn redirect(&mut self, from: Val, to: Val) {
-        self.nodes[from.num()] = Slot::Redirect(to);
+        self.world
+            .write_storage()
+            .insert(from, Slot::Redirect(to))
+            .unwrap();
         // If we use redirect() to give this node a name, transfer that over
         if self.name(to).is_none() {
             if let Some(name) = self.name(from) {
-                self.names[to.num()] = Some(name.clone());
+                self.world
+                    .write_storage()
+                    .insert(to, Name(name.clone()))
+                    .unwrap();
             }
         }
     }
 
     pub fn replace(&mut self, v: Val, x: Node) {
         // Since there aren't usually many arguments, it's simplest to just remove old uses and add new ones
-        let old_args = self.nodes[v.num()]
-            .to_option()
+        let old_args = self
+            .world
+            .read_storage::<Slot>()
+            .get(v)
+            .map(Slot::to_option)
+            .flatten()
             .map_or(SmallVec::new(), |x| x.args());
         let new_args = x.args();
 
+        let mut uses = self.world.write_storage::<Uses>();
         for i in old_args {
-            let u = &mut self.uses[i.num()];
+            let u = &mut uses.get_mut(i).unwrap().0;
             let i = u.iter().position(|&x| x == v).unwrap();
             u.swap_remove(i);
         }
         for i in new_args {
-            self.uses[i.num()].push(v);
+            uses.get_mut(i).unwrap().0.push(v);
         }
 
-        self.nodes[v.num()] = Slot::Full(x);
+        self.world.write_storage().insert(v, Slot::Full(x)).unwrap();
     }
 
-    pub fn top_level(&self) -> impl Iterator<Item = Val> + '_ {
-        (0..self.nodes.len()).map(Val).filter(move |x| {
-            // A node is top-level if it:
-            // 1. is a function (and not a redirect)
-            if !matches!(self.nodes.get(x.num()), Some(Slot::Full(Node::Fun(_)))) {
-                return false;
-            }
+    pub fn unredirect(&self, v: Val) -> Val {
+        match self.world.read_storage::<Slot>().get(v) {
+            Some(Slot::Redirect(x)) => self.unredirect(*x),
+            _ => v,
+        }
+    }
 
-            // 2. doesn't use parameters from other functions at runtime
-            fn has_param(m: &Module, x: Val, not: &mut HashSet<Val>) -> bool {
-                let x = x.unredirect(m);
-                match m.get(x) {
-                    None => unreachable!(),
-                    Some(Node::Param(p, _)) => {
-                        !not.contains(p) && matches!(m.get(*p), Some(Node::Fun(_)))
-                    }
-                    Some(Node::Fun(_)) | Some(Node::FunType(_)) | Some(Node::ProdType(_)) => {
-                        if !not.contains(&x) {
-                            // If it calls another function, that function can use its own parameters
-                            not.insert(x);
-                            let b = m
-                                .get(x)
-                                .unwrap()
-                                .runtime_args()
-                                .iter()
-                                .any(|x| has_param(m, *x, not)); //has_param(m, x, not);
-                            not.remove(&x);
-                            b
-                        } else {
-                            false
-                        }
-                    }
-                    Some(n) => n.runtime_args().iter().any(|x| has_param(m, *x, not)),
+    pub fn top_level(&self) -> Vec<Val> {
+        (&self.world.entities(), &self.world.read_storage::<Slot>())
+            .join()
+            .filter(move |(x, slot)| {
+                // A node is top-level if it:
+                // 1. is a function (and not a redirect)
+                if !matches!(slot, Slot::Full(Node::Fun(_))) {
+                    return false;
                 }
-            }
-            !has_param(self, *x, &mut std::iter::once(*x).collect())
-        })
+
+                // 2. doesn't use parameters from other functions at runtime
+                fn has_param(m: &Module, x: Val, not: &mut HashSet<Val>) -> bool {
+                    let x = m.unredirect(x);
+                    match m.slots().node(x) {
+                        None => unreachable!(),
+                        Some(Node::Param(p, _)) => {
+                            !not.contains(p) && matches!(m.slots().node(*p), Some(Node::Fun(_)))
+                        }
+                        Some(Node::Fun(_)) | Some(Node::FunType(_)) | Some(Node::ProdType(_)) => {
+                            if !not.contains(&x) {
+                                // If it calls another function, that function can use its own parameters
+                                not.insert(x);
+                                let b = m
+                                    .slots()
+                                    .node(x)
+                                    .unwrap()
+                                    .runtime_args()
+                                    .iter()
+                                    .any(|x| has_param(m, *x, not)); //has_param(m, x, not);
+                                not.remove(&x);
+                                b
+                            } else {
+                                false
+                            }
+                        }
+                        Some(n) => n.runtime_args().iter().any(|x| has_param(m, *x, not)),
+                    }
+                }
+                !has_param(self, *x, &mut std::iter::once(*x).collect())
+            })
+            .map(|(x, _)| x)
+            .collect()
     }
 
-    pub fn vals(&self) -> impl Iterator<Item = Val> + '_ {
-        (0..self.nodes.len())
-            .map(Val)
-            .filter(move |x| self.get(*x).is_some())
+    pub fn vals(&self) -> Vec<Val> {
+        self.world
+            .entities()
+            .join()
+            .filter(move |x| self.slots().node(*x).is_some())
+            .collect()
     }
 
     /// Returns a list of all foreign parameters this node depends on, with their types.
     pub fn env(&self, v: Val) -> Vec<(Val, Val)> {
         fn go(m: &Module, v: Val, seen: &mut HashSet<Val>, acc: &mut HashSet<(Val, Val)>) {
-            let v = v.unredirect(m);
-            match m.get(v).unwrap() {
+            let v = m.unredirect(v);
+            match m.slots().node(v).unwrap() {
                 Node::Param(f, i) => {
                     if seen.contains(f) {
                     } else {
-                        match m.get(*f).unwrap() {
+                        match m.slots().node(*f).unwrap() {
                             Node::Fun(Function { params, .. }) => {
                                 acc.insert((v, params[*i as usize]));
                             }
@@ -260,12 +379,12 @@ impl Module {
     /// Returns all functions that `v` depends on the parameters of, and so must be within, recursively.
     pub fn dependencies(&self, v: Val) -> Vec<Val> {
         fn go(m: &Module, v: Val, seen: &mut HashSet<Val>, acc: &mut HashSet<Val>) {
-            let v = v.unredirect(m);
-            match m.get(v).unwrap() {
+            let v = m.unredirect(v);
+            match m.slots().node(v).unwrap() {
                 Node::Param(f, _) => {
                     if seen.contains(f) {
                     } else {
-                        match m.get(*f).unwrap() {
+                        match m.slots().node(*f).unwrap() {
                             Node::Fun(Function { .. }) => {
                                 acc.insert(*f);
                             }
@@ -300,14 +419,13 @@ impl Module {
     pub fn top_level_scopes(&self) -> HashMap<Val, Vec<Val>> {
         let mut top_level = Vec::new();
         let mut scopes: HashMap<Val, Vec<Val>> = HashMap::new();
-        for i in 0..self.nodes.len() {
-            let i = Val(i);
+        for i in self.world.entities().join() {
             // Skip redirects for this
-            if i != i.unredirect(self) {
+            if i != self.unredirect(i) {
                 continue;
             }
             // Also skip anything but functions
-            if !matches!(self.get(i), Some(Node::Fun(_))) {
+            if !matches!(self.slots().node(i), Some(Node::Fun(_))) {
                 continue;
             }
 
@@ -444,20 +562,25 @@ impl Node {
         match self {
             Node::Fun(f) => m.add(Node::FunType(f.params.len()), None),
             Node::ExternFun(_, p, r) => m.add(Node::ExternFunType(p.clone(), *r), None),
-            Node::ExternCall(t) => match t.get(m).clone().ty(m).get(m) {
-                Node::ExternFunType(p, _) => {
-                    let l = p.len();
-                    m.add(Node::FunType(l + 1), None)
+            Node::ExternCall(t) => {
+                let ty = t.ty(m);
+                let slots = m.slots();
+                match ty.get(&slots) {
+                    Node::ExternFunType(p, _) => {
+                        let l = p.len();
+                        drop(slots);
+                        m.add(Node::FunType(l + 1), None)
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
-            },
+            }
             Node::FunType(_)
             | Node::ProdType(_)
             | Node::SumType(_)
             | Node::ExternFunType(_, _)
             | Node::RefTy(_) => m.add(Node::Const(Constant::TypeType), None),
             Node::Product(ty, _) => *ty,
-            Node::Param(f, i) => match m.get(*f).unwrap() {
+            Node::Param(f, i) => match m.slots().node(*f).unwrap() {
                 Node::Fun(f) => f.params[*i as usize],
                 Node::ProdType(p) => p[*i as usize],
                 _ => unreachable!(),
@@ -470,7 +593,7 @@ impl Node {
                 Constant::Stop | Constant::Unreachable => m.add(Node::FunType(0), None),
             },
             Node::BinOp(BinOp::IEq, _, _) => m.add(Node::Const(Constant::IntType(Width::W1)), None),
-            Node::BinOp(_, a, _) => a.get(m).clone().ty(m),
+            Node::BinOp(_, a, _) => a.ty(m),
             Node::If(_) => {
                 // Takes `then` and `else` blocks as arguments
                 m.add(Node::FunType(2), None)
@@ -483,7 +606,7 @@ impl Node {
                 // Takes `then` and `else` blocks as arguments
                 m.add(Node::FunType(2), None)
             }
-            Node::Proj(x, i) => match x.get(m).clone().ty(m).get(m) {
+            Node::Proj(x, i) => match x.ty(m).get(&m.slots()) {
                 Node::ProdType(v) => v[*i],
                 _ => unreachable!(),
             },

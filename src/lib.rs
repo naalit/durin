@@ -8,6 +8,7 @@ pub mod parse;
 pub use inkwell;
 use ir::*;
 
+/*
 impl Node {
     pub fn mangle(self, m: &mut Module, map: &HashMap<Val, Val>) -> Self {
         match self {
@@ -124,6 +125,7 @@ pub fn lift(m: &mut Module, vfun: Val, to_lift: Val) -> Val {
     m.replace(fnew, fun);
     fnew
 }
+*/
 
 #[cfg(test)]
 mod tests {
@@ -132,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_lifting() {
-        let mut m = Module::default();
+        let mut m = Module::new();
         let (before, to_lift) = {
             let u32_t = m.add(Node::Const(Constant::IntType(Width::W32)), None);
             let enclosing = m.reserve(None);
@@ -161,11 +163,9 @@ mod tests {
         // So we can see in the output where the lifting happened
         m.add(Node::Const(Constant::Int(Width::W64, 111111111111)), None);
 
-        let _after = lift(&mut m, before, to_lift);
-        println!("{}", m.emit());
-        // for (i, n) in m.nodes.iter().enumerate() {
-        //     println!("%{} = {}", i, n.as_ref().unwrap());
-        // }
+        //let _after = lift(&mut m, before, to_lift);
+        //println!("{}", m.emit());
+
         // panic!("look right?");
     }
 }

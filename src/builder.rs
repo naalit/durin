@@ -37,7 +37,7 @@ pub struct Builder<'m> {
     block: Val,
     params: Vec<Val>,
     /// (fun, block, params, cont)
-    funs: Vec<(Val, Val, Vec<Val>, Val)>,
+    funs: Vec<(Val, Val, Vec<Val>, Option<Val>)>,
     /// (continuation, else block)
     ifs: Vec<(Val, Option<Val>)>,
 }
@@ -67,7 +67,7 @@ impl<'m> Builder<'m> {
     }
 
     pub fn cont(&self) -> Option<Val> {
-        self.funs.last().map(|x| x.3)
+        self.funs.last().and_then(|x| x.3)
     }
 
     /// Updates `from` to be an alias of `to`
@@ -295,11 +295,11 @@ impl<'m> Builder<'m> {
     }
 
     pub fn type_of(&mut self, x: Val) -> Val {
-        let node = self.module.get(x).unwrap().clone();
+        let node = self.module.slots().node(x).unwrap().clone();
         if let Node::Param(f, n) = &node {
             let n = *n as usize;
             // It's a parameter of a function that we're in the process of generating, so we have the type stored somewhere
-            if self.module.get(*f).is_none() {
+            if self.module.slots().node(*f).is_none() {
                 let mut ix = self.funs.len();
                 let mut p = self.params.get(n).copied();
                 while let Some(i) = ix.checked_sub(1) {
@@ -320,7 +320,7 @@ impl<'m> Builder<'m> {
     }
 
     pub fn sum_idx(&self, x: Val, i: usize) -> Option<Val> {
-        match self.module.get(x) {
+        match self.module.slots().node(x) {
             Some(Node::SumType(v)) => Some(v[i]),
             _ => None,
         }
@@ -373,9 +373,10 @@ impl<'m> Builder<'m> {
         let fun = self.module.reserve(None);
         let cont = self.module.add(
             Node::Param(fun, params.len() as u8),
-            Some(format!("$cont.return.%{}", fun.num())),
+            Some(format!("$cont.return.%{}", fun.id())),
         );
-        self.funs.push((fun, self.block, self.params.clone(), cont));
+        self.funs
+            .push((fun, self.block, self.params.clone(), Some(cont)));
         self.block = fun;
         // Skip adding the continuation parameter and add it later, since we might not know the return type yet
         self.params = params.iter().map(|(_, ty)| *ty).collect();
@@ -391,8 +392,7 @@ impl<'m> Builder<'m> {
     pub fn push_fun_raw(&mut self, params: impl Into<Vec<(Option<String>, Val)>>) -> Vec<Val> {
         let params = params.into();
         let fun = self.module.reserve(None);
-        self.funs
-            .push((fun, self.block, self.params.clone(), Val::INVALID));
+        self.funs.push((fun, self.block, self.params.clone(), None));
         self.block = fun;
         self.params = params.iter().map(|(_, ty)| *ty).collect();
         params
@@ -407,9 +407,8 @@ impl<'m> Builder<'m> {
     /// Only for continuation manipulation, not direct-style code.
     pub fn pop_fun_raw(&mut self, callee: Val, args: impl Into<SmallVec<[Val; 3]>>) -> Val {
         let (fun, block, params, cont) = self.funs.pop().unwrap();
-        assert_eq!(
-            cont,
-            Val::INVALID,
+        assert!(
+            cont.is_none(),
             "Called pop_fun_raw() without push_fun_raw()"
         );
 
@@ -429,12 +428,13 @@ impl<'m> Builder<'m> {
 
     pub fn pop_fun(&mut self, ret: Val) -> Val {
         let (fun, block, params, cont) = self.funs.pop().unwrap();
-        assert!(cont != Val::INVALID, "Called pop_fun() with push_fun_raw()");
+        let cont = cont.expect("Called pop_fun() with push_fun_raw()");
 
         // Add the continuation parameter to the function
         let cont_ty = self.module.add(Node::FunType(1), None);
-        match self.module.get_mut(fun) {
-            Some(Node::Fun(f)) => {
+        let funv = self.module.unredirect(fun);
+        match self.module.world.write_storage::<Slot>().get_mut(funv) {
+            Some(Slot::Full(Node::Fun(f))) => {
                 f.params.push(cont_ty);
             }
             // The function returns a value directly, so we'll just add the continuation parameter to the function node we're making now
@@ -460,15 +460,13 @@ impl<'m> Builder<'m> {
 
     pub fn pop_fun_multi(&mut self, rets: Vec<(Val, Val)>) -> Val {
         let (fun, block, params, cont) = self.funs.pop().unwrap();
-        assert!(
-            cont != Val::INVALID,
-            "Called pop_fun_multi() with push_fun_raw()"
-        );
+        let cont = cont.expect("Called pop_fun_multi() with push_fun_raw()");
 
         // Add the continuation parameter to the function
         let cont_ty = self.module.add(Node::FunType(rets.len()), None);
-        match self.module.get_mut(fun) {
-            Some(Node::Fun(f)) => {
+        let funv = self.module.unredirect(fun);
+        match self.module.world.write_storage::<Slot>().get_mut(funv) {
+            Some(Slot::Full(Node::Fun(f))) => {
                 f.params.push(cont_ty);
             }
             // The function returns a value directly, so we'll just add the continuation parameter to the function node we're making now
@@ -519,7 +517,7 @@ impl<'m> Builder<'m> {
             }),
         );
         self.block = cont;
-        let ret_ty = match f.get(self.module).clone().ty(self.module).get(self.module) {
+        let ret_ty = match f.ty(self.module).get(&self.module.slots()) {
             Node::ExternFunType(_, r) => *r,
             _ => panic!("extern_call() requires extern fun!"),
         };
@@ -560,12 +558,7 @@ impl<'m> Builder<'m> {
             }),
         );
         self.block = cont;
-        let ret_ty = match vref
-            .get(self.module)
-            .clone()
-            .ty(self.module)
-            .get(self.module)
-        {
+        let ret_ty = match vref.ty(self.module).get(&self.module.slots()) {
             Node::RefTy(r) => *r,
             _ => panic!("refget() requires ref value!"),
         };

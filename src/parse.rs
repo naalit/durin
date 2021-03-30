@@ -47,7 +47,7 @@ impl<'a> Parser<'a> {
             chars: input.chars().peekable(),
             input,
             pos: 0,
-            module: Default::default(),
+            module: Module::new(),
             names: Default::default(),
         }
     }
@@ -373,7 +373,7 @@ impl<'a> Parser<'a> {
                 let val = self
                     .names
                     .get(name)
-                    .filter(|&&(x, _)| self.module.get(x).is_none())
+                    .filter(|&&(x, _)| self.module.slots().node(x).is_none())
                     .map(|&(x, _)| x)
                     .unwrap_or_else(|| {
                         let v = self.module.reserve(Some(name.to_owned()));
@@ -398,7 +398,7 @@ impl<'a> Parser<'a> {
                 let val = self
                     .names
                     .get(name)
-                    .filter(|&&(x, _)| self.module.get(x).is_none())
+                    .filter(|&&(x, _)| self.module.slots().node(x).is_none())
                     .map(|&(x, _)| x)
                     .unwrap_or_else(|| {
                         let v = self.module.reserve(Some(name.to_owned()));
@@ -456,7 +456,7 @@ impl<'a> Parser<'a> {
             let val = self
                 .names
                 .get(name)
-                .filter(|&&(x, _)| self.module.get(x).is_none())
+                .filter(|&&(x, _)| self.module.slots().node(x).is_none())
                 .map(|&(x, _)| x)
                 .unwrap_or_else(|| {
                     let v = self.module.reserve(Some(name.to_owned()));
@@ -666,7 +666,7 @@ impl<'a> Parser<'a> {
         }
 
         for (name, (val, pos)) in &self.names {
-            if self.module.get(*val).is_none() {
+            if self.module.slots().node(*val).is_none() {
                 self.pos = *pos;
                 self.error(format!("Name '{}' not found", name));
             }

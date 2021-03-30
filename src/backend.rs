@@ -1,4 +1,5 @@
-use crate::ir::{Function, Node, Val};
+use crate::emit::ValPretty;
+use crate::ir::{Function, Node, Slots, Val, ValExt};
 use inkwell::basic_block::BasicBlock;
 use inkwell::IntPredicate;
 use inkwell::{
@@ -143,7 +144,7 @@ enum FunMode {
 impl crate::ir::Module {
     /// A helper for `stack_enabled()`: returns whether we can call `callee` on the stack, adding requirements to `reqs`.
     fn try_stack_call(
-        &mut self,
+        &self,
         callee: Val,
         cont: Option<Val>,
         call_args: &[Val],
@@ -152,14 +153,14 @@ impl crate::ir::Module {
         if reqs.contains(&callee) {
             return true;
         }
-        match self.get(callee).unwrap() {
+        match self.slots().node(callee).unwrap() {
             Node::Param(f, i) => match cont {
                 // If we call another function's parameter, we can't be stack enabled.
                 // Even if this is another function's continuation, we have our own continuation.
                 Some(cont) => return callee == cont,
                 // If we don't have our own continuation, we can call other functions' continuations
                 None => {
-                    if let Node::Fun(Function { params, .. }) = f.get(self) {
+                    if let Node::Fun(Function { params, .. }) = f.get(&self.slots()) {
                         if params.len() == *i as usize + 1 {
                             reqs.push(*f)
                         } else {
@@ -199,9 +200,8 @@ impl crate::ir::Module {
     /// Figure out which functions can use the LLVM stack
     fn stack_enabled(&self) -> HashSet<Val> {
         let mut modes = HashMap::new();
-        let mut tmp_mod = self.clone();
         for val in self.vals() {
-            if val.unredirect(self) != val {
+            if self.unredirect(val) != val {
                 continue;
             }
             // Ignore non-functions
@@ -209,17 +209,20 @@ impl crate::ir::Module {
                 params,
                 callee,
                 call_args,
-            }) = self.get(val).unwrap()
+            }) = self.slots().node(val).unwrap()
             {
                 // If the last parameter is of function type and used, that's the continuation
+                let slots = self.slots();
                 let cont_p = if matches!(
-                    params.last().and_then(|&x| self.get(x)),
+                    params.last().and_then(|&x| slots.node(x)),
                     Some(Node::FunType(_))
                 ) {
                     let cont_n = params.len() as u8 - 1;
-                    self.uses(val)
+                    self.uses()
+                        .get(val)
+                        .unwrap()
                         .iter()
-                        .find(|&&x| *self.get(x).unwrap() == Node::Param(val, cont_n))
+                        .find(|&&x| *slots.node(x).unwrap() == Node::Param(val, cont_n))
                         .copied()
                 } else {
                     None
@@ -228,7 +231,8 @@ impl crate::ir::Module {
                 // If it has other parameters of function type, which are used, it can't be stack enabled
                 if !params.is_empty()
                     && params[0..params.len() - 1].iter().any(|&x| {
-                        matches!(self.get(x), Some(Node::FunType(_))) && !self.uses(x).is_empty()
+                        matches!(self.slots().node(x), Some(Node::FunType(_)))
+                            && !self.uses().get(x).unwrap().is_empty()
                     })
                 {
                     modes.insert(val, FunMode::NoStack);
@@ -239,12 +243,12 @@ impl crate::ir::Module {
                 // Instead of checking if other functions are stack-enabled, we add them to reqs, since they might be in any order
                 let mut reqs = Vec::new();
                 // This function must only call other stack-enabled functions - we won't have a continuation to pass other functions
-                let mut good = tmp_mod.try_stack_call(*callee, cont_p, call_args, &mut reqs);
+                let mut good = self.try_stack_call(*callee, cont_p, call_args, &mut reqs);
 
                 if let Some(cont_p) = cont_p {
-                    good &= self.uses(cont_p).iter().all(|&u| {
+                    good &= self.uses().get(cont_p).unwrap().iter().all(|&u| {
                         // The continuation must only be used in known calls, not passed it around
-                        match self.get(u).unwrap() {
+                        match self.slots().node(u).unwrap() {
                             Node::Fun(Function { callee, .. }) if *callee == cont_p => true,
                             // Although passing it as the continuation (last) parameter to another stack-enabled function is fine.
                             // That's just a tail call.
@@ -264,13 +268,13 @@ impl crate::ir::Module {
                     // It can still be stack-enabled as long as it only calls stack-enabled functions or their continuations.
                     // The function must also not be used as a first-class function (not passed around, just called)
                     // That's because we're going to turn it into a basic block
-                    for &u in self.uses(val) {
-                        match self.get(u).unwrap() {
+                    for &u in &**self.uses().get(val).unwrap() {
+                        match self.slots().node(u).unwrap() {
                             Node::Fun(f) => {
                                 // Using it as an argument to if or ifcase doesn't count
                                 if f.callee != val
                                     && !matches!(
-                                        self.get(f.callee),
+                                        self.slots().node(f.callee),
                                         Some(Node::If(_))
                                             | Some(Node::IfCase(_, _))
                                             | Some(Node::Ref(_))
@@ -281,7 +285,7 @@ impl crate::ir::Module {
                                         && f.call_args.last() == Some(&val)
                                     {
                                         // If it's the continuation to an externcall, we don't need to add that to reqs
-                                        if !matches!(self.get(u), Some(Node::Fun(Function { callee, .. })) if matches!(self.get(*callee), Some(Node::ExternCall(_))))
+                                        if !matches!(self.slots().node(u), Some(Node::Fun(Function { callee, .. })) if matches!(self.slots().node(*callee), Some(Node::ExternCall(_))))
                                         {
                                             reqs.push(u)
                                         }
@@ -327,7 +331,7 @@ impl crate::ir::Module {
                 // The new version of reqs - functions we're still waiting on
                 let mut nreqs = Vec::new();
                 for &v in &reqs {
-                    let v = v.unredirect(self);
+                    let v = self.unredirect(v);
                     // Single recursion is fine
                     if v == val {
                         continue;
@@ -378,7 +382,7 @@ impl crate::ir::Module {
 
     /// The size that this type takes up on the *stack*
     fn static_size<'cxt>(&self, val: Val, cxt: &Cxt<'cxt>) -> u64 {
-        match self.get(val).unwrap() {
+        match self.slots().node(val).unwrap() {
             Node::Const(c) => match c {
                 crate::ir::Constant::TypeType => cxt.size_ty().get_bit_width() as u64 / 8,
                 crate::ir::Constant::IntType(w) => w.bits() as u64 / 8,
@@ -436,7 +440,7 @@ impl crate::ir::Module {
     }
 
     fn llvm_ty<'cxt>(&self, val: Val, cxt: &Cxt<'cxt>) -> BasicTypeEnum<'cxt> {
-        match self.get(val).unwrap() {
+        match self.slots().node(val).unwrap() {
             Node::Const(c) => match c {
                 crate::ir::Constant::TypeType => cxt.size_ty().as_basic_type_enum(),
                 crate::ir::Constant::IntType(w) => {
@@ -528,12 +532,12 @@ impl crate::ir::Module {
     }
 
     fn gen_value<'cxt>(&self, val: Val, cxt: &Cxt<'cxt>) -> BasicValueEnum<'cxt> {
-        let val = val.unredirect(self);
+        let val = self.unredirect(val);
 
         if let Some(&v) = cxt.upvalues.get(&val) {
             return v;
         }
-        match self.get(val).unwrap() {
+        match self.slots().node(val).unwrap() {
             Node::Fun(_) => {
                 // Create a closure
                 let LFunction {
@@ -639,7 +643,7 @@ impl crate::ir::Module {
                     .unwrap()
             }
             Node::Inj(ty, i, payload) => {
-                if matches!(self.get(*ty), Some(Node::SumType(v)) if v.len() == 1) {
+                if matches!(self.slots().node(*ty), Some(Node::SumType(v)) if v.len() == 1) {
                     // No tag or casting needed
                     return self.gen_value(*payload, cxt);
                 }
@@ -696,13 +700,13 @@ impl crate::ir::Module {
                 panic!("`refset`, `refget`, and `refnew` aren't first-class functions!")
             }
             Node::Param(f, i) => {
-                let name = self.name(val).map(|x| x as &str).unwrap_or("param");
+                let name = self.name(val).unwrap_or_else(|| "param".to_string());
                 let ptr = cxt
                     .blocks
                     .get(f)
                     .unwrap_or_else(|| panic!("Couldn't find param {} of {}", i, f.pretty(self)))
                     .1[*i as usize];
-                cxt.builder.build_load(ptr, name)
+                cxt.builder.build_load(ptr, &name)
             }
             Node::Const(c) => match c {
                 crate::ir::Constant::TypeType => cxt.size_ty().size_of().as_basic_value_enum(),
@@ -724,7 +728,8 @@ impl crate::ir::Module {
             Node::BinOp(op, a, b) => {
                 let a = self.gen_value(*a, cxt);
                 let b = self.gen_value(*b, cxt);
-                let name = self.name(val).map(|x| x as &str).unwrap_or("binop");
+                let name = self.name(val).unwrap_or_else(|| "binop".to_string());
+                let name = &name;
                 match op {
                     crate::ir::BinOp::IAdd => cxt
                         .builder
@@ -828,8 +833,11 @@ impl crate::ir::Module {
         let stack_enabled = self.stack_enabled();
 
         // Codegen all functions visible from the top level, and everything reachable from there
-        let mut to_gen: Vec<(Val, Vec<(Val, crate::ir::Function)>)> =
-            self.top_level().map(|x| (x, Vec::new())).collect();
+        let mut to_gen: Vec<(Val, Vec<(Val, crate::ir::Function)>)> = self
+            .top_level()
+            .into_iter()
+            .map(|x| (x, Vec::new()))
+            .collect();
         let scopes = self.top_level_scopes();
         // This explicit for loop allows us to add to to_gen in the body of the loop
         let mut i = 0;
@@ -838,7 +846,10 @@ impl crate::ir::Module {
             let env = self.env(val);
             i += 1;
 
-            if let Node::Fun(fun) = self.get(val).unwrap().clone() {
+            if let Node::Fun(fun) = {
+                let slots = self.slots();
+                slots.node(val).unwrap().clone()
+            } {
                 // Codegen it
 
                 // Everything in `scope` will either be generated as a basic block, or added to `to_gen`
@@ -850,6 +861,7 @@ impl crate::ir::Module {
                 let mut blocks: VecDeque<_> = scope
                     .iter()
                     .filter_map(|&x| {
+                        let slots = self.slots();
                         // The body of the main function will be added separately
                         if x == val {
                             return None;
@@ -858,17 +870,17 @@ impl crate::ir::Module {
                             params,
                             callee,
                             call_args,
-                        })) = self.get(x)
+                        })) = slots.node(x)
                         {
                             // It must be stack enabled and not have its own continuation
                             let is_block = stack_enabled.contains(&x)
                                 && !matches!(
-                                    params.iter().last().and_then(|&x| self.get(x)),
+                                    params.iter().last().and_then(|&x| slots.node(x)),
                                     Some(Node::FunType(_))
                                 )
                                 && self.env(x).into_iter().all(|(x, _)| {
                                     env.iter().any(|(y, _)| x == *y)
-                                    || matches!(self.get(x), Some(Node::Param(f, _)) if *f == val || scope.contains(f))
+                                    || matches!(self.slots().node(x), Some(Node::Param(f, _)) if *f == val || scope.contains(f))
                                 });
 
                             if is_block {
@@ -916,11 +928,11 @@ impl crate::ir::Module {
                     xscope.push(x);
                     let xscope: Vec<_> = xscope
                         .into_iter()
-                        .flat_map(|x| x.get(self).args())
+                        .flat_map(|x| x.get(&self.slots()).args())
                         .collect();
                     for b in &blocks {
                         let &(v, _) = b;
-                        let h: HashSet<_> = self.uses(v).iter().copied().collect();
+                        let h: HashSet<_> = self.uses().get(v).unwrap().iter().copied().collect();
                         if xscope.iter().any(|x| h.contains(&x)) {
                             x_blocks.push(b.clone());
                         }
@@ -931,30 +943,42 @@ impl crate::ir::Module {
                 // The first basic block is the actual function body
                 blocks.push_front((val, fun.clone()));
 
+                let slots = self.slots();
                 let stack_enabled = stack_enabled.contains(&val);
                 let cont = if stack_enabled
                     && fun
                         .params
                         .last()
-                        .and_then(|x| self.get(*x))
+                        .and_then(|x| slots.node(*x))
                         .map_or(false, |n| matches!(n, Node::FunType(_)))
                 {
-                    self.uses(val)
-                        .clone()
-                        .into_iter()
-                        .find_map(|x| match self.get(x).unwrap() {
+                    drop(slots);
+                    {
+                        let uses = self.uses();
+                        (**uses.get(val).unwrap()).clone()
+                    }
+                    .into_iter()
+                    .find_map(|x| {
+                        let slots = self.slots();
+                        match slots.node(x).unwrap() {
                             Node::Param(_, i) if *i as usize == fun.params.len() - 1 => {
-                                let u = self.uses(x);
+                                drop(slots);
+                                let uses = self.uses();
+                                let u = uses.get(x).unwrap();
                                 if u.is_empty() {
                                     None
                                 } else {
-                                    for &i in u {
-                                        let ty = match self.get(i) {
+                                    let u = u.clone();
+                                    drop(uses);
+                                    for &i in &**u {
+                                        let slots = self.slots();
+                                        let ty = match slots.node(i).cloned() {
                                             Some(Node::Fun(Function { call_args, .. })) => {
+                                                drop(slots);
                                                 call_args
                                                     .clone()
                                                     .into_iter()
-                                                    .map(|x| x.get(self).clone().ty(self))
+                                                    .map(|x| x.ty(self))
                                                     .collect::<Vec<_>>()
                                             }
                                             _ => continue,
@@ -965,7 +989,8 @@ impl crate::ir::Module {
                                 }
                             }
                             _ => None,
-                        })
+                        }
+                    })
                 } else {
                     None
                 };
@@ -998,8 +1023,7 @@ impl crate::ir::Module {
 
                 let name = self
                     .name(val)
-                    .cloned()
-                    .unwrap_or_else(|| format!("fun${}", val.num()));
+                    .unwrap_or_else(|| format!("fun${}", val.id()));
                 let known = cxt.module.add_function(&name, known_ty, None);
                 known.set_call_conventions(TAILCC);
 
@@ -1088,7 +1112,7 @@ impl crate::ir::Module {
                                 .build_extract_value(
                                     env_val,
                                     i as u32,
-                                    self.name(val).map(|x| x as &str).unwrap_or("upvalue"),
+                                    &self.name(val).unwrap_or_else(|| "upvalue".to_string()),
                                 )
                                 .unwrap();
                             cxt.upvalues.insert(val, value);
@@ -1108,9 +1132,7 @@ impl crate::ir::Module {
                     .collect();
                 if let Some(vcont) = args.pop() {
                     // `gen_call` takes the continuation as a Val, not a BasicValueEnum; so, we use an unused Val slot and stick the BasicValueEnum in the upvalues map
-                    // Thing is, we can't call `self.reserve()` because we don't want to take `self` as mutable
-                    // But we only ever need one of these at once, so we use `Val::INVALID`, which exists for this purpose
-                    let cont = Val::INVALID;
+                    let cont = self.reserve(None);
                     cxt.upvalues.insert(cont, vcont);
                     self.gen_call(val, args, Some(cont), cxt);
                 } else {
@@ -1169,9 +1191,11 @@ impl crate::ir::Module {
                 let (block, _, _) = cxt.blocks.get(&bval).unwrap();
                 cxt.builder.position_at_end(*block);
 
+                let slots = self.slots();
+
                 // If we're calling if x, do that
-                if let Some(Node::If(x)) = self.get(bfun.callee) {
-                    let &x = x;
+                if let Some(Node::If(x)) = slots.node(bfun.callee).cloned() {
+                    drop(slots);
                     assert_eq!(bfun.call_args.len(), 2);
                     let fthen = bfun.call_args[0];
                     let felse = bfun.call_args[1];
@@ -1190,10 +1214,13 @@ impl crate::ir::Module {
                     cxt.builder.position_at_end(belse);
                     self.gen_call(felse, vec![], None, cxt);
                 // If we're calling ifcase i x, do that instead
-                } else if let Some(Node::IfCase(i, x)) = self.get(bfun.callee) {
-                    let (&i, &x) = (i, x);
-                    let payload_ty = match x.get(self).clone().ty(self).get(self) {
+                } else if let Some(Node::IfCase(i, x)) = slots.node(bfun.callee).cloned() {
+                    drop(slots);
+                    let ty = x.ty(self);
+                    let slots = self.slots();
+                    let payload_ty = match ty.get(&slots) {
                         Node::SumType(v) if v.len() == 1 => {
+                            drop(slots);
                             // There's no tag, and no casting needed
                             let x = self.gen_value(x, cxt);
                             assert_eq!(bfun.call_args.len(), 2);
@@ -1210,6 +1237,7 @@ impl crate::ir::Module {
                     assert_eq!(bfun.call_args.len(), 2);
                     let fthen = bfun.call_args[0];
                     let felse = bfun.call_args[1];
+                    drop(slots);
 
                     let x = self.gen_value(x, cxt);
                     let tag = cxt
@@ -1259,6 +1287,8 @@ impl crate::ir::Module {
                     cxt.builder.position_at_end(belse);
                     self.gen_call(felse, vec![], None, cxt);
                 } else {
+                    drop(slots);
+
                     // Generate a call
                     let args: Vec<_> = bfun
                         .call_args
@@ -1282,7 +1312,7 @@ impl crate::ir::Module {
         ty: Val,
         cxt: &Cxt<'cxt>,
     ) -> BasicValueEnum<'cxt> {
-        match self.get(ty).unwrap() {
+        match self.slots().node(ty).unwrap() {
             Node::Const(c) => match c {
                 crate::ir::Constant::TypeType => cxt
                     .builder
@@ -1418,209 +1448,235 @@ impl crate::ir::Module {
         cont: Option<Val>,
         cxt: &mut Cxt<'cxt>,
     ) {
-        // If we're calling the return continuation, emit a return instruction
-        if cxt.cont.as_ref().map_or(false, |(x, _)| *x == callee) {
-            if let Some(k) = cont {
-                args.push(self.gen_value(k, cxt));
-            }
-            let args = args
-                .into_iter()
-                .zip(&cxt.cont.as_ref().unwrap().1)
-                .map(|(x, &ty)| self.cast(x, ty, cxt))
-                .collect::<Vec<_>>();
-            let ret = if args.len() == 1 {
-                args[0]
-            } else {
-                let tys: Vec<_> = cxt
-                    .cont
-                    .clone()
-                    .unwrap()
-                    .1
+        let slots = self.slots();
+        match slots.node(callee) {
+            // If we're calling the return continuation, emit a return instruction
+            _ if cxt.cont.as_ref().map_or(false, |(x, _)| *x == callee) => {
+                if let Some(k) = cont {
+                    args.push(self.gen_value(k, cxt));
+                }
+                let args = args
                     .into_iter()
-                    .map(|x| self.llvm_ty(x, cxt))
-                    .collect();
-                let ty = cxt.cxt.struct_type(&tys, false);
-                let mut agg = ty.get_undef().as_aggregate_value_enum();
-                for (i, x) in args.into_iter().enumerate() {
-                    agg = cxt
-                        .builder
-                        .build_insert_value(agg, x, i as u32, "ret_product")
-                        .unwrap();
-                }
-                agg.as_basic_value_enum()
-            };
-            cxt.builder.build_return(Some(&ret));
-        // If we're calling a basic block, jump there
-        } else if let Some((target, params, tys)) = cxt.blocks.get(&callee) {
-            if let Some(k) = cont {
-                args.push(self.gen_value(k, cxt));
-            }
-            let args = args
-                .into_iter()
-                .zip(tys)
-                .map(|(x, &ty)| self.cast(x, ty, cxt))
-                .collect::<Vec<_>>();
-            // Set the parameters and jump to the target block
-            for (&ptr, value) in params.iter().zip(args) {
-                cxt.builder.build_store(ptr, value);
-            }
-            cxt.builder.build_unconditional_branch(*target);
-        // Execute a ref op if we're doing one
-        } else if let Some(Node::Ref(op)) = self.get(callee) {
-            // Execute the operation
-            let args = match op {
-                crate::ir::RefOp::RefNew(ty) => {
-                    let ty = self.llvm_ty(*ty, cxt);
-                    let ptr = cxt.builder.build_malloc(ty, "refnew").unwrap();
-                    vec![ptr.as_basic_value_enum()]
-                }
-                crate::ir::RefOp::RefGet(r) => {
-                    let ptr = self.gen_value(*r, cxt).into_pointer_value();
-                    let val = cxt.builder.build_load(ptr, "refget");
-                    vec![val]
-                }
-                crate::ir::RefOp::RefSet(r, v) => {
-                    let ptr = self.gen_value(*r, cxt).into_pointer_value();
-                    let val = self.gen_value(*v, cxt);
-                    cxt.builder.build_store(ptr, val);
-                    Vec::new()
-                }
-            };
-
-            // Call the continuation
-            let cont = cont.unwrap();
-            let cont2 = args.last().map(|&v| {
-                let n = self.reserve(None);
-                cxt.upvalues.insert(n, v);
-                n
-            });
-            self.gen_call(cont, Vec::new(), cont2, cxt)
-        // If we're stopping, return void
-        } else if let Some(Node::Const(crate::ir::Constant::Stop)) = self.get(callee) {
-            cxt.builder.build_return(None);
-        // If we're calling unreachable, emit a LLVM unreachable instruction
-        } else if let Some(Node::Const(crate::ir::Constant::Unreachable)) = self.get(callee) {
-            cxt.builder.build_unreachable();
-        // Even if it goes through a function
-        } else if matches!(self.get(callee), Some(Node::Fun(Function { callee, .. })) if matches!(self.get(*callee), Some(Node::Const(crate::ir::Constant::Unreachable))))
-        {
-            cxt.builder.build_unreachable();
-        // If we're calling an extern function, do that
-        } else if let Some(Node::ExternCall(f)) = self.get(callee) {
-            let f = self.gen_value(*f, cxt);
-            let call = cxt
-                .builder
-                .build_call(f.into_pointer_value(), &args, "extern_call");
-            call.set_tail_call(true);
-
-            let cont = cont.unwrap();
-            // let cont_ty = tys.last().copied();
-            self.gen_call(
-                cont,
-                vec![call.try_as_basic_value().left().unwrap()],
-                None,
-                cxt,
-            )
-        // Otherwise, we're actually calling a function
-        } else {
-            // The mechanism depends on whether it's a known or unknown call
-            match cxt.functions.get(&callee.unredirect(self)) {
-                Some(LFunction {
-                    known,
-                    env,
-                    stack_enabled,
-                    cont: fcont,
-                    param_tys,
-                    ..
-                }) => {
-                    // Known call
-
-                    // Prepend upvalues to the argument list
-                    let args = args
+                    .zip(&cxt.cont.as_ref().unwrap().1)
+                    .map(|(x, &ty)| self.cast(x, ty, cxt))
+                    .collect::<Vec<_>>();
+                let ret = if args.len() == 1 {
+                    args[0]
+                } else {
+                    let tys: Vec<_> = cxt
+                        .cont
+                        .clone()
+                        .unwrap()
+                        .1
                         .into_iter()
-                        .zip(param_tys)
-                        .map(|(x, &ty)| self.cast(x, ty, cxt))
-                        .collect::<Vec<_>>();
-                    let mut args: Vec<_> = env
-                        .iter()
-                        .map(|&(val, _, _)| self.gen_value(val, cxt))
-                        .chain(args)
+                        .map(|x| self.llvm_ty(x, cxt))
                         .collect();
+                    let ty = cxt.cxt.struct_type(&tys, false);
+                    let mut agg = ty.get_undef().as_aggregate_value_enum();
+                    for (i, x) in args.into_iter().enumerate() {
+                        agg = cxt
+                            .builder
+                            .build_insert_value(agg, x, i as u32, "ret_product")
+                            .unwrap();
+                    }
+                    agg.as_basic_value_enum()
+                };
+                cxt.builder.build_return(Some(&ret));
+            }
 
-                    // The actual call depends on whether we're using the LLVM stack or not
-                    if *stack_enabled && fcont.is_some() {
-                        let cont = cont.unwrap_or_else(|| {
-                            panic!("No continuation given for {}", callee.pretty(self))
-                        });
-                        let call = cxt.builder.build_call(*known, &args, "stack_call");
-                        call.set_tail_call(true);
-                        call.set_call_convention(TAILCC);
+            // If we're calling a basic block, jump there
+            _ if cxt.blocks.get(&callee).is_some() => {
+                let (target, params, tys) = cxt.blocks.get(&callee).unwrap();
+                if let Some(k) = cont {
+                    args.push(self.gen_value(k, cxt));
+                }
+                let args = args
+                    .into_iter()
+                    .zip(tys)
+                    .map(|(x, &ty)| self.cast(x, ty, cxt))
+                    .collect::<Vec<_>>();
+                // Set the parameters and jump to the target block
+                for (&ptr, value) in params.iter().zip(args) {
+                    cxt.builder.build_store(ptr, value);
+                }
+                cxt.builder.build_unconditional_branch(*target);
+            }
 
-                        let call = call.try_as_basic_value().left().unwrap();
-                        let nargs = fcont.as_ref().unwrap().1.len();
-                        let mut args = if nargs == 1 {
-                            vec![call]
+            // Execute a ref op if we're doing one
+            Some(Node::Ref(op)) => {
+                // Execute the operation
+                let args = match op {
+                    crate::ir::RefOp::RefNew(ty) => {
+                        let ty = self.llvm_ty(*ty, cxt);
+                        let ptr = cxt.builder.build_malloc(ty, "refnew").unwrap();
+                        vec![ptr.as_basic_value_enum()]
+                    }
+                    crate::ir::RefOp::RefGet(r) => {
+                        let ptr = self.gen_value(*r, cxt).into_pointer_value();
+                        let val = cxt.builder.build_load(ptr, "refget");
+                        vec![val]
+                    }
+                    crate::ir::RefOp::RefSet(r, v) => {
+                        let ptr = self.gen_value(*r, cxt).into_pointer_value();
+                        let val = self.gen_value(*v, cxt);
+                        cxt.builder.build_store(ptr, val);
+                        Vec::new()
+                    }
+                };
+
+                drop(slots);
+
+                // Call the continuation
+                let cont = cont.unwrap();
+                let cont2 = args.last().map(|&v| {
+                    let n = self.reserve(None);
+                    cxt.upvalues.insert(n, v);
+                    n
+                });
+                self.gen_call(cont, Vec::new(), cont2, cxt)
+            }
+
+            // If we're stopping, return void
+            Some(Node::Const(crate::ir::Constant::Stop)) => {
+                cxt.builder.build_return(None);
+            }
+
+            // If we're calling unreachable, emit a LLVM unreachable instruction
+            Some(Node::Const(crate::ir::Constant::Unreachable)) => {
+                cxt.builder.build_unreachable();
+            }
+            // Even if it goes through a function
+            Some(Node::Fun(Function { callee, .. }))
+                if matches!(
+                    self.slots().node(*callee),
+                    Some(Node::Const(crate::ir::Constant::Unreachable))
+                ) =>
+            {
+                cxt.builder.build_unreachable();
+            }
+
+            // If we're calling an extern function, do that
+            Some(Node::ExternCall(f)) => {
+                let f = self.gen_value(*f, cxt);
+                let call = cxt
+                    .builder
+                    .build_call(f.into_pointer_value(), &args, "extern_call");
+                call.set_tail_call(true);
+
+                drop(slots);
+
+                let cont = cont.unwrap();
+                self.gen_call(
+                    cont,
+                    vec![call.try_as_basic_value().left().unwrap()],
+                    None,
+                    cxt,
+                )
+            }
+
+            // Otherwise, we're actually calling a function
+            _ => {
+                // The mechanism depends on whether it's a known or unknown call
+                match cxt.functions.get(&self.unredirect(callee)) {
+                    Some(LFunction {
+                        known,
+                        env,
+                        stack_enabled,
+                        cont: fcont,
+                        param_tys,
+                        ..
+                    }) => {
+                        // Known call
+
+                        // Prepend upvalues to the argument list
+                        let args = args
+                            .into_iter()
+                            .zip(param_tys)
+                            .map(|(x, &ty)| self.cast(x, ty, cxt))
+                            .collect::<Vec<_>>();
+                        let mut args: Vec<_> = env
+                            .iter()
+                            .map(|&(val, _, _)| self.gen_value(val, cxt))
+                            .chain(args)
+                            .collect();
+
+                        // The actual call depends on whether we're using the LLVM stack or not
+                        if *stack_enabled && fcont.is_some() {
+                            drop(slots);
+
+                            let cont = cont.unwrap_or_else(|| {
+                                panic!("No continuation given for {}", callee.pretty(self))
+                            });
+                            let call = cxt.builder.build_call(*known, &args, "stack_call");
+                            call.set_tail_call(true);
+                            call.set_call_convention(TAILCC);
+
+                            let call = call.try_as_basic_value().left().unwrap();
+                            let nargs = fcont.as_ref().unwrap().1.len();
+                            let mut args = if nargs == 1 {
+                                vec![call]
+                            } else {
+                                let call = call.into_struct_value();
+                                (0..nargs as u32)
+                                    .map(|i| {
+                                        cxt.builder
+                                            .build_extract_value(call, i, "extract_return")
+                                            .unwrap()
+                                    })
+                                    .collect()
+                            };
+                            let acont = args.pop().map(|x| {
+                                let v = self.reserve(None);
+                                cxt.upvalues.insert(v, x);
+                                v
+                            });
+
+                            self.gen_call(cont, args, acont, cxt)
                         } else {
-                            let call = call.into_struct_value();
-                            (0..nargs as u32)
-                                .map(|i| {
-                                    cxt.builder
-                                        .build_extract_value(call, i, "extract_return")
-                                        .unwrap()
-                                })
-                                .collect()
-                        };
-                        let acont = args.pop().map(|x| {
-                            let v = self.reserve(None);
-                            cxt.upvalues.insert(v, x);
-                            v
-                        });
-
-                        self.gen_call(cont, args, acont, cxt)
-                    } else {
-                        if let Some(k) = cont {
-                            let v = self.gen_value(k, cxt);
-                            let v = self.cast(v, *param_tys.last().unwrap(), cxt);
-                            args.push(v);
+                            if let Some(k) = cont {
+                                let v = self.gen_value(k, cxt);
+                                let v = self.cast(v, *param_tys.last().unwrap(), cxt);
+                                args.push(v);
+                            }
+                            let call = cxt.builder.build_call(*known, &args, "call");
+                            // Tail calls are disabled until we stop using allocas
+                            // call.set_tail_call(true);
+                            call.set_call_convention(TAILCC);
+                            cxt.builder.build_return(None);
                         }
-                        let call = cxt.builder.build_call(*known, &args, "call");
+                    }
+                    None => {
+                        // Unknown call
+                        if let Some(k) = cont {
+                            args.push(self.gen_value(k, cxt));
+                        }
+                        // let args = args
+                        //     .into_iter()
+                        //     .zip(tys)
+                        //     .map(|(x, ty)| self.cast(x, ty, cxt))
+                        //     .collect::<Vec<_>>();
+                        let callee = self.gen_value(callee, cxt).into_struct_value();
+                        let env = cxt.builder.build_extract_value(callee, 0, "env").unwrap();
+                        let fun_ptr = cxt
+                            .builder
+                            .build_extract_value(callee, 1, "fun_ptr")
+                            .unwrap()
+                            .into_pointer_value();
+
+                        // It could be polymorphic, so we pass all arguments as word-size "any"
+                        let mut args: Vec<_> = args
+                            .into_iter()
+                            .map(|val| self.to_any(val, cxt).as_basic_value_enum())
+                            .collect();
+                        // The closure environment is the last argument
+                        args.push(env);
+
+                        let call = cxt.builder.build_call(fun_ptr, &args, "closure_call");
                         // Tail calls are disabled until we stop using allocas
                         // call.set_tail_call(true);
                         call.set_call_convention(TAILCC);
                         cxt.builder.build_return(None);
                     }
-                }
-                None => {
-                    // Unknown call
-                    if let Some(k) = cont {
-                        args.push(self.gen_value(k, cxt));
-                    }
-                    // let args = args
-                    //     .into_iter()
-                    //     .zip(tys)
-                    //     .map(|(x, ty)| self.cast(x, ty, cxt))
-                    //     .collect::<Vec<_>>();
-                    let callee = self.gen_value(callee, cxt).into_struct_value();
-                    let env = cxt.builder.build_extract_value(callee, 0, "env").unwrap();
-                    let fun_ptr = cxt
-                        .builder
-                        .build_extract_value(callee, 1, "fun_ptr")
-                        .unwrap()
-                        .into_pointer_value();
-
-                    // It could be polymorphic, so we pass all arguments as word-size "any"
-                    let mut args: Vec<_> = args
-                        .into_iter()
-                        .map(|val| self.to_any(val, cxt).as_basic_value_enum())
-                        .collect();
-                    // The closure environment is the last argument
-                    args.push(env);
-
-                    let call = cxt.builder.build_call(fun_ptr, &args, "closure_call");
-                    // Tail calls are disabled until we stop using allocas
-                    // call.set_tail_call(true);
-                    call.set_call_convention(TAILCC);
-                    cxt.builder.build_return(None);
                 }
             }
         }
