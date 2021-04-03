@@ -84,8 +84,16 @@ impl Slot {
 
 pub trait Slots {
     fn node(&self, i: Val) -> Option<&Node>;
+    fn unredirect(&self, v: Val) -> Val;
+    fn fun(&self, i: Val) -> Option<&Function>;
 }
 impl Slots for ReadStorage<'_, Slot> {
+    fn fun(&self, i: Val) -> Option<&Function> {
+        match self.node(i)? {
+            Node::Fun(f) => Some(f),
+            _ => None,
+        }
+    }
     fn node(&self, i: Val) -> Option<&Node> {
         let mut i = i;
         loop {
@@ -93,6 +101,12 @@ impl Slots for ReadStorage<'_, Slot> {
                 Slot::Full(x) => break Some(x),
                 Slot::Redirect(v) => i = *v,
             }
+        }
+    }
+    fn unredirect(&self, v: Val) -> Val {
+        match self.get(v) {
+            Some(Slot::Redirect(x)) => self.unredirect(*x),
+            _ => v,
         }
     }
 }
@@ -129,7 +143,7 @@ wrapper! {
     pub struct Name(String);
 }
 
-//#[derive(Debug, Clone, Eq, PartialEq)]
+// #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Module {
     pub world: World,
 }
@@ -158,35 +172,7 @@ impl Module {
         self.world.write_storage()
     }
 
-    // pub fn get(&self, i: Val) -> Option<&Node> {
-    //     let mut i = i;
-    //     loop {
-    //         match self.world.read_storage().get(i)? {
-    //             Slot::Full(x) => break Some(x),
-    //             Slot::Redirect(v) => i = *v,
-    //         }
-    //     }
-    // }
-
-    // pub fn get_mut(&mut self, i: Val) -> Option<&mut Node> {
-    //     let mut i = i;
-    //     loop {
-    //         match self.world.read_storage().get(i)? {
-    //             Slot::Full(_) => {
-    //                 break self
-    //                     .world
-    //                     .write_storage::<Slot>()
-    //                     .get_mut(i)
-    //                     .map(|x| x.to_option_mut())
-    //                     .unwrap()
-    //             }
-    //             Slot::Redirect(v) => i = *v,
-    //         }
-    //     }
-    // }
-
     pub fn uses(&self) -> ReadStorage<Uses> {
-        //}, i: Val) -> &Vec<Val> {
         self.world.read_storage()
     }
 
@@ -219,6 +205,7 @@ impl Module {
 
         // Add uses for the things the new value uses
         for i in args {
+            let i = self.slots().unredirect(i);
             self.world
                 .write_storage::<Uses>()
                 .get_mut(i)
@@ -252,6 +239,15 @@ impl Module {
                     .unwrap();
             }
         }
+
+        // Transfer any uses from the alias to the pointee
+        // Removes any uses of 'from' and adds them to 'to'
+        let mut uses = self.world.write_storage::<Uses>();
+        let from = uses.get_mut(from).unwrap();
+        let mut new = Vec::new();
+        std::mem::swap(&mut from.0, &mut new);
+        let to = uses.get_mut(to).unwrap();
+        to.0.append(&mut new);
     }
 
     pub fn replace(&mut self, v: Val, x: Node) {
@@ -267,11 +263,13 @@ impl Module {
 
         let mut uses = self.world.write_storage::<Uses>();
         for i in old_args {
+            let i = self.slots().unredirect(i);
             let u = &mut uses.get_mut(i).unwrap().0;
             let i = u.iter().position(|&x| x == v).unwrap();
             u.swap_remove(i);
         }
         for i in new_args {
+            let i = self.slots().unredirect(i);
             uses.get_mut(i).unwrap().0.push(v);
         }
 
