@@ -9,6 +9,8 @@ pub trait ValExt {
     fn get<'a>(self, slots: &'a ReadStorage<Slot>) -> &'a Node;
 
     fn ty(self, m: &mut Module) -> Self;
+
+    fn name_or_num(self, n: &ReadStorage<Name>) -> String;
 }
 impl ValExt for Val {
     fn get<'a>(self, slots: &'a ReadStorage<Slot>) -> &'a Node {
@@ -20,6 +22,12 @@ impl ValExt for Val {
         let n = self.get(&slots).clone();
         drop(slots);
         n.ty(m)
+    }
+
+    fn name_or_num(self, n: &ReadStorage<Name>) -> String {
+        n.get(self)
+            .map(|n| n.0.clone())
+            .unwrap_or_else(|| format!("{}", self.id()))
     }
 }
 
@@ -86,6 +94,53 @@ pub trait Slots {
     fn node(&self, i: Val) -> Option<&Node>;
     fn unredirect(&self, v: Val) -> Val;
     fn fun(&self, i: Val) -> Option<&Function>;
+
+    /// Returns a list of all foreign parameters this node depends on, with their types.
+    fn env(&self, v: Val) -> Vec<(Val, Val)> {
+        fn go(
+            m: &(impl Slots + ?Sized),
+            v: Val,
+            seen: &mut HashSet<Val>,
+            acc: &mut Vec<(Val, Val)>,
+        ) {
+            let v = m.unredirect(v);
+            match m.node(v).unwrap() {
+                Node::Param(f, i) => {
+                    if seen.contains(f) {
+                    } else {
+                        match m.node(*f).unwrap() {
+                            Node::Fun(Function { params, .. }) => {
+                                if !acc.contains(&(v, params[*i as usize])) {
+                                    acc.push((v, params[*i as usize]));
+                                }
+                                // go(m, params[*i as usize], seen, acc);
+                            }
+                            // Parameters of sigma types don't count
+                            Node::ProdType(_) => (),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                n @ Node::Fun(_) => {
+                    if !seen.contains(&v) {
+                        seen.insert(v);
+                        for i in n.runtime_args() {
+                            go(m, i, seen, acc)
+                        }
+                        seen.remove(&v);
+                    }
+                }
+                n => {
+                    for i in n.runtime_args() {
+                        go(m, i, seen, acc)
+                    }
+                }
+            }
+        }
+        let mut acc = Vec::new();
+        go(self, v, &mut HashSet::new(), &mut acc);
+        acc //.into_iter().collect()
+    }
 }
 impl Slots for ReadStorage<'_, Slot> {
     fn fun(&self, i: Val) -> Option<&Function> {
@@ -118,7 +173,7 @@ macro_rules! wrapper {
         pub struct $n:ident($inner:ty); $($rest:tt)*
     } => {
         #[derive $traits]
-        pub struct $n($inner);
+        pub struct $n(pub $inner);
         impl std::ops::Deref for $n {
             type Target = $inner;
             fn deref(&self) -> &$inner {
@@ -141,6 +196,9 @@ wrapper! {
 
     #[derive(Clone, Debug, Component)]
     pub struct Name(String);
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Component)]
+    pub struct ValType(Val);
 }
 
 // #[derive(Debug, Clone, Eq, PartialEq)]
@@ -153,7 +211,22 @@ impl Module {
         world.register::<Slot>();
         world.register::<Uses>();
         world.register::<Name>();
+        world.register::<ValType>();
         Module { world }
+    }
+
+    pub fn add_types(&mut self) {
+        let entities: Vec<_> = self
+            .world
+            .entities()
+            .join()
+            .filter(|e| self.slots().get(*e).and_then(|x| x.to_option()).is_some())
+            .collect::<Vec<_>>();
+        let tys: Vec<_> = entities.into_iter().map(|e| (e, e.ty(self))).collect();
+        let mut types = self.world.write_storage::<ValType>();
+        for (e, t) in tys {
+            types.insert(e, ValType(t)).unwrap();
+        }
     }
 
     /// Removes a node from the module. Panics if that node is used by anything.
@@ -447,7 +520,7 @@ impl Module {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RefOp {
     /// RefNew(inner_ty)
-    RefNew(Val),
+    RefNew,
     /// RefGet(ref)
     RefGet(Val),
     /// RefSet(ref, new_val)
@@ -456,15 +529,13 @@ pub enum RefOp {
 impl RefOp {
     pub fn runtime_args(self) -> SmallVec<[Val; 4]> {
         match self {
-            RefOp::RefGet(v) | RefOp::RefNew(v) => smallvec![v],
+            RefOp::RefNew => smallvec![],
+            RefOp::RefGet(v) => smallvec![v],
             RefOp::RefSet(v, n) => smallvec![v, n],
         }
     }
     pub fn args(self) -> SmallVec<[Val; 4]> {
-        match self {
-            RefOp::RefGet(v) | RefOp::RefNew(v) => smallvec![v],
-            RefOp::RefSet(v, n) => smallvec![v, n],
-        }
+        self.runtime_args()
     }
 }
 
@@ -479,13 +550,15 @@ pub enum Node {
     SumType(SmallVec<[Val; 4]>),
     /// IfCase(tag, x); then and else are passed to it as arguments
     IfCase(usize, Val),
-    ExternCall(Val),
+    /// ExternCall(fun, ret_ty)
+    ExternCall(Val, Val),
     If(Val),
-    Ref(RefOp),
+    /// Ref(inner_ty, op)
+    Ref(Val, RefOp),
     RefTy(Val),
-    /// Projecting a numbered member of a product type
-    Proj(Val, usize),
-    /// Injecting a numbered member of a sum type (the type is the first argument)
+    /// Proj(ty, val, i): Projecting a numbered member of a product type
+    Proj(Val, Val, usize),
+    /// Inj(ty, i, payload): Injecting a numbered member of a sum type
     Inj(Val, usize, Val),
     Product(Val, SmallVec<[Val; 3]>),
     /// The `Val` should point to a function
@@ -496,12 +569,16 @@ pub enum Node {
 impl Node {
     /// Arguments that, *if they're only known at runtime*, exist in the generated LLVM IR.
     /// So, not types of things.
-    fn runtime_args(&self) -> SmallVec<[Val; 4]> {
+    pub fn runtime_args(&self) -> SmallVec<[Val; 4]> {
+        // return self.args();
         match self {
             Node::Fun(Function {
-                callee, call_args, ..
+                callee,
+                call_args,
+                params,
             }) => call_args
                 .iter()
+                .chain(params)
                 .copied()
                 .chain(std::iter::once(*callee))
                 .collect(),
@@ -509,11 +586,11 @@ impl Node {
             Node::ProdType(v) => v.clone(),
             Node::BinOp(_, a, b) => smallvec![*a, *b],
             Node::IfCase(_, x)
-            | Node::Proj(x, _)
+            | Node::Proj(_, x, _)
             | Node::Inj(_, _, x)
             | Node::If(x)
             | Node::RefTy(x)
-            | Node::ExternCall(x) => {
+            | Node::ExternCall(x, _) => {
                 smallvec![*x]
             }
             Node::FunType(_) | Node::SumType(_) => SmallVec::new(),
@@ -521,7 +598,11 @@ impl Node {
             Node::Const(_) => SmallVec::new(),
             // `f` not being known at runtime doesn't really make sense
             Node::Param(_f, _) => SmallVec::new(),
-            Node::Ref(r) => r.runtime_args(),
+            Node::Ref(ty, r) => {
+                let mut v = r.runtime_args();
+                v.push(*ty);
+                v
+            }
         }
     }
 
@@ -543,16 +624,19 @@ impl Node {
                 v.iter().copied().chain(std::iter::once(*r)).collect()
             }
             Node::Param(f, _) => smallvec![*f],
-            Node::BinOp(_, a, b) | Node::Inj(a, _, b) => smallvec![*a, *b],
+            Node::BinOp(_, a, b)
+            | Node::Inj(a, _, b)
+            | Node::Proj(a, b, _)
+            | Node::ExternCall(a, b) => smallvec![*a, *b],
             Node::FunType(_) | Node::Const(_) => SmallVec::new(),
-            Node::IfCase(_, x)
-            | Node::Proj(x, _)
-            | Node::If(x)
-            | Node::ExternCall(x)
-            | Node::RefTy(x) => {
+            Node::IfCase(_, x) | Node::If(x) | Node::RefTy(x) => {
                 smallvec![*x]
             }
-            Node::Ref(r) => r.args(),
+            Node::Ref(ty, r) => {
+                let mut v = r.args();
+                v.push(*ty);
+                v
+            }
         }
     }
 
@@ -560,7 +644,7 @@ impl Node {
         match self {
             Node::Fun(f) => m.add(Node::FunType(f.params.len()), None),
             Node::ExternFun(_, p, r) => m.add(Node::ExternFunType(p.clone(), *r), None),
-            Node::ExternCall(t) => {
+            Node::ExternCall(t, _) => {
                 let ty = t.ty(m);
                 let slots = m.slots();
                 match ty.get(&slots) {
@@ -581,6 +665,7 @@ impl Node {
             Node::Param(f, i) => match m.slots().node(*f).unwrap() {
                 Node::Fun(f) => f.params[*i as usize],
                 Node::ProdType(p) => p[*i as usize],
+                Node::ExternFun(_, p, _) => p[*i as usize],
                 _ => unreachable!(),
             },
             Node::Const(c) => match c {
@@ -590,13 +675,15 @@ impl Node {
                 Constant::Int(w, _) => m.add(Node::Const(Constant::IntType(*w)), None),
                 Constant::Stop | Constant::Unreachable => m.add(Node::FunType(0), None),
             },
-            Node::BinOp(BinOp::IEq, _, _) => m.add(Node::Const(Constant::IntType(Width::W1)), None),
+            Node::BinOp(op, _, _) if op.is_comp() => {
+                m.add(Node::Const(Constant::IntType(Width::W1)), None)
+            }
             Node::BinOp(_, a, _) => a.ty(m),
             Node::If(_) => {
                 // Takes `then` and `else` blocks as arguments
                 m.add(Node::FunType(2), None)
             }
-            Node::Ref(_) => {
+            Node::Ref(_, _) => {
                 // Takes just a continuation
                 m.add(Node::FunType(1), None)
             }
@@ -604,7 +691,7 @@ impl Node {
                 // Takes `then` and `else` blocks as arguments
                 m.add(Node::FunType(2), None)
             }
-            Node::Proj(x, i) => match x.ty(m).get(&m.slots()) {
+            Node::Proj(t, _, i) => match m.slots().node(*t).unwrap() {
                 Node::ProdType(v) => v[*i],
                 _ => unreachable!(),
             },
@@ -670,6 +757,12 @@ pub enum BinOp {
     ILt,
     IGeq,
     ILeq,
+}
+impl BinOp {
+    pub fn is_comp(self) -> bool {
+        use BinOp::*;
+        matches!(self, IEq | INEq | IGt | ILt | IGeq | ILeq)
+    }
 }
 
 mod display {

@@ -300,6 +300,9 @@ impl<'m> Builder<'m> {
             let n = *n as usize;
             // It's a parameter of a function that we're in the process of generating, so we have the type stored somewhere
             if self.module.slots().node(*f).is_none() {
+                if *f == self.block {
+                    return self.params[n];
+                }
                 let mut ix = self.funs.len();
                 let mut p = self.params.get(n).copied();
                 while let Some(i) = ix.checked_sub(1) {
@@ -316,7 +319,8 @@ impl<'m> Builder<'m> {
     }
 
     pub fn project(&mut self, x: Val, i: usize) -> Val {
-        self.module.add(Node::Proj(x, i), None)
+        let ty = self.type_of(x);
+        self.module.add(Node::Proj(ty, x, i), None)
     }
 
     pub fn sum_idx(&self, x: Val, i: usize) -> Option<Val> {
@@ -504,10 +508,15 @@ impl<'m> Builder<'m> {
     }
 
     pub fn extern_call(&mut self, f: Val, args: impl Into<SmallVec<[Val; 3]>>) -> Val {
+        let ret_ty = match self.type_of(f).get(&self.module.slots()) {
+            Node::ExternFunType(_, r) => *r,
+            _ => panic!("extern_call() requires extern fun!"),
+        };
+
         let cont = self.module.reserve(None);
         let mut args = args.into();
         args.push(cont);
-        let callee = self.module.add(Node::ExternCall(f), None);
+        let callee = self.module.add(Node::ExternCall(f, ret_ty), None);
         self.module.replace(
             self.block,
             Node::Fun(Function {
@@ -517,10 +526,6 @@ impl<'m> Builder<'m> {
             }),
         );
         self.block = cont;
-        let ret_ty = match f.ty(self.module).get(&self.module.slots()) {
-            Node::ExternFunType(_, r) => *r,
-            _ => panic!("extern_call() requires extern fun!"),
-        };
         self.params.push(ret_ty);
         self.module.add(Node::Param(cont, 0), None)
     }
@@ -531,7 +536,7 @@ impl<'m> Builder<'m> {
 
     pub fn refnew(&mut self, inner_ty: Val) -> Val {
         let cont = self.module.reserve(None);
-        let callee = self.module.add(Node::Ref(RefOp::RefNew(inner_ty)), None);
+        let callee = self.module.add(Node::Ref(inner_ty, RefOp::RefNew), None);
         self.module.replace(
             self.block,
             Node::Fun(Function {
@@ -547,8 +552,15 @@ impl<'m> Builder<'m> {
     }
 
     pub fn refget(&mut self, vref: Val) -> Val {
+        let ret_ty = match self.type_of(vref).get(&self.module.slots()) {
+            Node::RefTy(r) => *r,
+            _ => panic!("refget() requires ref value!"),
+        };
+
         let cont = self.module.reserve(None);
-        let callee = self.module.add(Node::Ref(RefOp::RefGet(vref)), None);
+        let callee = self
+            .module
+            .add(Node::Ref(ret_ty, RefOp::RefGet(vref)), None);
         self.module.replace(
             self.block,
             Node::Fun(Function {
@@ -558,19 +570,20 @@ impl<'m> Builder<'m> {
             }),
         );
         self.block = cont;
-        let ret_ty = match vref.ty(self.module).get(&self.module.slots()) {
-            Node::RefTy(r) => *r,
-            _ => panic!("refget() requires ref value!"),
-        };
         self.params.push(ret_ty);
         self.module.add(Node::Param(cont, 0), None)
     }
 
     pub fn refset(&mut self, vref: Val, new_val: Val) {
+        let inner_ty = match self.type_of(vref).get(&self.module.slots()) {
+            Node::RefTy(r) => *r,
+            _ => panic!("refget() requires ref value!"),
+        };
+
         let cont = self.module.reserve(None);
         let callee = self
             .module
-            .add(Node::Ref(RefOp::RefSet(vref, new_val)), None);
+            .add(Node::Ref(inner_ty, RefOp::RefSet(vref, new_val)), None);
         self.module.replace(
             self.block,
             Node::Fun(Function {

@@ -5,7 +5,7 @@ val pair = sig { _: I32, _: I32 };
 fun adt_fun (x : (pair | I32), cont : fun 1) = ifcase 0 x then else;
 
 # The argument has type `(I32, I32)` since that's variant number 0 of the type of `x`
-fun then (y : pair) = cont (y.0);
+fun then (y : pair) = cont (y.0 of pair);
 # We do have to use `ifcase` again to extract variant 1
 fun else () = ifcase 1 x then2 else2;
 

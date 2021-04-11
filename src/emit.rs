@@ -1,3 +1,5 @@
+use specs::ReadStorage;
+
 use crate::ir::*;
 use std::fmt::{self, Display, Write};
 
@@ -66,8 +68,8 @@ impl<'a> Display for PrettyVal<'a> {
                 }
                 write!(f, " }} :: {}", ty.pretty(m))
             }
-            Node::Proj(x, i) => {
-                write!(f, "({}.{})", x.pretty(m), i)
+            Node::Proj(ty, x, i) => {
+                write!(f, "({}.{} of {})", x.pretty(m), i, ty.pretty(m))
             }
             Node::Inj(t, i, v) => {
                 write!(f, "({}:{} {})", t.pretty(m), i, v.pretty(m))
@@ -78,13 +80,19 @@ impl<'a> Display for PrettyVal<'a> {
             Node::IfCase(i, x) => {
                 write!(f, "ifcase {} {}", i, x.pretty(m))
             }
-            Node::Ref(op) => match op {
-                RefOp::RefNew(ty) => write!(f, "refnew {}", ty.pretty(m)),
-                RefOp::RefGet(ptr) => write!(f, "refget {}", ptr.pretty(m)),
-                RefOp::RefSet(ptr, val) => write!(f, "refset {} {}", ptr.pretty(m), val.pretty(m)),
+            Node::Ref(ty, op) => match op {
+                RefOp::RefNew => write!(f, "refnew {}", ty.pretty(m)),
+                RefOp::RefGet(ptr) => write!(f, "refget {} {}", ty.pretty(m), ptr.pretty(m)),
+                RefOp::RefSet(ptr, val) => write!(
+                    f,
+                    "refset {} {} {}",
+                    ty.pretty(m),
+                    ptr.pretty(m),
+                    val.pretty(m)
+                ),
             },
-            Node::ExternCall(x) => {
-                write!(f, "externcall {}", x.pretty(m))
+            Node::ExternCall(x, ret_ty) => {
+                write!(f, "externcall {} -> {}", x.pretty(m), ret_ty.pretty(m))
             }
             Node::BinOp(op, a, b) => {
                 write!(f, "({} {} {})", a.pretty(m), op, b.pretty(m))
@@ -101,10 +109,47 @@ impl<'a> Display for PrettyVal<'a> {
 
 pub trait ValPretty {
     fn pretty(self, m: &Module) -> PrettyVal;
+
+    fn param_name(
+        self,
+        pnum: u8,
+        uses: &ReadStorage<Uses>,
+        slots: &ReadStorage<Slot>,
+        names: &ReadStorage<Name>,
+    ) -> String;
 }
 impl ValPretty for Val {
     fn pretty(self, m: &Module) -> PrettyVal {
         PrettyVal(m, self, false)
+    }
+
+    fn param_name(
+        self,
+        pnum: u8,
+        uses: &ReadStorage<Uses>,
+        slots: &ReadStorage<Slot>,
+        names: &ReadStorage<Name>,
+    ) -> String {
+        let name: Vec<_> = uses
+            .get(self)
+            .unwrap()
+            .iter()
+            .filter(|&&x| {
+                if let Some(Node::Param(_, i)) = slots.node(x) {
+                    *i == pnum
+                } else {
+                    false
+                }
+            })
+            .copied()
+            .collect();
+        if name.len() == 1 && !uses.get(name[0]).unwrap().is_empty() {
+            format!("{}: ", self.name_or_num(names))
+        } else if name.len() > 1 {
+            format!("{}.{}: ", self.name_or_num(names), pnum)
+        } else {
+            String::new()
+        }
     }
 }
 

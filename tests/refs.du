@@ -1,7 +1,7 @@
-fun inc (x : ref I32, k : fun 0) = refget x inc2;
-fun inc2 (v : I32) = refset x (v + 1i32) inc3;
+fun inc (x : ref I32, k : fun 0) = refget I32 x inc2;
+fun inc2 (v : I32) = refset I32 x (v + 1i32) inc3;
 fun inc3 () = k;
 
-fun main (k2 : fun 0) = refnew I32 main2;
-fun main2 (x2 : ref I32) = refset x2 3i32 main3;
+fun main (k2: fun 0) = refnew I32 main2;
+fun main2 (x2 : ref I32) = refset I32 x2 3i32 main3;
 fun main3 () = inc x2 k2;

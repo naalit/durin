@@ -272,8 +272,12 @@ impl<'a> Parser<'a> {
                 }
                 let i: usize = i.parse().expect("invalid number for ifcase tag");
                 self.skip_whitespace();
+                self.expect("of");
+                self.skip_whitespace();
+                let ty = self.expr();
+                self.skip_whitespace();
                 self.expect(")");
-                self.module.add(Node::Proj(lhs, i), None)
+                self.module.add(Node::Proj(ty, lhs, i), None)
             } else if self.matches(":") {
                 // Injection into a sum type
                 self.skip_whitespace();
@@ -560,6 +564,18 @@ impl<'a> Parser<'a> {
                         call_args: SmallVec::new(),
                     }),
                 );
+            } else if self.matches("stop") {
+                self.skip_whitespace();
+                self.expect(";");
+                let callee = self.module.add(Node::Const(Constant::Stop), None);
+                self.module.replace(
+                    val,
+                    Node::Fun(Function {
+                        params,
+                        callee,
+                        call_args: SmallVec::new(),
+                    }),
+                );
             } else if self.matches("refnew") {
                 self.skip_whitespace();
 
@@ -571,7 +587,7 @@ impl<'a> Parser<'a> {
 
                 self.expect(";");
 
-                let callee = self.module.add(Node::Ref(RefOp::RefNew(ty)), None);
+                let callee = self.module.add(Node::Ref(ty, RefOp::RefNew), None);
                 self.module.replace(
                     val,
                     Node::Fun(Function {
@@ -581,6 +597,9 @@ impl<'a> Parser<'a> {
                     }),
                 );
             } else if self.matches("refset") {
+                self.skip_whitespace();
+
+                let ty = self.expr();
                 self.skip_whitespace();
 
                 let ptr = self.expr();
@@ -594,7 +613,7 @@ impl<'a> Parser<'a> {
 
                 self.expect(";");
 
-                let callee = self.module.add(Node::Ref(RefOp::RefSet(ptr, v)), None);
+                let callee = self.module.add(Node::Ref(ty, RefOp::RefSet(ptr, v)), None);
                 self.module.replace(
                     val,
                     Node::Fun(Function {
@@ -606,6 +625,9 @@ impl<'a> Parser<'a> {
             } else if self.matches("refget") {
                 self.skip_whitespace();
 
+                let ty = self.expr();
+                self.skip_whitespace();
+
                 let ptr = self.expr();
                 self.skip_whitespace();
 
@@ -614,7 +636,7 @@ impl<'a> Parser<'a> {
 
                 self.expect(";");
 
-                let callee = self.module.add(Node::Ref(RefOp::RefGet(ptr)), None);
+                let callee = self.module.add(Node::Ref(ty, RefOp::RefGet(ptr)), None);
                 self.module.replace(
                     val,
                     Node::Fun(Function {
@@ -628,6 +650,11 @@ impl<'a> Parser<'a> {
 
                 let x = self.expr();
                 self.skip_whitespace();
+                self.expect("->");
+                self.skip_whitespace();
+
+                let ret_ty = self.expr();
+                self.skip_whitespace();
 
                 let mut call_args = SmallVec::new();
                 while !self.matches(";") {
@@ -635,7 +662,7 @@ impl<'a> Parser<'a> {
                     self.skip_whitespace();
                 }
 
-                let callee = self.module.add(Node::ExternCall(x), None);
+                let callee = self.module.add(Node::ExternCall(x, ret_ty), None);
                 self.module.replace(
                     val,
                     Node::Fun(Function {

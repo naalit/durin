@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ir::*;
 use specs::prelude::*;
@@ -13,6 +13,45 @@ pub enum FunMode {
     CPS,
     /// Stores the parent
     Block(Val),
+}
+
+/// Returns all functions that `v` depends on the parameters of, and so must be within, recursively.
+pub fn dependencies(v: Val, slots: &ReadStorage<Slot>) -> Vec<Val> {
+    fn go(slots: &ReadStorage<Slot>, v: Val, seen: &mut HashSet<Val>, acc: &mut HashSet<Val>) {
+        let v = slots.unredirect(v);
+        match slots.node(v).unwrap() {
+            Node::Param(f, _) => {
+                if seen.contains(f) {
+                } else {
+                    match slots.node(*f).unwrap() {
+                        Node::Fun(Function { .. }) => {
+                            acc.insert(*f);
+                        }
+                        // Parameters of pi or sigma types don't count
+                        Node::FunType(_) | Node::ProdType(_) => (),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            n @ Node::Fun(_) => {
+                if !seen.contains(&v) {
+                    seen.insert(v);
+                    for i in n.runtime_args() {
+                        go(slots, i, seen, acc)
+                    }
+                    seen.remove(&v);
+                }
+            }
+            n => {
+                for i in n.runtime_args() {
+                    go(slots, i, seen, acc)
+                }
+            }
+        }
+    }
+    let mut acc = HashSet::new();
+    go(slots, v, &mut HashSet::new(), &mut acc);
+    acc.into_iter().collect()
 }
 
 impl<'a> System<'a> for SSA {
@@ -53,6 +92,15 @@ impl<'a> System<'a> for SSA {
                     _ => None,
                 })
                 .unzip();
+        // for v in entities.join() {
+        //     if slots.fun(v).is_some() {
+        //         for i in dependencies(v, &slots) {
+        //             if can_be_block[&i] {
+        //                 uses.entry(i).or_default().push(v);
+        //             }
+        //         }
+        //     }
+        // }
 
         let mut parents: HashMap<Val, Val> = HashMap::new();
 
@@ -274,7 +322,7 @@ fn try_stack_call(
             true
         }
         // If it's calling an extern function, it calls the passed continuation
-        Node::ExternCall(_) | Node::Ref(_) => {
+        Node::ExternCall(_, _) | Node::Ref(_, _) => {
             try_stack_call(*call_args.last().unwrap(), cont, &[], reqs, blocks, slots)
         }
         // Unreachable and Stop don't call any other functions
