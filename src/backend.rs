@@ -145,6 +145,48 @@ impl<'cxt> Cxt<'cxt> {
         )
     }
 
+    pub fn if_expr(&self, cond: IntValue<'cxt>, fthen: impl FnOnce() -> BasicValueEnum<'cxt>, felse: impl FnOnce() -> BasicValueEnum<'cxt>) -> BasicValueEnum<'cxt> {
+        let bstart = self.builder.get_insert_block().unwrap();
+        let bthen = self.cxt.insert_basic_block_after(bstart, "if.then");
+        let belse = self.cxt.insert_basic_block_after(bthen, "if.else");
+        let bmerge = self.cxt.insert_basic_block_after(belse, "if.merge");
+
+        self.builder.build_conditional_branch(cond, bthen, belse);
+
+        self.builder.position_at_end(bthen);
+        let pthen = fthen();
+        self.builder.build_unconditional_branch(bmerge);
+
+        self.builder.position_at_end(belse);
+        let pelse = felse();
+        self.builder.build_unconditional_branch(bmerge);
+
+        self.builder.position_at_end(bmerge);
+        let phi = self.builder.build_phi(pthen.get_type(), "if.phi");
+        phi.add_incoming(&[(&pthen, bthen), (&pelse, belse)]);
+
+        phi.as_basic_value()
+    }
+
+    pub fn if_stmt(&self, cond: IntValue<'cxt>, fthen: impl FnOnce(), felse: impl FnOnce()) {
+        let bstart = self.builder.get_insert_block().unwrap();
+        let bthen = self.cxt.insert_basic_block_after(bstart, "if.then");
+        let belse = self.cxt.insert_basic_block_after(bthen, "if.else");
+        let bmerge = self.cxt.insert_basic_block_after(belse, "if.merge");
+
+        self.builder.build_conditional_branch(cond, bthen, belse);
+
+        self.builder.position_at_end(bthen);
+        fthen();
+        self.builder.build_unconditional_branch(bmerge);
+
+        self.builder.position_at_end(belse);
+        felse();
+        self.builder.build_unconditional_branch(bmerge);
+
+        self.builder.position_at_end(bmerge);
+    }
+
     pub fn new(cxt: &'cxt Context, machine: &'cxt TargetMachine) -> Self {
         let module = cxt.create_module("main");
 
@@ -563,7 +605,7 @@ impl<'cxt> Cxt<'cxt> {
         &self,
         ty: &Type<'cxt>,
         from: PointerValue<'cxt>,
-        _slots: &ReadStorage<Slot>,
+        slots: &ReadStorage<Slot>,
     ) -> BasicValueEnum<'cxt> {
         match ty {
             // Actually load
@@ -586,10 +628,27 @@ impl<'cxt> Cxt<'cxt> {
                 self.builder.build_load(from, "load")
             }
 
-            // Leave it, it's a pointer anyway
-            // TODO: we probably will need to reallocate and copy for GC reasons, or maybe mutable ref reasons
             Type::Unknown(_) | Type::Unknown2(_) | Type::PtrStruct(_) | Type::PtrEnum(_) => {
-                from.as_basic_value_enum()
+                let size = ty.runtime_size(self, slots);
+                let fits = self.builder.build_int_compare(IntPredicate::ULE, size, self.size_ty().const_int(8, false), "fits_in_word");
+                self.if_expr(fits, || {
+                    // It's represented by a bitcasted something else on the stack, not just a pointer
+                    // So load it from the pointer
+                    let lty = ty.llvm_ty(self);
+                    let from = self
+                        .builder
+                        .build_bitcast(
+                            from,
+                            lty.ptr_type(AddressSpace::Generic),
+                            "casted_load_slot",
+                        )
+                        .into_pointer_value();
+                    self.builder.build_load(from, "load")
+                }, || {
+                    // Leave it, it's a pointer anyway
+                    // TODO: we probably will need to reallocate and copy for GC reasons, or maybe mutable ref reasons
+                    from.as_basic_value_enum()
+                })
             }
         }
     }
@@ -620,13 +679,25 @@ impl<'cxt> Cxt<'cxt> {
                 self.builder.build_store(to, from);
             }
 
-            // Copy
             Type::Unknown(_) | Type::Unknown2(_) | Type::PtrStruct(_) | Type::PtrEnum(_) => {
                 let size = ty.runtime_size(self, slots);
-                let align = ty.alignment().max(1);
-                self.builder
-                    .build_memcpy(to, align, from.into_pointer_value(), align, size)
-                    .unwrap();
+                let fits = self.builder.build_int_compare(IntPredicate::ULE, size, self.size_ty().const_int(8, false), "fits_in_word");
+                self.if_stmt(fits, || {
+                    // It's represented by a bitcasted something else on the stack, not just a pointer
+                    // So just store the pointer
+                    let lty = from.get_type();
+                    let to = self
+                        .builder
+                        .build_bitcast(to, lty.ptr_type(AddressSpace::Generic), "casted_store_slot")
+                        .into_pointer_value();
+                    self.builder.build_store(to, from);
+                }, || {
+                    // Copy the data this points to to the new location
+                    let align = ty.alignment().max(1);
+                    self.builder
+                        .build_memcpy(to, align, from.into_pointer_value(), align, size)
+                        .unwrap();
+                })
             }
         }
     }
@@ -651,14 +722,23 @@ impl<'cxt> Cxt<'cxt> {
             // LLVM will figure out the most efficient way to do it
             Node::Proj(ty, x, idx) => {
                 let ty = self.as_type(*ty, slots);
-                match ty {
+                match &ty {
                     Type::StackStruct(_) => {
                         // Just do a load+store
                         let v = self.gen_value(val, slots);
                         self.store(vty, v, ptr, slots);
                     }
                     Type::PtrStruct(v) => {
-                        let mut ptr2 = self.gen_value(*x, slots).into_pointer_value();
+                        // TODO only compute the size once, and use bitwise and instead of alloca
+                        let size = ty.runtime_size(self, slots);
+                        let fits = self.builder.build_int_compare(IntPredicate::ULE, size, self.size_ty().const_int(8, false), "fits_in_word");
+                        let val = self.gen_value(*x, slots);
+                        let mut ptr2 = self.if_expr(fits, || {
+                            // If it fits in a word, put it in an alloca so we can still work with a pointer
+                            let ptr2 = self.builder.build_alloca(self.any_ty(), "proj_slot");
+                            self.builder.build_store(ptr2, val);
+                            ptr2.as_basic_value_enum()
+                        }, || val).into_pointer_value();
 
                         let mut size = self.size_ty().const_zero();
                         for (i, ty) in v.iter().enumerate() {
@@ -688,7 +768,6 @@ impl<'cxt> Cxt<'cxt> {
                             }
                             size = self.builder.build_int_add(size, x, "struct_size");
                         }
-                        unreachable!("index out of bounds")
                     }
                     _ => unreachable!(),
                 }
@@ -704,29 +783,38 @@ impl<'cxt> Cxt<'cxt> {
 
                 match &vty {
                     Type::StackEnum(_, v) | Type::PtrEnum(v) => {
-                        let align = v.iter().map(|t| t.alignment()).max().unwrap_or(0);
-                        let tag = tag_bytes(v.len());
-                        if tag != 0 {
-                            let tag = tag.max(align);
-                            let tag = tag * 8;
-                            let tag = self.cxt.custom_width_int_type(tag);
-                            let tag_slot = self.builder.build_bitcast(
-                                ptr,
-                                tag.ptr_type(AddressSpace::Generic),
-                                "tag_slot",
-                            );
-                            let tag = tag.const_int(*i as u64, false).as_basic_value_enum();
-                            self.builder.build_store(tag_slot.into_pointer_value(), tag);
-                        }
+                        let size = vty.runtime_size(self, slots);
+                        let fits = self.builder.build_int_compare(IntPredicate::ULE, size, self.size_ty().const_int(8, false), "fits_in_word");
 
-                        let payload_slot = unsafe {
-                            self.builder.build_in_bounds_gep(
-                                ptr,
-                                &[self.size_ty().const_int(tag.into(), false)],
-                                "payload_slot",
-                            )
-                        };
-                        self.gen_at(*payload, &v[*i], payload_slot, slots);
+                        self.if_stmt(fits, || {
+                            // Just do a load+store
+                            let v = self.gen_value(val, slots);
+                            self.store(vty, v, ptr, slots);
+                        }, || {
+                            let align = v.iter().map(|t| t.alignment()).max().unwrap_or(0);
+                            let tag = tag_bytes(v.len());
+                            if tag != 0 {
+                                let tag = tag.max(align);
+                                let tag = tag * 8;
+                                let tag = self.cxt.custom_width_int_type(tag);
+                                let tag_slot = self.builder.build_bitcast(
+                                    ptr,
+                                    tag.ptr_type(AddressSpace::Generic),
+                                    "tag_slot",
+                                );
+                                let tag = tag.const_int(*i as u64, false).as_basic_value_enum();
+                                self.builder.build_store(tag_slot.into_pointer_value(), tag);
+                            }
+    
+                            let payload_slot = unsafe {
+                                self.builder.build_in_bounds_gep(
+                                    ptr,
+                                    &[self.size_ty().const_int(tag.into(), false)],
+                                    "payload_slot",
+                                )
+                            };
+                            self.gen_at(*payload, &v[*i], payload_slot, slots);
+                        })
                     }
                     _ => unreachable!(),
                 }
@@ -752,23 +840,31 @@ impl<'cxt> Cxt<'cxt> {
                         size = self.builder.build_int_add(size, x, "struct_size");
                     }
 
-                    let mut next = ptr;
-                    for (&val, (ty, size, padding)) in values.iter().zip(padding) {
-                        if let Some(padding) = padding {
+                    let fits = self.builder.build_int_compare(IntPredicate::ULE, size, self.size_ty().const_int(8, false), "fits_in_word");
+
+                    self.if_stmt(fits, || {
+                        // Just do a load+store
+                        let v = self.gen_value(val, slots);
+                        self.store(vty, v, ptr, slots);
+                    }, || {  
+                        let mut next = ptr;
+                        for (&val, (ty, size, padding)) in values.iter().zip(padding) {
+                            if let Some(padding) = padding {
+                                next = unsafe {
+                                    self.builder.build_in_bounds_gep(
+                                        next,
+                                        &[padding],
+                                        "member_slot_padded",
+                                    )
+                                };
+                            }
+                            self.gen_at(val, &ty, next, slots);
                             next = unsafe {
-                                self.builder.build_in_bounds_gep(
-                                    next,
-                                    &[padding],
-                                    "member_slot_padded",
-                                )
+                                self.builder
+                                    .build_in_bounds_gep(next, &[size], "next_member_slot")
                             };
                         }
-                        self.gen_at(val, &ty, next, slots);
-                        next = unsafe {
-                            self.builder
-                                .build_in_bounds_gep(next, &[size], "next_member_slot")
-                        };
-                    }
+                    })
                 }
                 _ => unreachable!(),
             },
@@ -891,7 +987,7 @@ impl<'cxt> Cxt<'cxt> {
                 .as_basic_value_enum(),
             Node::Proj(ty, x, idx) => {
                 let ty = self.as_type(*ty, slots);
-                match ty {
+                match &ty {
                     Type::StackStruct(_) => {
                         let x = self.try_gen_value(*x, slots)?.into_struct_value();
                         self.builder
@@ -899,7 +995,16 @@ impl<'cxt> Cxt<'cxt> {
                             .unwrap()
                     }
                     Type::PtrStruct(v) => {
-                        let mut ptr = self.try_gen_value(*x, slots)?.into_pointer_value();
+                        // TODO only compute the size once, and use bitwise and instead of alloca
+                        let val = self.try_gen_value(*x, slots)?;
+                        let size = ty.runtime_size(self, slots);
+                        let fits = self.builder.build_int_compare(IntPredicate::ULE, size, self.size_ty().const_int(8, false), "fits_in_word");
+                        let mut ptr = self.if_expr(fits, || {
+                            // If it fits in a word, put it in an alloca so we can still work with a pointer
+                            let ptr = self.builder.build_alloca(self.any_ty(), "proj_slot");
+                            self.builder.build_store(ptr, val);
+                            self.builder.build_bitcast(ptr, self.any_ty(), "proj_slot_casted")
+                        }, || val).into_pointer_value();
 
                         let mut size = self.size_ty().const_zero();
                         for (i, ty) in v.iter().enumerate() {
@@ -970,6 +1075,7 @@ impl<'cxt> Cxt<'cxt> {
                             self.size_ty().const_int(tag.into(), false),
                             "sum_type_size",
                         );
+                        let fits = self.builder.build_int_compare(IntPredicate::ULE, size, self.size_ty().const_int(8, false), "fits_in_word");
                         let malloc = match &ty {
                             Type::StackEnum(_, _) => {
                                 let alloca = self.builder.build_array_alloca(
@@ -984,10 +1090,18 @@ impl<'cxt> Cxt<'cxt> {
                                     .unwrap();
                                 alloca
                             }
-                            Type::PtrEnum(_) => self
-                                .builder
-                                .build_array_malloc(self.cxt.i8_type(), size, "sum_type_malloc")
-                                .unwrap(),
+                            Type::PtrEnum(_) => {
+                                self.if_expr(fits, || {
+                                    let alloca = self.builder.build_alloca(self.any_ty(), "sum_type_bitcast_slot");
+                                    self.builder.build_bitcast(alloca, self.any_ty(), "sum_type_slot")
+                                }, || {
+                                    self
+                                        .builder
+                                        .build_array_malloc(self.cxt.i8_type(), size, "sum_type_malloc")
+                                        .unwrap()
+                                        .as_basic_value_enum()
+                                }).into_pointer_value()
+                            }
                             _ => unreachable!(),
                         };
 
@@ -1025,7 +1139,14 @@ impl<'cxt> Cxt<'cxt> {
                                     .build_load(malloc.into_pointer_value(), "sum_type")
                             }
                             // Just return the pointer
-                            Type::PtrEnum(_) => malloc.as_basic_value_enum(),
+                            Type::PtrEnum(_) => {
+                                self.if_expr(fits, || {
+                                    let ptr = self.builder.build_bitcast(malloc, self.any_ty().ptr_type(AddressSpace::Generic), "sum_type_bitcast_slot_again").into_pointer_value();
+                                    self.builder.build_load(ptr, "sum_type_as_word")
+                                }, || {
+                                    malloc.as_basic_value_enum()
+                                })
+                            }
                             _ => unreachable!(),
                         }
                     }
@@ -1063,10 +1184,17 @@ impl<'cxt> Cxt<'cxt> {
                             size = self.builder.build_int_add(size, x, "struct_size");
                         }
 
-                        let malloc = self
-                            .builder
-                            .build_array_malloc(self.cxt.i8_type(), size, "struct_malloc")
-                            .unwrap();
+                        let fits = self.builder.build_int_compare(IntPredicate::ULE, size, self.size_ty().const_int(8, false), "fits_in_word");
+                        let malloc = self.if_expr(fits, || {
+                            let alloca = self.builder.build_alloca(self.any_ty(), "struct_bitcast_slot");
+                            self.builder.build_bitcast(alloca, self.any_ty(), "struct_slot")
+                        }, || {
+                            self
+                                .builder
+                                .build_array_malloc(self.cxt.i8_type(), size, "struct_malloc")
+                                .unwrap()
+                                .as_basic_value_enum()
+                        }).into_pointer_value();
 
                         let mut next = malloc;
                         for (&val, (ty, size, padding)) in values.iter().zip(padding) {
@@ -1086,7 +1214,12 @@ impl<'cxt> Cxt<'cxt> {
                             };
                         }
 
-                        malloc.as_basic_value_enum()
+                        self.if_expr(fits, || {
+                            let ptr = self.builder.build_bitcast(malloc, self.any_ty().ptr_type(AddressSpace::Generic), "struct_bitcast_slot_again").into_pointer_value();
+                            self.builder.build_load(ptr, "struct_as_word")
+                        }, || {
+                            malloc.as_basic_value_enum()
+                        })
                     }
                     _ => unreachable!(),
                 }

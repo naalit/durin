@@ -1,0 +1,5 @@
+fun main () = main2 I32 3i32;
+
+fun main2 (T : Type, x : T) = refnew T main3;
+fun main3 (r : ref T) = refset T r x main4;
+fun main4 () = stop;
