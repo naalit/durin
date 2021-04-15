@@ -33,18 +33,13 @@ pub fn dependencies(v: Val, slots: &ReadStorage<Slot>) -> Vec<Val> {
                     }
                 }
             }
-            n @ Node::Fun(_) => {
+            n => {
                 if !seen.contains(&v) {
                     seen.insert(v);
                     for i in n.runtime_args() {
                         go(slots, i, seen, acc)
                     }
                     seen.remove(&v);
-                }
-            }
-            n => {
-                for i in n.runtime_args() {
-                    go(slots, i, seen, acc)
                 }
             }
         }

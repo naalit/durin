@@ -121,18 +121,13 @@ pub trait Slots {
                         }
                     }
                 }
-                n @ Node::Fun(_) => {
+                n => {
                     if !seen.contains(&v) {
                         seen.insert(v);
                         for i in n.runtime_args() {
                             go(m, i, seen, acc)
                         }
                         seen.remove(&v);
-                    }
-                }
-                n => {
-                    for i in n.runtime_args() {
-                        go(m, i, seen, acc)
                     }
                 }
             }
@@ -582,18 +577,17 @@ impl Node {
                 .copied()
                 .chain(std::iter::once(*callee))
                 .collect(),
-            Node::Product(_, v) => v.to_smallvec(),
-            Node::ProdType(v) => v.clone(),
-            Node::BinOp(_, a, b) => smallvec![*a, *b],
+            Node::Product(t, v) => v.iter().copied().chain(std::iter::once(*t)).collect(),
+            Node::ProdType(v) | Node::SumType(v) => v.clone(),
+            Node::BinOp(_, a, b) | Node::Proj(a, b, _) => smallvec![*a, *b],
             Node::IfCase(_, x)
-            | Node::Proj(_, x, _)
             | Node::Inj(_, _, x)
             | Node::If(x)
             | Node::RefTy(x)
             | Node::ExternCall(x, _) => {
                 smallvec![*x]
             }
-            Node::FunType(_) | Node::SumType(_) => SmallVec::new(),
+            Node::FunType(_) => SmallVec::new(),
             Node::ExternFun(_, _, _) | Node::ExternFunType(_, _) => SmallVec::new(),
             Node::Const(_) => SmallVec::new(),
             // `f` not being known at runtime doesn't really make sense

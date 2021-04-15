@@ -35,7 +35,7 @@ macro_rules! run {
             };
             run_file(&input)
         }
-    }
+    };
 }
 
 /// For the generated code to call
@@ -56,7 +56,7 @@ fn run_file(source: &str) {
     let s = s.to_str().unwrap();
     l.verify().unwrap();
     println!("{}", s);
-    
+
     // The main function is tailcc, so generate a ccc wrapper function which just calls it
     let cxt = &backend.cxt;
     let main_fun = l.get_function("main").expect("No main function");
