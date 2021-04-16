@@ -1076,7 +1076,9 @@ impl<'cxt> Cxt<'cxt> {
                     unknown,
                     env,
                     ..
-                } = functions.get(&val).unwrap();
+                } = functions
+                    .get(&val)
+                    .unwrap_or_else(|| panic!("Couldn't find fun {}", val.id()));
 
                 // Create the environment struct, then store it in an alloca and bitcast the pointer to i8*
                 // TODO use `gen_at()`
@@ -1906,14 +1908,14 @@ impl<'cxt> Cxt<'cxt> {
         // Collect all functions and their blocks
         let mut to_gen: HashMap<Val, VecDeque<(Val, crate::ir::Function)>> = HashMap::new();
         let mut stack_enabled = HashMap::new();
-        for (v, &mode) in (entities, modes).join() {
+        for (v, mode) in (entities, modes).join() {
             match mode {
                 FunMode::SSA(cont) => {
                     to_gen
                         .entry(v)
                         .or_default()
                         .push_front((v, slots.fun(v).unwrap().clone()));
-                    stack_enabled.insert(v, cont);
+                    stack_enabled.insert(v, *cont);
                 }
                 FunMode::CPS => {
                     to_gen
@@ -1923,7 +1925,7 @@ impl<'cxt> Cxt<'cxt> {
                 }
                 FunMode::Block(parent) => {
                     to_gen
-                        .entry(parent)
+                        .entry(*parent)
                         .or_default()
                         .push_back((v, slots.fun(v).unwrap().clone()));
                 }
@@ -1940,6 +1942,7 @@ impl<'cxt> Cxt<'cxt> {
                 let cont = cont.and_then(|&cont| {
                     let u = uses.get(cont).unwrap();
                     if u.is_empty() {
+                        eprintln!("durin/warning: could not deduce continuation type (no uses)");
                         None
                     } else {
                         let u = u.clone();
@@ -1958,6 +1961,7 @@ impl<'cxt> Cxt<'cxt> {
                             };
                             return Some((cont, ty));
                         }
+                        eprintln!("durin/warning: could not deduce continuation type (no calls)");
                         None
                     }
                 });
@@ -2150,15 +2154,25 @@ impl<'cxt> Cxt<'cxt> {
             for (bval, bfun) in blocks {
                 let name = format!("{}${}", val.name_or_num(names), bval.name_or_num(names));
                 let block = self.cxt.append_basic_block(*fun, &name);
+                let cont_num = modes
+                    .get(*bval)
+                    .filter(|m| matches!(m, FunMode::SSA(_)))
+                    .map(|_| bfun.params.len() - 1);
+
                 let mut params = Vec::new();
                 let mut param_tys = Vec::new();
                 for (i, &ty) in bfun.params.iter().enumerate() {
-                    let ty = self.as_type(ty, slots, uses);
-                    let lty = ty.llvm_ty(self);
-                    let name = bval.param_name(i as u8, uses, slots, names);
-                    let param = self.builder.build_alloca(lty, &name);
-                    params.push(param);
-                    param_tys.push(ty);
+                    if Some(i) == cont_num {
+                        // Don't allocate the continuation parameter
+                        break;
+                    } else {
+                        let ty = self.as_type(ty, slots, uses);
+                        let lty = ty.llvm_ty(self);
+                        let name = bval.param_name(i as u8, uses, slots, names);
+                        let param = self.builder.build_alloca(lty, &name);
+                        params.push(param);
+                        param_tys.push(ty);
+                    }
                 }
                 self.blocks
                     .borrow_mut()

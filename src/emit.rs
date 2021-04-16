@@ -144,9 +144,9 @@ impl ValPretty for Val {
             .copied()
             .collect();
         if name.len() == 1 && !uses.get(name[0]).unwrap().is_empty() {
-            format!("{}: ", self.name_or_num(names))
+            format!("{}", name[0].name_or_num(names))
         } else if name.len() > 1 {
-            format!("{}.{}: ", self.name_or_num(names), pnum)
+            format!("{}.{}", self.name_or_num(names), pnum)
         } else {
             String::new()
         }

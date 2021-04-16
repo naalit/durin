@@ -11,8 +11,10 @@ fun else2 () = next2 c;
 
 fun next2 (r : I1) = rcont r;
 
-fun curry (cont: fun 1) = curry cont;
+fun curry (cont: fun 1) = cont curry_c;
+fun curry_c (z: fun 0) = z;
 fun do_something (cont: fun 0) = cont;
+
 # let f = curry(); do_something(); f();
 fun one (ocont: fun 0) = curry two;
 fun two (f: fun 1) = do_something three;

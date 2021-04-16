@@ -6,47 +6,13 @@ use specs::Component;
 
 pub struct SSA;
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Component)]
+#[derive(Clone, PartialEq, Eq, Debug, Component)]
 pub enum FunMode {
     /// Stores the continuation
     SSA(Val),
     CPS,
     /// Stores the parent
     Block(Val),
-}
-
-/// Returns all functions that `v` depends on the parameters of, and so must be within, recursively.
-pub fn dependencies(v: Val, slots: &ReadStorage<Slot>) -> Vec<Val> {
-    fn go(slots: &ReadStorage<Slot>, v: Val, seen: &mut HashSet<Val>, acc: &mut HashSet<Val>) {
-        let v = slots.unredirect(v);
-        match slots.node(v).unwrap() {
-            Node::Param(f, _) => {
-                if seen.contains(f) {
-                } else {
-                    match slots.node(*f).unwrap() {
-                        Node::Fun(Function { .. }) => {
-                            acc.insert(*f);
-                        }
-                        // Parameters of pi or sigma types don't count
-                        Node::FunType(_) | Node::ProdType(_) => (),
-                        _ => unreachable!(),
-                    }
-                }
-            }
-            n => {
-                if !seen.contains(&v) {
-                    seen.insert(v);
-                    for i in n.runtime_args() {
-                        go(slots, i, seen, acc)
-                    }
-                    seen.remove(&v);
-                }
-            }
-        }
-    }
-    let mut acc = HashSet::new();
-    go(slots, v, &mut HashSet::new(), &mut acc);
-    acc.into_iter().collect()
 }
 
 impl<'a> System<'a> for SSA {
@@ -64,38 +30,72 @@ impl<'a> System<'a> for SSA {
     fn run(&mut self, (entities, uses_comp, slots, mut modes): Self::SystemData) {
         // Stage 1: figure out which functions are blocks of which others
 
-        let (mut can_be_block, mut uses): (HashMap<Val, bool>, HashMap<Val, Vec<Val>>) =
-            (&entities, &slots, &uses_comp)
-                .join()
-                .filter_map(|(v, slot, uses)| match slot {
-                    Slot::Full(Node::Fun(_)) => {
-                        // It can only be a block if all uses are direct calls
-                        let mut block = true;
-                        let mut uses2 = Vec::new();
-                        for &i in &**uses {
-                            match slots.node(i).unwrap() {
-                                Node::Fun(Function { callee, .. }) if *callee == v => uses2.push(i),
-                                Node::Param(_, _) => (),
+        let mut not_block = Vec::new();
+        let (mut can_be_block, mut uses, mut ssa_reqs) = (&entities, &slots, &uses_comp)
+            .join()
+            .filter_map(|(v, slot, uses)| match slot {
+                Slot::Full(Node::Fun(_)) => {
+                    // It can only be a block if all uses are direct calls
+                    let mut block = true;
+                    let mut uses2 = Vec::new();
+                    let mut ssa_reqs = Vec::new();
+                    for &i in &**uses {
+                        match slots.node(i).unwrap() {
+                            Node::Fun(Function {
+                                callee, call_args, ..
+                            }) => match slots.node(*callee).unwrap() {
+                                _ if *callee == v => uses2.push(i),
+                                Node::If(_) | Node::IfCase(_, _) | Node::Ref(_, _) => uses2.push(i),
+                                Node::ExternCall(_, _) if *call_args.last().unwrap() == v => {
+                                    uses2.push(i)
+                                }
+                                Node::Fun(_) if *call_args.last().unwrap() == v => {
+                                    uses2.push(i);
+                                    ssa_reqs.push(slots.unredirect(*callee));
+                                }
                                 _ => {
                                     block = false;
                                     break;
                                 }
+                            },
+                            Node::Param(_, _) => (),
+                            _ => {
+                                block = false;
+                                break;
                             }
                         }
-                        Some(((v, block), (v, if block { uses2 } else { Vec::new() })))
                     }
-                    _ => None,
-                })
-                .unzip();
-        // for v in entities.join() {
-        //     if slots.fun(v).is_some() {
-        //         for i in dependencies(v, &slots) {
-        //             if can_be_block[&i] {
-        //                 uses.entry(i).or_default().push(v);
-        //             }
-        //         }
-        //     }
-        // }
+                    Some((
+                        v,
+                        block,
+                        if block {
+                            // If this requires something to be SSA, then that can't be a block
+                            // Either way something isn't a block, and this is generally a better idea
+                            not_block.extend(ssa_reqs.iter().copied());
+                            uses2
+                        } else {
+                            Vec::new()
+                        },
+                        ssa_reqs,
+                    ))
+                }
+                _ => None,
+            })
+            .fold(
+                (HashMap::new(), HashMap::new(), HashMap::new()),
+                |(mut ha, mut hb, mut hc), (k, a, b, c)| {
+                    ha.insert(k, a);
+                    hb.insert(k, b);
+                    hc.insert(k, c);
+                    (ha, hb, hc)
+                },
+            );
+        for i in not_block {
+            if can_be_block.get(&i).copied().unwrap_or(false) {
+                can_be_block.insert(i, false);
+                uses.insert(i, Vec::new());
+            }
+        }
 
         let mut parents: HashMap<Val, Val> = HashMap::new();
 
@@ -142,6 +142,10 @@ impl<'a> System<'a> for SSA {
 
                             // if it has no uses, use its parent and remove it from uses
                             if uses[&j].iter().all(|&x| rec(x, i, &uses)) {
+                                // if j doesn't end up being a block, this can't either since j uses this
+                                let mut ssa_reqs_j = ssa_reqs[&j].clone();
+                                ssa_reqs.get_mut(&i).unwrap().append(&mut ssa_reqs_j);
+
                                 uses.get_mut(&i).unwrap().retain(|&x| x != j);
                                 if let Some(&pj) = parents.get(&j).or(parents.get(&i)) {
                                     parents.insert(j, pj);
@@ -208,7 +212,11 @@ impl<'a> System<'a> for SSA {
                         }
                         _ => None,
                     };
-                    cont.filter(|&cont| !uses_comp.get(cont).unwrap().is_empty())
+                    cont.filter(|&cont| {
+                        let cuses = uses_comp.get(cont).unwrap();
+                        !cuses.is_empty()
+                        && cuses.iter().all(|&i| matches!(slots.node(i), Some(Node::Fun(Function { callee, .. })) if *callee == cont))
+                    })
                         .and_then(|cont| {
                             let mut reqs = Vec::new();
                             if try_stack_call(v, cont, &[], &mut reqs, &can_be_block, &slots) {
@@ -278,7 +286,11 @@ impl<'a> System<'a> for SSA {
 
         // Stage 3: set the FunModes appropriately
 
-        for (v, is_block) in can_be_block {
+        for (&v, &is_block) in &can_be_block {
+            let is_block = is_block
+                && ssa_reqs[&v]
+                    .iter()
+                    .all(|f| reqs.contains_key(f) && !can_be_block[&f]);
             let mode = if is_block {
                 FunMode::Block(*parents.get(&v).unwrap())
             } else if reqs.contains_key(&v) {
