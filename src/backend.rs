@@ -413,6 +413,27 @@ impl<'cxt> Type<'cxt> {
         }
     }
 
+    /// Whether this value would contain a pointer if allocated on the stack
+    fn has_ptr(&self) -> bool {
+        match self {
+            Type::Pointer => true,
+            Type::PtrStruct(_) => true,
+            Type::PtrEnum(_) => true,
+            Type::Unknown(_) => true,
+            Type::Unknown2(_) => true,
+            Type::Closure(_) => true,
+            Type::Type => true,
+
+            Type::Int(_) => false,
+            Type::ExternFun(_, _) => false,
+
+            // Stack structs and enums can't have pointers in them
+            // That's because LLVM can't see pointers inside of structs
+            Type::StackStruct(_) => false,
+            Type::StackEnum(_, _) => false,
+        }
+    }
+
     fn llvm_ty(&self, cxt: &Cxt<'cxt>) -> BasicTypeEnum<'cxt> {
         match self {
             Type::StackStruct(v) => {
@@ -521,6 +542,30 @@ enum LastType {
     VariantEnd(usize),
 }
 
+// Type information is structured as a 16-bit size of the type in bytes, 16-bit size of the type info in bytes, then a number of 32-bit *entries*, one after another.
+// They can be one of 3 (4 including arrays to add later) types:
+//
+// 0..0 0..0 00 0
+// ---- ---- -- - whether there's another struct member after this
+// |    |    |
+// |    |    00 is the type for a bitset of up to 24 words
+// |    5-bit number of words in this bitset
+// 24-bit bitset
+//
+// 0..0 0..0 000 01 0
+// ---- ---- --- -- - whether there's another struct member after this
+// |    |    |   |
+// |    |    |   01 is the type for a case split
+// |    |    3-bit size of the tag in bytes (up to 8)
+// |    10-bit offset of the tag in bytes from the end of the last entry
+// 16-bit number of variants
+//
+// 0....0 0 10 0
+// ------ - -- - whether there's another struct member after this
+// |      | |
+// |      | 10 is the type for a run-length encoding
+// |      whether the words in this run are pointers
+// 28-bit size of the run in words
 struct TyInfo<'cxt> {
     run_words: Vec<bool>,
     variant_stack: Vec<usize>,
@@ -853,15 +898,21 @@ impl<'cxt> Cxt<'cxt> {
                 }).collect();
 
                 // It's a StackStruct if the part we would put on the stack is smaller than STACK_THRESHOLD bytes
+                let mut is_static = true;
                 let mut static_size = 0;
                 for (_, i) in &v {
+                    // If it has a pointer, it needs to be heap-allocated, because LLVM can't see pointers inside of structs for GC purposes
+                    if i.has_ptr() {
+                        is_static = false;
+                        break;
+                    }
                     let align = i.alignment();
                     if align > 0 {
                         static_size += padding(static_size, align);
                     }
                     static_size += i.stack_size().unwrap_or(0);
                 }
-                if static_size <= STACK_THRESHOLD {
+                if is_static && static_size <= STACK_THRESHOLD {
                     Type::StackStruct(v)
                 } else {
                     Type::PtrStruct(v)
@@ -879,6 +930,11 @@ impl<'cxt> Cxt<'cxt> {
                 let mut payload = 0;
                 let mut align = 0;
                 for i in &v {
+                    // If it has a pointer, it needs to be heap-allocated, because LLVM can't see pointers inside of structs for GC purposes
+                    if i.has_ptr() {
+                        is_static = false;
+                        break;
+                    }
                     let size = i.stack_size().unwrap_or_else(|| {
                         is_static = false;
                         0
