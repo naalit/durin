@@ -1,7 +1,6 @@
-use super::Cxt;
-use crate::ir::{Constant, Node, Slot, Slots, Uses, Val};
+use super::{Cxt, Data};
+use crate::ir::{Constant, Node, Slots, Val};
 use inkwell::{types::*, values::*, AddressSpace, IntPredicate};
-use specs::prelude::*;
 use std::{collections::VecDeque, convert::TryInto};
 
 /// The number of bytes we're willing to copy around freely on the stack.
@@ -115,26 +114,21 @@ impl<'cxt> Type<'cxt> {
                 Some(tag + payload)
             }
             Type::Unknown(_) | Type::Unknown2(_) => None,
-            Type::Int(bits) => Some(bits / 8),
-            // TODO should we ever unbox closures?
-            Type::Closure(_) => Some(16),
+            // Round up - an i1 should be 1 byte, not 0
+            Type::Int(bits) => Some((bits + 7) / 8),
+            Type::Closure(_) => Some(8),
             Type::ExternFun(_, _) => Some(8),
             Type::Type => Some(8),
             Type::Pointer => Some(8),
         }
     }
 
-    pub fn heap_size(
-        &self,
-        cxt: &Cxt<'cxt>,
-        slots: &ReadStorage<Slot>,
-        uses: &ReadStorage<Uses>,
-    ) -> IntValue<'cxt> {
+    pub fn heap_size(&self, cxt: &Cxt<'cxt>, data: &Data) -> IntValue<'cxt> {
         match self {
             Type::StackStruct(v) | Type::PtrStruct(v) => {
                 let mut size = cxt.size_ty().const_zero();
                 for (_, i) in v {
-                    let x = i.heap_size(cxt, slots, uses);
+                    let x = i.heap_size(cxt, data);
                     let align = i.alignment();
                     if align > 0 {
                         let padding = cxt.padding_llvm(size, align);
@@ -148,7 +142,7 @@ impl<'cxt> Type<'cxt> {
                 let mut payload = cxt.size_ty().const_zero();
                 let mut align = 0;
                 for i in v {
-                    let size = i.heap_size(cxt, slots, uses);
+                    let size = i.heap_size(cxt, data);
                     let gt = cxt
                         .builder
                         .build_int_compare(IntPredicate::UGT, size, payload, "gt");
@@ -184,8 +178,9 @@ impl<'cxt> Type<'cxt> {
                 cxt.builder
                     .build_int_z_extend(int32, cxt.size_ty(), "size_i64")
             }
-            Type::Unknown2(v) => Type::Unknown(cxt.gen_value(*v, slots, uses).into_pointer_value())
-                .heap_size(cxt, slots, uses),
+            Type::Unknown2(v) => {
+                Type::Unknown(cxt.gen_value(*v, data).into_pointer_value()).heap_size(cxt, data)
+            }
             Type::StackEnum(_, _)
             | Type::Pointer
             | Type::Int(_)
@@ -218,6 +213,17 @@ impl<'cxt> Type<'cxt> {
         }
     }
 
+    /// Whether this value might contain something of unknown size
+    pub fn has_unknown(&self) -> bool {
+        match self {
+            Type::PtrStruct(v) => v.iter().any(|(_, x)| x.has_unknown()),
+            Type::PtrEnum(v) => v.iter().any(Type::has_unknown),
+            Type::Unknown(_) => true,
+            Type::Unknown2(_) => true,
+            _ => false,
+        }
+    }
+
     pub fn llvm_ty(&self, cxt: &Cxt<'cxt>) -> BasicTypeEnum<'cxt> {
         match self {
             Type::StackStruct(v) => {
@@ -242,14 +248,12 @@ impl<'cxt> Type<'cxt> {
             Type::Closure(nargs) => {
                 // Add an argument for the environment
                 let args = vec![cxt.any_ty(); *nargs as usize + 1];
-                let fun_ty = cxt
-                    .cxt
+                // It's a pointer to a function pointer, with the environment after
+                cxt.cxt
                     .void_type()
                     .fn_type(&args, false)
                     .ptr_type(AddressSpace::Generic)
-                    .as_basic_type_enum();
-                cxt.cxt
-                    .struct_type(&[cxt.any_ty(), fun_ty], false)
+                    .ptr_type(AddressSpace::Generic)
                     .as_basic_type_enum()
             }
             Type::ExternFun(v, ret) => ret
@@ -293,11 +297,7 @@ impl<'cxt> Type<'cxt> {
                     info.extra_bytes(*i / 8);
                 }
             }
-            Type::Closure(_) => {
-                // TODO fully boxed closures
-                info.word(true);
-                info.word(false);
-            }
+            Type::Closure(_) => info.word(true),
             Type::ExternFun(_, _) => info.word(false),
             Type::Type => info.word(true),
         }
@@ -689,29 +689,24 @@ impl<'cxt> Cxt<'cxt> {
         )
     }
 
-    pub fn as_type(
-        &self,
-        val: Val,
-        slots: &ReadStorage<Slot>,
-        uses: &ReadStorage<Uses>,
-    ) -> Type<'cxt> {
-        match slots.node(val).unwrap() {
+    pub fn as_type(&self, val: Val, data: &Data) -> Type<'cxt> {
+        match data.slots.node(val).unwrap() {
             Node::FunType(i) => Type::Closure(*i),
             Node::ExternFunType(args, ret) => {
                 let args = args
                     .iter()
-                    .map(|&x| self.as_type(x, slots, uses).llvm_ty(self))
+                    .map(|&x| self.as_type(x, data).llvm_ty(self))
                     .collect();
-                let ret = self.as_type(*ret, slots, uses).llvm_ty(self);
+                let ret = self.as_type(*ret, data).llvm_ty(self);
                 Type::ExternFun(args, ret)
             }
             Node::ProdType(v) => {
-                let val = slots.unredirect(val);
+                let val = data.slots.unredirect(val);
                 let v: Vec<_> = v.iter().enumerate().map(|(i, &x)| {
-                    let ty = self.as_type(x, slots, uses);
-                    let param = uses.get(val).unwrap().iter().find(|&&u| {
-                        matches!(slots.node(u), Some(Node::Param(f, n)) if *f == val && *n as usize == i)
-                            && !uses.get(u).unwrap().is_empty()
+                    let ty = self.as_type(x, data);
+                    let param = data.uses.get(val).unwrap().iter().find(|&&u| {
+                        matches!(data.slots.node(u), Some(Node::Param(f, n)) if *f == val && *n as usize == i)
+                            && !data.uses.get(u).unwrap().is_empty()
                     }).copied();
                     (param, ty)
                 }).collect();
@@ -739,10 +734,10 @@ impl<'cxt> Cxt<'cxt> {
             }
             Node::SumType(v) => {
                 if v.len() == 1 {
-                    return self.as_type(v[0], slots, uses);
+                    return self.as_type(v[0], data);
                 }
 
-                let v: Vec<_> = v.iter().map(|&x| self.as_type(x, slots, uses)).collect();
+                let v: Vec<_> = v.iter().map(|&x| self.as_type(x, data)).collect();
 
                 // It's a StackEnum if it's statically sized, and smaller than STACK_THRESHOLD bytes
                 let mut is_static = true;
@@ -790,7 +785,7 @@ impl<'cxt> Cxt<'cxt> {
                 }
             },
 
-            Node::Param(_, _) | Node::Proj(_, _, _) => match self.try_gen_value(val, slots, uses) {
+            Node::Param(_, _) | Node::Proj(_, _, _) => match self.try_gen_value(val, data) {
                 Some(v) => Type::Unknown(v.into_pointer_value()),
                 None => Type::Unknown2(val),
             },

@@ -21,6 +21,12 @@ pub const CCC: u32 = 0;
 pub const FASTCC: u32 = 8;
 pub const DO_TAIL_CALL: bool = true;
 
+pub struct Data<'a> {
+    slots: ReadStorage<'a, Slot>,
+    uses: ReadStorage<'a, Uses>,
+    entities: Entities<'a>,
+}
+
 /// An owning wrapper around the Inkwell context
 pub struct Backend {
     pub cxt: Context,
@@ -168,12 +174,10 @@ impl<'cxt> Cxt<'cxt> {
     }
 
     pub fn push_val(&self, key: Val, val: BasicValueEnum<'cxt>) {
-        println!("Push {}", key.id());
         self.upvalues.borrow_mut().insert(key, val);
     }
 
     pub fn pop_val(&self, key: Val) {
-        println!("Pop {}", key.id());
         self.upvalues.borrow_mut().remove(&key);
     }
 
@@ -196,8 +200,7 @@ impl<'cxt> Cxt<'cxt> {
         &self,
         ty: &Type<'cxt>,
         val: BasicValueEnum<'cxt>,
-        slots: &ReadStorage<Slot>,
-        uses: &ReadStorage<Uses>,
+        data: &Data,
     ) -> PointerValue<'cxt> {
         match ty {
             // Already a pointer, just do a bitcast to make sure it's the right type
@@ -207,6 +210,7 @@ impl<'cxt> Cxt<'cxt> {
             | Type::Unknown(_)
             | Type::Unknown2(_)
             | Type::Type
+            | Type::Closure(_)
             | Type::ExternFun(_, _) => self
                 .builder
                 .build_bitcast(val, self.any_ty(), "to_any")
@@ -224,13 +228,13 @@ impl<'cxt> Cxt<'cxt> {
             }
 
             // Allocate and call `store`
-            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Closure(_) => {
-                let size = ty.heap_size(self, slots, uses);
+            Type::StackStruct(_) | Type::StackEnum(_, _) => {
+                let size = ty.heap_size(self, data);
                 let malloc = self
                     .builder
                     .build_array_malloc(self.cxt.i8_type(), size, "any_slot")
                     .unwrap();
-                self.store(ty, val, malloc, slots, uses);
+                self.store(ty, val, malloc, data);
                 malloc
             }
         }
@@ -240,8 +244,7 @@ impl<'cxt> Cxt<'cxt> {
         &self,
         ty: &Type<'cxt>,
         ptr: PointerValue<'cxt>,
-        slots: &ReadStorage<Slot>,
-        uses: &ReadStorage<Uses>,
+        data: &Data,
     ) -> BasicValueEnum<'cxt> {
         match ty {
             // Already a pointer, just do a bitcast to make sure it's the right type
@@ -251,6 +254,7 @@ impl<'cxt> Cxt<'cxt> {
             | Type::Unknown(_)
             | Type::Unknown2(_)
             | Type::Type
+            | Type::Closure(_)
             | Type::ExternFun(_, _) => {
                 let lty = ty.llvm_ty(self);
                 self.builder.build_bitcast(ptr, lty, "from_any")
@@ -266,22 +270,14 @@ impl<'cxt> Cxt<'cxt> {
             }
 
             // Load from the pointer
-            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Closure(_) => {
-                self.load(ty, ptr, slots, uses)
-            }
+            Type::StackStruct(_) | Type::StackEnum(_, _) => self.load(ty, ptr, data),
         }
     }
 
     /// Like from_any, but `from` is an actual pointer, not just something pointer-shaped.
     /// Small values that would otherwise be bitcasted to and from pointers will instead be actually loaded.
     /// The inverse of `store`, and also `gen_at`.
-    fn load(
-        &self,
-        ty: &Type<'cxt>,
-        from: PointerValue<'cxt>,
-        slots: &ReadStorage<Slot>,
-        uses: &ReadStorage<Uses>,
-    ) -> BasicValueEnum<'cxt> {
+    fn load(&self, ty: &Type<'cxt>, from: PointerValue<'cxt>, data: &Data) -> BasicValueEnum<'cxt> {
         match ty {
             // Actually load
             Type::Pointer
@@ -315,8 +311,8 @@ impl<'cxt> Cxt<'cxt> {
                             .build_in_bounds_gep(ptr, &[padding], "padded_member_slot")
                     };
 
-                    let member = self.load(ty, ptr, slots, uses);
-                    let isize = ty.heap_size(self, slots, uses);
+                    let member = self.load(ty, ptr, data);
+                    let isize = ty.heap_size(self, data);
                     if let Some(param) = param {
                         self.push_val(*param, member);
                     }
@@ -340,7 +336,7 @@ impl<'cxt> Cxt<'cxt> {
             }
 
             Type::Unknown(_) | Type::Unknown2(_) | Type::PtrStruct(_) | Type::PtrEnum(_) => {
-                let size = ty.heap_size(self, slots, uses);
+                let size = ty.heap_size(self, data);
                 let fits = self.builder.build_int_compare(
                     IntPredicate::ULE,
                     size,
@@ -380,8 +376,7 @@ impl<'cxt> Cxt<'cxt> {
         ty: &Type<'cxt>,
         from: BasicValueEnum<'cxt>,
         to: PointerValue<'cxt>,
-        slots: &ReadStorage<Slot>,
-        uses: &ReadStorage<Uses>,
+        data: &Data,
     ) {
         match ty {
             // Store
@@ -417,9 +412,9 @@ impl<'cxt> Cxt<'cxt> {
                         .build_extract_value(agg, i.try_into().unwrap(), "member_to_store")
                         .unwrap();
                     param.map(|p| self.push_val(p, member));
-                    self.store(ty, member, ptr, slots, uses);
+                    self.store(ty, member, ptr, data);
 
-                    let isize = ty.heap_size(self, slots, uses);
+                    let isize = ty.heap_size(self, data);
                     size = self.builder.build_int_add(size, isize, "struct_size");
                     ptr = unsafe {
                         self.builder
@@ -432,7 +427,7 @@ impl<'cxt> Cxt<'cxt> {
             }
 
             Type::Unknown(_) | Type::Unknown2(_) | Type::PtrStruct(_) | Type::PtrEnum(_) => {
-                let size = ty.heap_size(self, slots, uses);
+                let size = ty.heap_size(self, data);
                 let fits = self.builder.build_int_compare(
                     IntPredicate::ULE,
                     size,
@@ -467,38 +462,78 @@ impl<'cxt> Cxt<'cxt> {
         }
     }
 
+    fn gen_struct(&self, values: &[Val], vty: &Type<'cxt>, ptr: PointerValue<'cxt>, data: &Data) {
+        match vty {
+            Type::StackStruct(v) | Type::PtrStruct(v) => {
+                let mut size = self.size_ty().const_zero();
+                let mut padding = Vec::new();
+                for (p, i) in v {
+                    let x = i.heap_size(self, data);
+                    let align = i.alignment();
+                    if align > 0 {
+                        let pad = self.padding_llvm(size, align);
+                        padding.push((p, i, x, Some(pad)));
+                        size = self.builder.build_int_add(size, pad, "aligned_size");
+                    } else {
+                        padding.push((p, i, x, None));
+                    }
+                    size = self.builder.build_int_add(size, x, "struct_size");
+                }
+
+                let mut next = ptr;
+                for (&val, (param, ty, size, padding)) in values.iter().zip(padding) {
+                    if let Some(padding) = padding {
+                        next = unsafe {
+                            self.builder
+                                .build_in_bounds_gep(next, &[padding], "member_slot_padded")
+                        };
+                    }
+                    if let Some(param) = param {
+                        // Is it better to gen it twice, or just store this?
+                        self.push_val(*param, self.gen_value(val, data));
+                    }
+                    self.gen_at(val, &ty, next, data);
+                    next = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(next, &[size], "next_member_slot")
+                    };
+                }
+                for (p, _) in v {
+                    if let Some(p) = p {
+                        self.pop_val(*p);
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// Like gen_value, but store the result at `ptr`.
     /// Avoids allocating and copying when creating boxed values.
     /// It should take up the size specified in `vty.runtime_size()`.
-    fn gen_at(
-        &self,
-        val: Val,
-        vty: &Type<'cxt>,
-        ptr: PointerValue<'cxt>,
-        slots: &ReadStorage<Slot>,
-        uses: &ReadStorage<Uses>,
-    ) {
-        let val = slots.unredirect(val);
+    fn gen_at(&self, val: Val, vty: &Type<'cxt>, ptr: PointerValue<'cxt>, data: &Data) {
+        let val = data.slots.unredirect(val);
 
         if let Some(&v) = self.upvalues.borrow().get(&val) {
-            self.store(vty, v, ptr, slots, uses);
+            self.store(vty, v, ptr, data);
+            return;
         }
-        match slots.node(val).unwrap() {
+        match data.slots.node(val).unwrap() {
             // Projection can be a memcpy instead of a store+load
             // LLVM will figure out the most efficient way to do it
             Node::Proj(ty, x, idx) => {
-                let ty = self.as_type(*ty, slots, uses);
+                let ty = self.as_type(*ty, data);
                 match &ty {
                     Type::StackStruct(v) | Type::PtrStruct(v) => {
                         // TODO only compute the size once, and use bitwise and instead of alloca
-                        let size = ty.heap_size(self, slots, uses);
+                        let size = ty.heap_size(self, data);
                         let fits = self.builder.build_int_compare(
                             IntPredicate::ULE,
                             size,
                             self.size_ty().const_int(8, false),
                             "fits_in_word",
                         );
-                        let val = self.gen_value(*x, slots, uses);
+                        let val = self.gen_value(*x, data);
                         let mut ptr2 = self
                             .if_expr(
                                 fits,
@@ -515,7 +550,7 @@ impl<'cxt> Cxt<'cxt> {
 
                         let mut size = self.size_ty().const_zero();
                         for (i, (param, ty)) in v.iter().enumerate() {
-                            let x = ty.heap_size(self, slots, uses);
+                            let x = ty.heap_size(self, data);
                             let align = ty.alignment();
                             if align > 0 {
                                 let padding = self.padding_llvm(size, align);
@@ -535,7 +570,7 @@ impl<'cxt> Cxt<'cxt> {
                                 return;
                             } else {
                                 if let Some(param) = param {
-                                    let p = self.load(&ty, ptr2, slots, uses);
+                                    let p = self.load(&ty, ptr2, data);
                                     self.push_val(*param, p);
                                 }
                                 ptr2 = unsafe {
@@ -552,15 +587,15 @@ impl<'cxt> Cxt<'cxt> {
 
             // Creating a sum or product type can be done directly in the pointer
             Node::Inj(ty, i, payload) => {
-                if matches!(slots.node(*ty), Some(Node::SumType(v)) if v.len() == 1) {
+                if matches!(data.slots.node(*ty), Some(Node::SumType(v)) if v.len() == 1) {
                     // Just do a load+store
-                    let v = self.gen_value(val, slots, uses);
-                    self.store(vty, v, ptr, slots, uses);
+                    let v = self.gen_value(val, data);
+                    self.store(vty, v, ptr, data);
                 }
 
                 match &vty {
                     Type::StackEnum(_, v) | Type::PtrEnum(v) => {
-                        let size = vty.heap_size(self, slots, uses);
+                        let size = vty.heap_size(self, data);
                         let fits = self.builder.build_int_compare(
                             IntPredicate::ULE,
                             size,
@@ -572,8 +607,8 @@ impl<'cxt> Cxt<'cxt> {
                             fits,
                             || {
                                 // Just do a load+store
-                                let v = self.gen_value(val, slots, uses);
-                                self.store(vty, v, ptr, slots, uses);
+                                let v = self.gen_value(val, data);
+                                self.store(vty, v, ptr, data);
                             },
                             || {
                                 let align = v.iter().map(|t| t.alignment()).max().unwrap_or(0);
@@ -598,110 +633,35 @@ impl<'cxt> Cxt<'cxt> {
                                         "payload_slot",
                                     )
                                 };
-                                self.gen_at(*payload, &v[*i], payload_slot, slots, uses);
+                                self.gen_at(*payload, &v[*i], payload_slot, data);
                             },
                         )
                     }
                     _ => unreachable!(),
                 }
             }
-            Node::Product(_, values) => match vty {
-                Type::StackStruct(v) | Type::PtrStruct(v) => {
-                    let mut size = self.size_ty().const_zero();
-                    let mut padding = Vec::new();
-                    for (p, i) in v {
-                        let x = i.heap_size(self, slots, uses);
-                        let align = i.alignment();
-                        if align > 0 {
-                            let pad = self.padding_llvm(size, align);
-                            padding.push((p, i, x, Some(pad)));
-                            size = self.builder.build_int_add(size, pad, "aligned_size");
-                        } else {
-                            padding.push((p, i, x, None));
-                        }
-                        size = self.builder.build_int_add(size, x, "struct_size");
-                    }
-
-                    let fits = self.builder.build_int_compare(
-                        IntPredicate::ULE,
-                        size,
-                        self.size_ty().const_int(8, false),
-                        "fits_in_word",
-                    );
-
-                    self.if_stmt(
-                        fits,
-                        || {
-                            // Just do a load+store
-                            let v = self.gen_value(val, slots, uses);
-                            self.store(vty, v, ptr, slots, uses);
-                        },
-                        || {
-                            let mut next = ptr;
-                            for (&val, (param, ty, size, padding)) in values.iter().zip(padding) {
-                                if let Some(padding) = padding {
-                                    next = unsafe {
-                                        self.builder.build_in_bounds_gep(
-                                            next,
-                                            &[padding],
-                                            "member_slot_padded",
-                                        )
-                                    };
-                                }
-                                if let Some(param) = param {
-                                    // Is it better to gen it twice, or just store this?
-                                    self.push_val(*param, self.gen_value(val, slots, uses));
-                                }
-                                self.gen_at(val, &ty, next, slots, uses);
-                                next = unsafe {
-                                    self.builder.build_in_bounds_gep(
-                                        next,
-                                        &[size],
-                                        "next_member_slot",
-                                    )
-                                };
-                            }
-                            for (p, _) in v {
-                                if let Some(p) = p {
-                                    self.pop_val(*p);
-                                }
-                            }
-                        },
-                    )
-                }
-                _ => unreachable!(),
-            },
+            Node::Product(_, values) => self.gen_struct(values, vty, ptr, data),
 
             // For anything else, fall back to generating the value normally and storing it
             _ => {
-                let v = self.gen_value(val, slots, uses);
-                self.store(vty, v, ptr, slots, uses);
+                let v = self.gen_value(val, data);
+                self.store(vty, v, ptr, data);
             }
         }
     }
 
-    fn gen_value(
-        &self,
-        val: Val,
-        slots: &ReadStorage<Slot>,
-        uses: &ReadStorage<Uses>,
-    ) -> BasicValueEnum<'cxt> {
-        self.try_gen_value(val, slots, uses)
+    fn gen_value(&self, val: Val, data: &Data) -> BasicValueEnum<'cxt> {
+        self.try_gen_value(val, data)
             .unwrap_or_else(|| panic!("Failed to gen_value %{}", val.id()))
     }
 
-    fn try_gen_value(
-        &self,
-        val: Val,
-        slots: &ReadStorage<Slot>,
-        uses: &ReadStorage<Uses>,
-    ) -> Option<BasicValueEnum<'cxt>> {
-        let val = slots.unredirect(val);
+    fn try_gen_value(&self, val: Val, data: &Data) -> Option<BasicValueEnum<'cxt>> {
+        let val = data.slots.unredirect(val);
 
         if let Some(&v) = self.upvalues.borrow().get(&val) {
             return Some(v);
         }
-        Some(match slots.node(val).unwrap() {
+        Some(match data.slots.node(val).unwrap() {
             Node::Fun(_) => {
                 // Create a closure
                 let functions = self.functions.borrow();
@@ -714,38 +674,39 @@ impl<'cxt> Cxt<'cxt> {
                     .get(&val)
                     .unwrap_or_else(|| panic!("Couldn't find fun {}", val.id()));
 
-                // Create the environment struct, then store it in an alloca and bitcast the pointer to i8*
-                // TODO use `gen_at()`
-                let env = match env.len() {
-                    0 => self.any_ty().into_pointer_type().get_undef(),
-                    1 => {
-                        // If there's only one upvalue, treat it like an `any`
-                        let (val, _, ty) = &env[0];
-                        let val = self.try_gen_value(*val, slots, uses)?;
-                        self.to_any(ty, val, slots, uses)
-                    }
-                    _ => {
-                        let env_tys: Vec<_> = env.iter().map(|&(_, ty, _)| ty).collect();
-                        let mut env_val = self.cxt.struct_type(&env_tys, false).get_undef();
-                        for (i, &(val, _, _)) in env.iter().enumerate() {
-                            // TODO reuse values (all over the codebase but especially here)
-                            let val = self.gen_value(val, slots, uses);
-                            env_val = self
-                                .builder
-                                .build_insert_value(env_val, val, i as u32, "env_insert")
-                                .unwrap()
-                                .into_struct_value();
-                        }
-                        let env_ptr = self
-                            .builder
-                            .build_malloc(self.cxt.struct_type(&env_tys, false), "env_ptr")
-                            .unwrap();
-                        self.builder.build_store(env_ptr, env_val);
-                        self.builder
-                            .build_bitcast(env_ptr, self.any_ty(), "env")
-                            .into_pointer_value()
-                    }
-                };
+                // Store the function pointer + environment in a heap-allocated struct
+                let env_ty = Type::PtrStruct(
+                    std::iter::once((None, Type::Pointer))
+                        .chain(env.iter().map(|(_, _, ty)| {
+                            let ty = if ty.has_unknown() {
+                                Type::Pointer
+                            } else {
+                                ty.clone()
+                            };
+                            (None, ty)
+                        }))
+                        .collect(),
+                );
+                let size = env_ty.heap_size(self, data);
+
+                let fun_ptr_val = data.entities.create();
+                self.push_val(
+                    fun_ptr_val,
+                    unknown
+                        .as_global_value()
+                        .as_pointer_value()
+                        .as_basic_value_enum(),
+                );
+                let values: Vec<_> = std::iter::once(fun_ptr_val)
+                    .chain(env.iter().map(|&(x, _, _)| x))
+                    .collect();
+
+                let malloc = self
+                    .builder
+                    .build_array_malloc(self.cxt.i8_type(), size, "env_slot")
+                    .unwrap();
+                self.gen_struct(&values, &env_ty, malloc, data);
+                self.pop_val(fun_ptr_val);
 
                 // We use the unknown version of the function, which takes one environment parameter and all of type i8* (any)
                 let arg_tys: Vec<_> = (0..arity + 1).map(|_| self.any_ty()).collect();
@@ -753,32 +714,22 @@ impl<'cxt> Cxt<'cxt> {
                     .cxt
                     .void_type()
                     .fn_type(&arg_tys, false)
-                    .ptr_type(AddressSpace::Generic)
-                    .as_basic_type_enum();
+                    .ptr_type(AddressSpace::Generic);
 
-                let cl = self
-                    .cxt
-                    .struct_type(&[self.any_ty(), fun_ty], false)
-                    .get_undef();
-                let cl = self
-                    .builder
-                    .build_insert_value(cl, env, 0, "cl_partial")
-                    .unwrap();
-                let cl = self
-                    .builder
-                    .build_insert_value(cl, unknown.as_global_value().as_pointer_value(), 1, "cl")
-                    .unwrap();
-
-                cl.as_basic_value_enum()
+                self.builder.build_bitcast(
+                    malloc,
+                    fun_ty.ptr_type(AddressSpace::Generic),
+                    "closure",
+                )
             }
             Node::ExternFun(name, params, ret) => {
                 let fun = match self.module.get_function(name) {
                     Some(fun) => fun,
                     None => {
-                        let rty = self.as_type(*ret, slots, uses).llvm_ty(self);
+                        let rty = self.as_type(*ret, data).llvm_ty(self);
                         let ptys: Vec<_> = params
                             .iter()
-                            .map(|t| self.as_type(*t, slots, uses).llvm_ty(self))
+                            .map(|t| self.as_type(*t, data).llvm_ty(self))
                             .collect();
                         let fty = rty.fn_type(&ptys, false);
                         self.module.add_function(name, fty, None)
@@ -789,18 +740,18 @@ impl<'cxt> Cxt<'cxt> {
                     .as_basic_value_enum()
             }
             Node::Proj(ty, x, idx) => {
-                let ty = self.as_type(*ty, slots, uses);
+                let ty = self.as_type(*ty, data);
                 match &ty {
                     Type::StackStruct(_) => {
-                        let x = self.try_gen_value(*x, slots, uses)?.into_struct_value();
+                        let x = self.try_gen_value(*x, data)?.into_struct_value();
                         self.builder
                             .build_extract_value(x, *idx as u32, "project")
                             .unwrap()
                     }
                     Type::PtrStruct(v) => {
                         // TODO only compute the size once, and use bitwise and instead of alloca
-                        let val = self.try_gen_value(*x, slots, uses)?;
-                        let size = ty.heap_size(self, slots, uses);
+                        let val = self.try_gen_value(*x, data)?;
+                        let size = ty.heap_size(self, data);
                         let fits = self.builder.build_int_compare(
                             IntPredicate::ULE,
                             size,
@@ -826,7 +777,7 @@ impl<'cxt> Cxt<'cxt> {
 
                         let mut size = self.size_ty().const_zero();
                         for (i, (param, ty)) in v.iter().enumerate() {
-                            let x = ty.heap_size(self, slots, uses);
+                            let x = ty.heap_size(self, data);
                             let align = ty.alignment();
                             if align > 0 {
                                 let padding = self.padding_llvm(size, align);
@@ -840,10 +791,10 @@ impl<'cxt> Cxt<'cxt> {
                                 size = self.builder.build_int_add(size, padding, "aligned_size");
                             }
                             if i == *idx {
-                                return Some(self.load(ty, ptr, slots, uses));
+                                return Some(self.load(ty, ptr, data));
                             } else {
                                 if let Some(param) = param {
-                                    self.push_val(*param, self.load(ty, ptr, slots, uses));
+                                    self.push_val(*param, self.load(ty, ptr, data));
                                 }
                                 ptr = unsafe {
                                     self.builder
@@ -858,18 +809,18 @@ impl<'cxt> Cxt<'cxt> {
                 }
             }
             Node::Inj(ty, i, payload) => {
-                if matches!(slots.node(*ty), Some(Node::SumType(v)) if v.len() == 1) {
+                if matches!(data.slots.node(*ty), Some(Node::SumType(v)) if v.len() == 1) {
                     // No tag or casting needed
-                    return self.try_gen_value(*payload, slots, uses);
+                    return self.try_gen_value(*payload, data);
                 }
 
-                let ty = self.as_type(*ty, slots, uses);
+                let ty = self.as_type(*ty, data);
                 match &ty {
                     Type::StackEnum(_, v) | Type::PtrEnum(v) => {
                         let mut payload_size = self.size_ty().const_zero();
                         let mut align = 0;
                         for i in v {
-                            let size = i.heap_size(self, slots, uses);
+                            let size = i.heap_size(self, data);
                             let gt = self.builder.build_int_compare(
                                 IntPredicate::UGT,
                                 size,
@@ -963,7 +914,7 @@ impl<'cxt> Cxt<'cxt> {
                                 "payload_slot",
                             )
                         };
-                        self.gen_at(*payload, &v[*i], payload_slot, slots, uses);
+                        self.gen_at(*payload, &v[*i], payload_slot, data);
 
                         match &ty {
                             Type::StackEnum(_, _) => {
@@ -1000,13 +951,13 @@ impl<'cxt> Cxt<'cxt> {
                 }
             }
             Node::Product(ty, values) => {
-                let ty = self.as_type(*ty, slots, uses);
+                let ty = self.as_type(*ty, data);
                 match &ty {
                     Type::StackStruct(v) => {
                         let ty = ty.llvm_ty(self).into_struct_type();
                         let mut agg = ty.get_undef().as_aggregate_value_enum();
                         for (i, (x, (param, _))) in values.into_iter().zip(v).enumerate() {
-                            let x = self.try_gen_value(*x, slots, uses)?;
+                            let x = self.try_gen_value(*x, data)?;
                             if let Some(param) = param {
                                 self.push_val(*param, x);
                             }
@@ -1022,21 +973,8 @@ impl<'cxt> Cxt<'cxt> {
                         }
                         agg.as_basic_value_enum()
                     }
-                    Type::PtrStruct(v) => {
-                        let mut size = self.size_ty().const_zero();
-                        let mut padding = Vec::new();
-                        for (p, i) in v {
-                            let x = i.heap_size(self, slots, uses);
-                            let align = i.alignment();
-                            if align > 0 {
-                                let pad = self.padding_llvm(size, align);
-                                padding.push((p, i, x, Some(pad)));
-                                size = self.builder.build_int_add(size, pad, "aligned_size");
-                            } else {
-                                padding.push((p, i, x, None));
-                            }
-                            size = self.builder.build_int_add(size, x, "struct_size");
-                        }
+                    Type::PtrStruct(_) => {
+                        let size = ty.heap_size(self, data);
 
                         let fits = self.builder.build_int_compare(
                             IntPredicate::ULE,
@@ -1066,28 +1004,7 @@ impl<'cxt> Cxt<'cxt> {
                                 },
                             )
                             .into_pointer_value();
-
-                        let mut next = malloc;
-                        for (&val, (param, ty, size, padding)) in values.iter().zip(padding) {
-                            if let Some(padding) = padding {
-                                next = unsafe {
-                                    self.builder.build_in_bounds_gep(
-                                        next,
-                                        &[padding],
-                                        "member_slot_padded",
-                                    )
-                                };
-                            }
-                            if let Some(param) = param {
-                                // TODO Is it better to gen it twice, or just store this?
-                                self.push_val(*param, self.gen_value(val, slots, uses));
-                            }
-                            self.gen_at(val, &ty, next, slots, uses);
-                            next = unsafe {
-                                self.builder
-                                    .build_in_bounds_gep(next, &[size], "next_member_slot")
-                            };
-                        }
+                        self.gen_struct(values, &ty, malloc, data);
 
                         self.if_expr(
                             fits,
@@ -1133,16 +1050,16 @@ impl<'cxt> Cxt<'cxt> {
             | Node::SumType(_)
             | Node::Const(Constant::TypeType)
             | Node::Const(Constant::IntType(_)) => {
-                let ty = self.as_type(val, slots, uses);
+                let ty = self.as_type(val, data);
                 let mut tyinfo = TyInfo::new();
                 ty.tyinfo(&mut tyinfo);
-                let ty_size = ty.heap_size(self, slots, uses);
+                let ty_size = ty.heap_size(self, data);
                 tyinfo.codegen(ty_size, self).as_basic_value_enum()
             }
             Node::ExternCall(_, _) => panic!("externcall isn't a first-class function!"),
             Node::BinOp(op, a, b) => {
-                let a = self.try_gen_value(*a, slots, uses)?;
-                let b = self.try_gen_value(*b, slots, uses)?;
+                let a = self.try_gen_value(*a, data)?;
+                let b = self.try_gen_value(*b, data)?;
                 // let name = self.name(val).unwrap_or_else(|| "binop".to_string());
                 // let name = &name;
                 let name = "binop";
@@ -1250,15 +1167,14 @@ impl<'cxt> Cxt<'cxt> {
         x: BasicValueEnum<'cxt>,
         from: &Type<'cxt>,
         to: &Type<'cxt>,
-        slots: &ReadStorage<Slot>,
-        uses: &ReadStorage<Uses>,
+        data: &Data,
     ) -> BasicValueEnum<'cxt> {
         if from == to {
             x
         } else {
             eprintln!("durin/info: Casting from {:?} to {:?}", from, to);
-            let x = self.to_any(from, x, slots, uses);
-            self.from_any(to, x, slots, uses)
+            let x = self.to_any(from, x, data);
+            self.from_any(to, x, data)
         }
     }
 
@@ -1267,11 +1183,9 @@ impl<'cxt> Cxt<'cxt> {
         callee: Val,
         mut args: Vec<(BasicValueEnum<'cxt>, Type<'cxt>)>,
         cont: Option<(Val, Type<'cxt>)>,
-        slots: &ReadStorage<Slot>,
-        uses: &ReadStorage<Uses>,
-        entities: &Entities,
+        data: &Data,
     ) {
-        match slots.node(callee) {
+        match data.slots.node(callee) {
             // If we're calling the return continuation, emit a return instruction
             _ if self
                 .cont
@@ -1280,12 +1194,12 @@ impl<'cxt> Cxt<'cxt> {
                 .map_or(false, |(x, _)| *x == callee) =>
             {
                 if let Some((k, ty)) = cont {
-                    args.push((self.gen_value(k, slots, uses), ty));
+                    args.push((self.gen_value(k, data), ty));
                 }
                 let args = args
                     .into_iter()
                     .zip(&self.cont.borrow().as_ref().unwrap().1)
-                    .map(|((x, from), to)| self.cast(x, &from, to, slots, uses))
+                    .map(|((x, from), to)| self.cast(x, &from, to, data))
                     .collect::<Vec<_>>();
                 let ret = if args.len() == 1 {
                     args[0]
@@ -1317,12 +1231,12 @@ impl<'cxt> Cxt<'cxt> {
                 let blocks = self.blocks.borrow();
                 let (target, params, tys) = blocks.get(&callee).unwrap();
                 if let Some((k, ty)) = cont {
-                    args.push((self.gen_value(k, slots, uses), ty));
+                    args.push((self.gen_value(k, data), ty));
                 }
                 let args = args
                     .into_iter()
                     .zip(tys)
-                    .map(|((x, from), to)| self.cast(x, &from, to, slots, uses))
+                    .map(|((x, from), to)| self.cast(x, &from, to, data))
                     .collect::<Vec<_>>();
                 // Set the parameters and jump to the target block
                 for (&ptr, value) in params.iter().zip(args) {
@@ -1333,12 +1247,12 @@ impl<'cxt> Cxt<'cxt> {
 
             // Execute a ref op if we're doing one
             Some(Node::Ref(ty, op)) => {
-                let ty = self.as_type(*ty, slots, uses);
+                let ty = self.as_type(*ty, data);
 
                 // Execute the operation
                 let arg = match op {
                     crate::ir::RefOp::RefNew => {
-                        let size = ty.heap_size(self, slots, uses);
+                        let size = ty.heap_size(self, data);
                         let ptr = self
                             .builder
                             .build_array_malloc(self.cxt.i8_type(), size, "ref_ptr")
@@ -1346,15 +1260,15 @@ impl<'cxt> Cxt<'cxt> {
                         Some((ptr.as_basic_value_enum(), Type::Pointer))
                     }
                     crate::ir::RefOp::RefGet(r) => {
-                        let ptr = self.gen_value(*r, slots, uses).into_pointer_value();
-                        let val = self.load(&ty, ptr, slots, uses);
+                        let ptr = self.gen_value(*r, data).into_pointer_value();
+                        let val = self.load(&ty, ptr, data);
                         Some((val, ty))
                     }
                     crate::ir::RefOp::RefSet(r, v) => {
-                        let ptr = self.gen_value(*r, slots, uses).into_pointer_value();
+                        let ptr = self.gen_value(*r, data).into_pointer_value();
                         // TODO are there circumstances when we can use `gen_at`?
-                        let val = self.gen_value(*v, slots, uses);
-                        self.store(&ty, val, ptr, slots, uses);
+                        let val = self.gen_value(*v, data);
+                        self.store(&ty, val, ptr, data);
                         None
                     }
                 };
@@ -1362,11 +1276,11 @@ impl<'cxt> Cxt<'cxt> {
                 // Call the continuation
                 let (cont, _) = cont.unwrap();
                 let cont2 = arg.map(|(v, ty)| {
-                    let n = entities.create();
+                    let n = data.entities.create();
                     self.upvalues.borrow_mut().insert(n, v);
                     (n, ty)
                 });
-                self.gen_call(cont, Vec::new(), cont2, slots, uses, entities)
+                self.gen_call(cont, Vec::new(), cont2, data)
             }
 
             // If we're stopping, return void
@@ -1381,7 +1295,7 @@ impl<'cxt> Cxt<'cxt> {
             // Even if it goes through a function
             Some(Node::Fun(Function { callee, .. }))
                 if matches!(
-                    slots.node(*callee),
+                    data.slots.node(*callee),
                     Some(Node::Const(crate::ir::Constant::Unreachable))
                 ) =>
             {
@@ -1391,29 +1305,27 @@ impl<'cxt> Cxt<'cxt> {
             // If we're calling an extern function, do that
             Some(Node::ExternCall(f, ret_ty)) => {
                 let args: Vec<_> = args.into_iter().map(|(v, _)| v).collect();
-                let f = self.gen_value(*f, slots, uses);
+                let f = self.gen_value(*f, data);
                 let call = self
                     .builder
                     .build_call(f.into_pointer_value(), &args, "extern_call");
                 call.set_tail_call(DO_TAIL_CALL);
 
-                let ret_ty = self.as_type(*ret_ty, slots, uses);
+                let ret_ty = self.as_type(*ret_ty, data);
 
                 let (cont, _) = cont.unwrap();
                 self.gen_call(
                     cont,
                     vec![(call.try_as_basic_value().left().unwrap(), ret_ty)],
                     None,
-                    slots,
-                    uses,
-                    entities,
+                    data,
                 )
             }
 
             // Otherwise, we're actually calling a function
             _ => {
                 // The mechanism depends on whether it's a known or unknown call
-                match self.functions.borrow().get(&slots.unredirect(callee)) {
+                match self.functions.borrow().get(&data.slots.unredirect(callee)) {
                     Some(LFunction {
                         known,
                         env,
@@ -1427,11 +1339,11 @@ impl<'cxt> Cxt<'cxt> {
                         let args = args
                             .into_iter()
                             .zip(param_tys)
-                            .map(|((x, from), to)| self.cast(x, &from, to, slots, uses))
+                            .map(|((x, from), to)| self.cast(x, &from, to, data))
                             .collect::<Vec<_>>();
                         let mut args: Vec<_> = env
                             .iter()
-                            .map(|&(val, _, _)| self.gen_value(val, slots, uses))
+                            .map(|&(val, _, _)| self.gen_value(val, data))
                             .chain(args)
                             .collect();
 
@@ -1469,16 +1381,16 @@ impl<'cxt> Cxt<'cxt> {
                                     .collect()
                             };
                             let acont = args.pop().map(|(x, ty)| {
-                                let v = entities.create();
+                                let v = data.entities.create();
                                 self.upvalues.borrow_mut().insert(v, x);
                                 (v, ty)
                             });
 
-                            self.gen_call(cont, args, acont, slots, uses, entities)
+                            self.gen_call(cont, args, acont, data)
                         } else {
                             if let Some((k, ty)) = cont {
-                                let v = self.gen_value(k, slots, uses);
-                                let v = self.cast(v, &ty, param_tys.last().unwrap(), slots, uses);
+                                let v = self.gen_value(k, data);
+                                let v = self.cast(v, &ty, param_tys.last().unwrap(), data);
                                 args.push(v);
                             }
                             let call = self.builder.build_call(*known, &args, "call");
@@ -1491,23 +1403,36 @@ impl<'cxt> Cxt<'cxt> {
                     None => {
                         // Unknown call
                         if let Some((k, ty)) = cont {
-                            args.push((self.gen_value(k, slots, uses), ty));
+                            args.push((self.gen_value(k, data), ty));
                         }
 
-                        let callee = self.gen_value(callee, slots, uses).into_struct_value();
-                        let env = self.builder.build_extract_value(callee, 0, "env").unwrap();
+                        let callee = self.gen_value(callee, data).into_pointer_value();
+                        let fun_ty = vec![self.any_ty(); args.len() + 1];
+                        let fun_ty = self
+                            .cxt
+                            .void_type()
+                            .fn_type(&fun_ty, false)
+                            .ptr_type(AddressSpace::Generic);
+                        let fun_ptr_ptr = self
+                            .builder
+                            .build_bitcast(
+                                callee,
+                                fun_ty.ptr_type(AddressSpace::Generic),
+                                "fun_ptr_ptr",
+                            )
+                            .into_pointer_value();
                         let fun_ptr = self
                             .builder
-                            .build_extract_value(callee, 1, "fun_ptr")
-                            .unwrap()
+                            .build_load(fun_ptr_ptr, "fun_ptr")
                             .into_pointer_value();
+                        let env = self
+                            .builder
+                            .build_bitcast(callee, self.any_ty(), "closure_env");
 
                         // It could be polymorphic, so we pass all arguments as word-size "any"
                         let mut args: Vec<_> = args
                             .into_iter()
-                            .map(|(val, ty)| {
-                                self.to_any(&ty, val, slots, uses).as_basic_value_enum()
-                            })
+                            .map(|(val, ty)| self.to_any(&ty, val, data).as_basic_value_enum())
                             .collect();
                         // The closure environment is the last argument
                         args.push(env);
@@ -1525,64 +1450,62 @@ impl<'cxt> Cxt<'cxt> {
 
     fn codegen(
         &self,
-        slots: &ReadStorage<Slot>,
-        entities: &Entities,
+        data: &Data,
         modes: &ReadStorage<FunMode>,
-        uses: &ReadStorage<Uses>,
         tys: &ReadStorage<ValType>,
         names: &ReadStorage<Name>,
     ) {
         // Collect all functions and their blocks
         let mut to_gen: HashMap<Val, VecDeque<(Val, crate::ir::Function)>> = HashMap::new();
         let mut stack_enabled = HashMap::new();
-        for (v, mode) in (entities, modes).join() {
+        for (v, mode) in (&data.entities, modes).join() {
             match mode {
                 FunMode::SSA(cont) => {
                     to_gen
                         .entry(v)
                         .or_default()
-                        .push_front((v, slots.fun(v).unwrap().clone()));
+                        .push_front((v, data.slots.fun(v).unwrap().clone()));
                     stack_enabled.insert(v, *cont);
                 }
                 FunMode::CPS => {
                     to_gen
                         .entry(v)
                         .or_default()
-                        .push_front((v, slots.fun(v).unwrap().clone()));
+                        .push_front((v, data.slots.fun(v).unwrap().clone()));
                 }
                 FunMode::Block(parent) => {
                     to_gen
                         .entry(*parent)
                         .or_default()
-                        .push_back((v, slots.fun(v).unwrap().clone()));
+                        .push_back((v, data.slots.fun(v).unwrap().clone()));
                 }
             }
         }
 
         // Declare all the functions before generating their bodies
         for (val, blocks) in to_gen {
-            let env = slots.env(val);
+            let env = data.slots.env(val);
 
-            if let Some(fun) = slots.fun(val).cloned() {
+            if let Some(fun) = data.slots.fun(val).cloned() {
                 // Get the continuation type by whatever is passed to the continuation
                 let cont = stack_enabled.get(&val);
                 let cont = cont.and_then(|&cont| {
-                    let u = uses.get(cont).unwrap();
+                    let u = data.uses.get(cont).unwrap();
                     if u.is_empty() {
                         eprintln!("durin/warning: could not deduce continuation type (no uses)");
                         None
                     } else {
                         let u = u.clone();
                         for &i in &**u {
-                            let ty = match slots.node(i).cloned() {
+                            let ty = match data.slots.node(i).cloned() {
                                 Some(Node::Fun(Function {
                                     callee, call_args, ..
                                 })) if callee == cont => call_args
                                     .clone()
                                     .into_iter()
-                                    .map(|x| slots.unredirect(x))
+                                    .map(|x| data.slots.unredirect(x))
                                     .map(|x| **tys.get(x).unwrap())
-                                    .map(|x| self.as_type(x, slots, uses))
+                                    .map(|x| self.as_type(x, data))
                                     .collect::<Vec<_>>(),
                                 _ => continue,
                             };
@@ -1602,7 +1525,7 @@ impl<'cxt> Cxt<'cxt> {
                     } else {
                         &fun.params
                     })
-                    .map(|&x| self.as_type(x, slots, uses).llvm_ty(self))
+                    .map(|&x| self.as_type(x, data).llvm_ty(self))
                     .collect();
                 let known_ty = if let Some((_, ret_tys)) = &cont {
                     let ret_ty = if ret_tys.len() == 1 {
@@ -1638,14 +1561,10 @@ impl<'cxt> Cxt<'cxt> {
                 let env = args[0..env.len()]
                     .iter()
                     .zip(env)
-                    .map(|(&ty, (val, ty2))| (val, ty, self.as_type(ty2, slots, uses)))
+                    .map(|(&ty, (val, ty2))| (val, ty, self.as_type(ty2, data)))
                     .collect();
 
-                let param_tys = fun
-                    .params
-                    .iter()
-                    .map(|&x| self.as_type(x, slots, uses))
-                    .collect();
+                let param_tys = fun.params.iter().map(|&x| self.as_type(x, data)).collect();
 
                 self.functions.borrow_mut().insert(
                     val,
@@ -1688,43 +1607,41 @@ impl<'cxt> Cxt<'cxt> {
                 let &env_ptr = unknown.get_params().last().unwrap();
                 env_ptr.set_name("env");
                 // TODO what about dependently sized types?
-                match env.len() {
-                    0 => (),
-                    1 => {
-                        // There's only one upvalue, so treat the environment pointer as an `any`
-                        let (val, _, ty) = &env[0];
-                        let value = self.from_any(ty, env_ptr.into_pointer_value(), slots, uses);
-                        self.upvalues.borrow_mut().insert(*val, value);
-                    }
-                    _ => {
-                        let env_tys: Vec<_> = env.iter().map(|&(_, ty, _)| ty).collect();
-                        let env_ty = self.cxt.struct_type(&env_tys, false);
-                        let env_ptr = self.builder.build_bitcast(
-                            env_ptr,
-                            env_ty.ptr_type(AddressSpace::Generic),
-                            "env_ptr",
-                        );
-                        let env_val = self
-                            .builder
-                            .build_load(env_ptr.into_pointer_value(), "env")
-                            .into_struct_value();
 
-                        // Add environment slots to the context
-                        for (i, &(val, _, _)) in env.iter().enumerate() {
-                            let value = self
-                                .builder
-                                .build_extract_value(
-                                    env_val,
-                                    i as u32,
-                                    &names
-                                        .get(val)
-                                        .map(|n| n.0.clone())
-                                        .unwrap_or_else(|| "upvalue".to_string()),
-                                )
-                                .unwrap();
-                            self.upvalues.borrow_mut().insert(val, value);
-                        }
+                let mut ptr = unsafe {
+                    self.builder.build_in_bounds_gep(
+                        env_ptr.into_pointer_value(),
+                        &[self.cxt.i32_type().const_int(8, false)],
+                        "env_slots",
+                    )
+                };
+                let mut size = self.size_ty().const_zero();
+                for (val, _, ty) in env.iter() {
+                    // If its size might depend on other upvalues, always box it since we don't know the order of upvalues
+                    // and even if we did, we could have e.g. `x : { Type, y.0 }; y : { Type, x.0 }`
+                    // so we just need to box those all the time
+                    let ty = if ty.has_unknown() {
+                        &Type::Pointer
+                    } else {
+                        ty
+                    };
+                    let x = ty.heap_size(self, data);
+                    let align = ty.alignment();
+                    if align > 0 {
+                        let padding = self.padding_llvm(size, align);
+                        ptr = unsafe {
+                            self.builder
+                                .build_in_bounds_gep(ptr, &[padding], "member_slot_padded")
+                        };
+                        size = self.builder.build_int_add(size, padding, "aligned_size");
                     }
+                    let value = self.load(ty, ptr, data);
+                    self.upvalues.borrow_mut().insert(*val, value);
+                    ptr = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(ptr, &[x], "next_member_slot")
+                    };
+                    size = self.builder.build_int_add(size, x, "struct_size");
                 }
 
                 // Call function
@@ -1734,27 +1651,22 @@ impl<'cxt> Cxt<'cxt> {
                     .iter()
                     .enumerate()
                     .map(|(i, &ty)| {
-                        let ty = self.as_type(ty, slots, uses);
+                        let ty = self.as_type(ty, data);
                         (
-                            self.from_any(
-                                &ty,
-                                unknown.get_params()[i].into_pointer_value(),
-                                slots,
-                                uses,
-                            ),
+                            self.from_any(&ty, unknown.get_params()[i].into_pointer_value(), data),
                             ty,
                         )
                     })
                     .collect();
                 if let Some((vcont, cty)) = args.pop() {
                     // `gen_call` takes the continuation as a Val, not a BasicValueEnum; so, we use an unused Val slot and stick the BasicValueEnum in the upvalues map
-                    let cont = entities.create();
+                    let cont = data.entities.create();
                     {
                         self.upvalues.borrow_mut().insert(cont, vcont);
                     }
-                    self.gen_call(*val, args, Some((cont, cty)), slots, uses, entities);
+                    self.gen_call(*val, args, Some((cont, cty)), data);
                 } else {
-                    self.gen_call(*val, args, None, slots, uses, entities);
+                    self.gen_call(*val, args, None, data);
                 }
             }
 
@@ -1793,9 +1705,9 @@ impl<'cxt> Cxt<'cxt> {
                         // Don't allocate the continuation parameter
                         break;
                     } else {
-                        let ty = self.as_type(ty, slots, uses);
+                        let ty = self.as_type(ty, data);
                         let lty = ty.llvm_ty(self);
-                        let name = bval.param_name(i as u8, uses, slots, names);
+                        let name = bval.param_name(i as u8, &data.uses, &data.slots, names);
                         let param = self.builder.build_alloca(lty, &name);
                         params.push(param);
                         param_tys.push(ty);
@@ -1827,12 +1739,12 @@ impl<'cxt> Cxt<'cxt> {
                 self.builder.position_at_end(*block);
 
                 // If we're calling if x, do that
-                if let Some(Node::If(x)) = slots.node(bfun.callee).cloned() {
+                if let Some(Node::If(x)) = data.slots.node(bfun.callee).cloned() {
                     assert_eq!(bfun.call_args.len(), 2);
                     let fthen = bfun.call_args[0];
                     let felse = bfun.call_args[1];
 
-                    let cond = self.gen_value(x, slots, uses).into_int_value();
+                    let cond = self.gen_value(x, data).into_int_value();
 
                     let bstart = self.builder.get_insert_block().unwrap();
                     let bthen = self.cxt.insert_basic_block_after(bstart, "if.then");
@@ -1841,23 +1753,23 @@ impl<'cxt> Cxt<'cxt> {
                     self.builder.build_conditional_branch(cond, bthen, belse);
 
                     self.builder.position_at_end(bthen);
-                    self.gen_call(fthen, vec![], None, slots, uses, entities);
+                    self.gen_call(fthen, vec![], None, data);
 
                     self.builder.position_at_end(belse);
-                    self.gen_call(felse, vec![], None, slots, uses, entities);
+                    self.gen_call(felse, vec![], None, data);
                 // If we're calling ifcase i x, do that instead
-                } else if let Some(Node::IfCase(i, x)) = slots.node(bfun.callee).cloned() {
+                } else if let Some(Node::IfCase(i, x)) = data.slots.node(bfun.callee).cloned() {
                     let vty = tys.get(x).unwrap().0;
-                    let ty = self.as_type(vty, slots, uses);
-                    let payload_ty = match vty.get(&slots) {
+                    let ty = self.as_type(vty, data);
+                    let payload_ty = match vty.get(&data.slots) {
                         Node::SumType(v) if v.len() == 1 => {
                             // There's no tag, and no casting needed
                             assert_eq!(i, 0);
-                            let x = self.gen_value(x, slots, uses);
+                            let x = self.gen_value(x, data);
                             assert_eq!(bfun.call_args.len(), 2);
                             let fthen = bfun.call_args[0];
 
-                            self.gen_call(fthen, vec![(x, ty)], None, slots, uses, entities);
+                            self.gen_call(fthen, vec![(x, ty)], None, data);
 
                             // Skip to the next basic block
                             continue;
@@ -1865,13 +1777,13 @@ impl<'cxt> Cxt<'cxt> {
                         Node::SumType(v) => v[i],
                         x => unreachable!("{:?}", x),
                     };
-                    let payload_ty = self.as_type(payload_ty, slots, uses);
+                    let payload_ty = self.as_type(payload_ty, data);
 
                     assert_eq!(bfun.call_args.len(), 2);
                     let fthen = bfun.call_args[0];
                     let felse = bfun.call_args[1];
 
-                    let x = self.gen_value(x, slots, uses);
+                    let x = self.gen_value(x, data);
 
                     let bstart = self.builder.get_insert_block().unwrap();
                     let bthen = self.cxt.insert_basic_block_after(bstart, "ifcase.then");
@@ -1930,18 +1842,11 @@ impl<'cxt> Cxt<'cxt> {
                             "payload_slot",
                         )
                     };
-                    let payload = self.load(&payload_ty, payload_slot, slots, uses);
-                    self.gen_call(
-                        fthen,
-                        vec![(payload, payload_ty)],
-                        None,
-                        slots,
-                        uses,
-                        entities,
-                    );
+                    let payload = self.load(&payload_ty, payload_slot, data);
+                    self.gen_call(fthen, vec![(payload, payload_ty)], None, data);
 
                     self.builder.position_at_end(belse);
-                    self.gen_call(felse, vec![], None, slots, uses, entities);
+                    self.gen_call(felse, vec![], None, data);
                 } else {
                     // Generate a call
                     let args: Vec<_> = bfun
@@ -1953,20 +1858,20 @@ impl<'cxt> Cxt<'cxt> {
                             bfun.call_args.len() - 1
                         })
                         .map(|&x| {
-                            let x = slots.unredirect(x);
+                            let x = data.slots.unredirect(x);
                             let ty = tys.get(x).unwrap().0;
-                            let ty = self.as_type(ty, slots, uses);
-                            let x = self.gen_value(x, slots, uses);
+                            let ty = self.as_type(ty, data);
+                            let x = self.gen_value(x, data);
                             (x, ty)
                         })
                         .collect();
                     let cont = bfun.call_args.last().map(|&x| {
-                        let x = slots.unredirect(x);
+                        let x = data.slots.unredirect(x);
                         let ty = tys.get(x).unwrap().0;
-                        let ty = self.as_type(ty, slots, uses);
+                        let ty = self.as_type(ty, data);
                         (x, ty)
                     });
-                    self.gen_call(bfun.callee, args, cont, slots, uses, entities);
+                    self.gen_call(bfun.callee, args, cont, data);
                 }
             }
         }
@@ -1984,6 +1889,15 @@ impl<'a> System<'a> for &Cxt<'_> {
     );
 
     fn run(&mut self, (slots, entities, modes, uses, tys, names): Self::SystemData) {
-        self.codegen(&slots, &entities, &modes, &uses, &tys, &names);
+        self.codegen(
+            &Data {
+                slots,
+                entities,
+                uses,
+            },
+            &modes,
+            &tys,
+            &names,
+        );
     }
 }
