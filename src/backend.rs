@@ -248,7 +248,7 @@ pub enum Type<'cxt> {
     PtrStruct(Vec<(Option<Val>, Type<'cxt>)>),
     StackEnum(u32, Vec<Type<'cxt>>),
     PtrEnum(Vec<Type<'cxt>>),
-    Unknown(IntValue<'cxt>),
+    Unknown(PointerValue<'cxt>),
     Unknown2(Val),
     Int(u32),
     Closure(usize),
@@ -390,8 +390,18 @@ impl<'cxt> Type<'cxt> {
                     payload
                 }
             }
-            Type::Unknown(v) => *v,
-            Type::Unknown2(v) => cxt.gen_value(*v, slots, uses).into_int_value(),
+            Type::Unknown(v) => {
+                let int32 = cxt.builder.build_load(*v, "ty_size").into_int_value();
+                let int32 = cxt.builder.build_and(
+                    int32,
+                    cxt.cxt.i32_type().const_int((1 << 16) - 1, false),
+                    "ty_size_trunc",
+                );
+                cxt.builder
+                    .build_int_z_extend(int32, cxt.size_ty(), "size_i64")
+            }
+            Type::Unknown2(v) => Type::Unknown(cxt.gen_value(*v, slots, uses).into_pointer_value())
+                .heap_size(cxt, slots, uses),
             Type::StackEnum(_, _)
             | Type::Pointer
             | Type::Int(_)
@@ -441,8 +451,381 @@ impl<'cxt> Type<'cxt> {
                 .fn_type(&v, false)
                 .ptr_type(AddressSpace::Generic)
                 .as_basic_type_enum(),
-            Type::Type => cxt.size_ty().as_basic_type_enum(),
+            Type::Type => cxt
+                .cxt
+                .i32_type()
+                .ptr_type(AddressSpace::Generic)
+                .as_basic_type_enum(),
         }
+    }
+
+    fn tyinfo(&self, info: &mut TyInfo<'cxt>) {
+        match self {
+            Type::Pointer => info.word(true),
+            Type::StackStruct(tys) | Type::PtrStruct(tys) => {
+                for (_, ty) in tys {
+                    ty.tyinfo(info);
+                }
+            }
+            Type::StackEnum(_, tys) | Type::PtrEnum(tys) => {
+                // For enums, the tag size happens to always equal alignment
+                let tag_size = self.alignment();
+                info.start_variant(tys.len(), tag_size);
+
+                for ty in tys {
+                    info.next_variant();
+                    ty.tyinfo(info);
+                }
+
+                info.end_variant();
+            }
+            Type::Unknown(v) => info.splice(*v),
+            Type::Unknown2(_) => panic!("Unknown2 not supported"),
+            Type::Int(i) => {
+                if *i == 64 {
+                    info.word(false);
+                } else {
+                    info.extra_bytes(*i / 8);
+                }
+            }
+            Type::Closure(_) => {
+                // TODO fully boxed closures
+                info.word(true);
+                info.word(false);
+            }
+            Type::ExternFun(_, _) => info.word(false),
+            Type::Type => info.word(true),
+        }
+    }
+}
+
+enum TyInfoPart<'cxt> {
+    Constant(Vec<u32>),
+    Splice(PointerValue<'cxt>, bool),
+}
+impl<'cxt> TyInfoPart<'cxt> {
+    fn extend(&mut self) {
+        match self {
+            TyInfoPart::Constant(v) => {
+                // Mark the last entry as continued
+                v.last_mut().map(|x| *x |= 1);
+            }
+            TyInfoPart::Splice(_, b) => *b = true,
+        }
+    }
+}
+
+enum LastType {
+    Normal,
+    VariantNext,
+    VariantEnd(usize),
+}
+
+struct TyInfo<'cxt> {
+    run_words: Vec<bool>,
+    variant_stack: Vec<usize>,
+    last: LastType,
+    extra_bytes: u32,
+    entries: Vec<TyInfoPart<'cxt>>,
+}
+impl<'cxt> TyInfo<'cxt> {
+    fn extend(&mut self) {
+        match self.last {
+            LastType::Normal => {
+                self.entries.last_mut().map(TyInfoPart::extend);
+            }
+            LastType::VariantNext => (),
+            LastType::VariantEnd(i) => self.entries[i].extend(),
+        }
+        self.last = LastType::Normal;
+    }
+
+    fn push_raw(&mut self, entry: u32) {
+        match self.entries.last_mut() {
+            Some(TyInfoPart::Constant(v)) => v.push(entry),
+            _ => self.entries.push(TyInfoPart::Constant(vec![entry])),
+        }
+    }
+
+    fn new() -> Self {
+        TyInfo {
+            run_words: Vec::new(),
+            variant_stack: Vec::new(),
+            last: LastType::Normal,
+            extra_bytes: 0,
+            entries: Vec::new(),
+        }
+    }
+}
+impl<'cxt> TyInfo<'cxt> {
+    fn splice(&mut self, ty: PointerValue<'cxt>) {
+        self.finish_bitset();
+
+        self.extend();
+        self.entries.push(TyInfoPart::Splice(ty, false));
+    }
+
+    fn start_variant(&mut self, num: usize, tag_size: u32) {
+        let offset = self.extra_bytes & 7;
+        self.extra_bytes = offset;
+        self.finish_bitset();
+
+        self.variant_stack.push(self.entries.len());
+        let num: u16 = num.try_into().expect("Too many variants");
+        assert!(tag_size <= 8, "tag must be <= 8 bytes, got {}", tag_size);
+        let entry = 0b01_0 | ((tag_size - 1) << 3) | (offset << 6) | ((num as u32) << 16);
+        self.entry(entry);
+    }
+
+    fn next_variant(&mut self) {
+        self.last = LastType::VariantNext;
+    }
+
+    fn end_variant(&mut self) {
+        self.last = LastType::VariantEnd(self.variant_stack.pop().unwrap());
+    }
+
+    fn word(&mut self, is_pointer: bool) {
+        self.finish_bytes();
+        self.run_words.push(is_pointer);
+    }
+
+    fn extra_bytes(&mut self, bytes: u32) {
+        self.extra_bytes += bytes;
+    }
+
+    fn entry(&mut self, entry: u32) {
+        self.finish_bitset();
+
+        // Mark the last entry as continued
+        self.extend();
+        self.push_raw(entry);
+    }
+
+    fn finish_bytes(&mut self) {
+        let extra_bytes_padded = (self.extra_bytes + 7) & !7;
+        let extra_words = extra_bytes_padded / 8;
+        for _ in 0..extra_words {
+            self.run_words.push(false);
+        }
+        self.extra_bytes = 0;
+    }
+
+    fn finish_bitset(&mut self) {
+        self.finish_bytes();
+
+        if !self.run_words.is_empty() {
+            if self.run_words.len() > 24 {
+                todo!("more than one bitset word")
+            }
+
+            let mut bitset: u32 = (self.run_words.len() as u32) << 3;
+            for (i, b) in self.run_words.drain(..).enumerate() {
+                if b {
+                    bitset |= 1 << (i + 8);
+                }
+            }
+
+            // Mark the last entry as continued
+            self.extend();
+            self.push_raw(bitset);
+        }
+    }
+
+    fn codegen(mut self, ty_size: IntValue<'cxt>, cxt: &Cxt<'cxt>) -> PointerValue<'cxt> {
+        self.finish_bitset();
+        // Make sure it doesn't end with part of a variant, so that we can `| 1` the last entry of a spliced rtti entry
+        match self.last {
+            LastType::VariantNext => unreachable!(),
+            // 0 is an empty bitset
+            LastType::VariantEnd(_) => self.entry(0),
+            LastType::Normal => (),
+        }
+
+        let ty_size = cxt
+            .builder
+            .build_int_truncate(ty_size, cxt.cxt.i32_type(), "ty_size_i32");
+
+        // Don't malloc if it's constant
+        if self.entries.len() == 1 {
+            if let TyInfoPart::Constant(v) = &self.entries[0] {
+                let rtti_size = v.len() * 4;
+                let rtti_size = cxt
+                    .cxt
+                    .i32_type()
+                    .const_int((rtti_size << 16) as u64, false);
+                let sizes = cxt.builder.build_or(rtti_size, ty_size, "rtti_sizes");
+
+                let values: Vec<_> = std::iter::once(sizes)
+                    .chain(
+                        v.iter()
+                            .map(|&x| cxt.cxt.i32_type().const_int(x as u64, false)),
+                    )
+                    .collect();
+
+                let arr = cxt.cxt.i32_type().const_array(&values);
+                let global = cxt.module.add_global(arr.get_type(), None, "const_rtti");
+                global.set_constant(true);
+                global.set_alignment(8);
+                global.set_initializer(&arr);
+
+                return cxt
+                    .builder
+                    .build_bitcast(
+                        global.as_pointer_value(),
+                        cxt.cxt.i32_type().ptr_type(AddressSpace::Generic),
+                        "const_rtti_ptr",
+                    )
+                    .into_pointer_value();
+            }
+        }
+
+        let mut size = cxt.size_ty().const_int(0, false);
+        let mut splice_sizes = VecDeque::new();
+        for entry in &self.entries {
+            match entry {
+                TyInfoPart::Constant(v) => {
+                    let esize = cxt.size_ty().const_int((v.len() * 4) as u64, false);
+                    size = cxt.builder.build_int_add(size, esize, "rtti_size");
+                }
+                TyInfoPart::Splice(ptr, _) => {
+                    let esize = cxt
+                        .builder
+                        .build_load(*ptr, "spliced_rtti_sizes")
+                        .into_int_value();
+                    let esize = cxt.builder.build_right_shift(
+                        esize,
+                        cxt.cxt.i32_type().const_int(16, false),
+                        false,
+                        "spliced_rtti_size",
+                    );
+                    let esize = cxt.builder.build_int_z_extend(
+                        esize,
+                        cxt.size_ty(),
+                        "spliced_rtti_size_i64",
+                    );
+                    splice_sizes.push_back(esize);
+                    size = cxt.builder.build_int_add(size, esize, "rtti_size");
+                }
+            }
+        }
+
+        let malloc = cxt
+            .builder
+            .build_array_malloc(cxt.cxt.i8_type(), size, "rtti_slot")
+            .unwrap();
+        let mut slot = cxt
+            .builder
+            .build_bitcast(
+                malloc,
+                cxt.cxt.i32_type().ptr_type(AddressSpace::Generic),
+                "rtti_slot_i32",
+            )
+            .into_pointer_value();
+
+        let sizes = cxt
+            .builder
+            .build_int_truncate(size, cxt.cxt.i32_type(), "rtti_size_i32");
+        let sizes = cxt.builder.build_left_shift(
+            sizes,
+            cxt.cxt.i32_type().const_int(16, false),
+            "rtti_size_shl",
+        );
+        let sizes = cxt.builder.build_or(sizes, ty_size, "rtti_sizes");
+        cxt.builder.build_store(slot, sizes);
+        slot = unsafe {
+            cxt.builder.build_in_bounds_gep(
+                slot,
+                &[cxt.cxt.i32_type().const_int(1, false)],
+                "rtti_slots",
+            )
+        };
+
+        for entry in &self.entries {
+            match entry {
+                TyInfoPart::Constant(v) => {
+                    let values: Vec<_> = v
+                        .iter()
+                        .map(|x| cxt.cxt.i32_type().const_int(*x as u64, false))
+                        .collect();
+                    let arr = cxt.cxt.i32_type().const_array(&values);
+                    let arr_slot = cxt
+                        .builder
+                        .build_bitcast(
+                            slot,
+                            arr.get_type().ptr_type(AddressSpace::Generic),
+                            "const_rtti_slot",
+                        )
+                        .into_pointer_value();
+                    cxt.builder.build_store(arr_slot, arr);
+
+                    slot = unsafe {
+                        cxt.builder.build_in_bounds_gep(
+                            slot,
+                            &[cxt.cxt.i32_type().const_int(v.len() as u64, false)],
+                            "rtti_next_slot",
+                        )
+                    };
+                }
+                TyInfoPart::Splice(ptr, b) => {
+                    // Skip the size to get to the actual entries
+                    let ptr = unsafe {
+                        cxt.builder.build_in_bounds_gep(
+                            *ptr,
+                            &[cxt.cxt.i32_type().const_int(1, false)],
+                            "spliced_rtti",
+                        )
+                    };
+
+                    let size = splice_sizes.pop_front().unwrap();
+                    cxt.builder.build_memcpy(slot, 4, ptr, 4, size).unwrap();
+                    let size_i32s = cxt.builder.build_int_unsigned_div(
+                        size,
+                        cxt.size_ty().const_int(8, false),
+                        "spliced_rtti_size_i32s",
+                    );
+
+                    if *b {
+                        // Mark the last entry that it's continued
+                        let last_idx = cxt.builder.build_int_sub(
+                            size_i32s,
+                            cxt.cxt.i32_type().const_int(1, false),
+                            "spliced_rtti_last_idx",
+                        );
+                        let last_slot = unsafe {
+                            cxt.builder.build_in_bounds_gep(
+                                slot,
+                                &[last_idx],
+                                "spliced_rtti_last_slot",
+                            )
+                        };
+                        let last_entry = cxt
+                            .builder
+                            .build_load(last_slot, "spliced_rtti_last_entry")
+                            .into_int_value();
+                        let last_entry = cxt.builder.build_or(
+                            last_entry,
+                            cxt.cxt.i32_type().const_int(1, false),
+                            "spliced_rtti_last_entry_continued",
+                        );
+                        cxt.builder.build_store(last_slot, last_entry);
+                    }
+
+                    slot = unsafe {
+                        cxt.builder
+                            .build_in_bounds_gep(slot, &[size_i32s], "rtti_next_slot")
+                    };
+                }
+            }
+        }
+
+        cxt.builder
+            .build_bitcast(
+                malloc,
+                cxt.cxt.i32_type().ptr_type(AddressSpace::Generic),
+                "rtti_slot_i32",
+            )
+            .into_pointer_value()
     }
 }
 
@@ -533,7 +916,7 @@ impl<'cxt> Cxt<'cxt> {
             },
 
             Node::Param(_, _) | Node::Proj(_, _, _) => match self.try_gen_value(val, slots, uses) {
-                Some(v) => Type::Unknown(v.into_int_value()),
+                Some(v) => Type::Unknown(v.into_pointer_value()),
                 None => Type::Unknown2(val),
             },
 
@@ -563,6 +946,7 @@ impl<'cxt> Cxt<'cxt> {
             | Type::PtrEnum(_)
             | Type::Unknown(_)
             | Type::Unknown2(_)
+            | Type::Type
             | Type::ExternFun(_, _) => self
                 .builder
                 .build_bitcast(val, self.any_ty(), "to_any")
@@ -578,11 +962,6 @@ impl<'cxt> Cxt<'cxt> {
                     "to_any",
                 )
             }
-            Type::Type => self.builder.build_int_to_ptr(
-                val.into_int_value(),
-                self.any_ty().into_pointer_type(),
-                "to_any",
-            ),
 
             // Allocate and call `store`
             Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Closure(_) => {
@@ -611,6 +990,7 @@ impl<'cxt> Cxt<'cxt> {
             | Type::PtrEnum(_)
             | Type::Unknown(_)
             | Type::Unknown2(_)
+            | Type::Type
             | Type::ExternFun(_, _) => {
                 let lty = ty.llvm_ty(self);
                 self.builder.build_bitcast(ptr, lty, "from_any")
@@ -620,12 +1000,6 @@ impl<'cxt> Cxt<'cxt> {
             Type::Int(bits) => {
                 assert!(*bits <= 64, "too big for ptrtoint");
                 let int_type = self.cxt.custom_width_int_type(*bits);
-                self.builder
-                    .build_ptr_to_int(ptr, int_type, "from_any")
-                    .as_basic_value_enum()
-            }
-            Type::Type => {
-                let int_type = self.size_ty();
                 self.builder
                     .build_ptr_to_int(ptr, int_type, "from_any")
                     .as_basic_value_enum()
@@ -1137,14 +1511,6 @@ impl<'cxt> Cxt<'cxt> {
 
                 cl.as_basic_value_enum()
             }
-            Node::FunType(_) => {
-                let ty = self.cxt.struct_type(&[self.any_ty(), self.any_ty()], false);
-                ty.size_of().unwrap().as_basic_value_enum()
-            }
-            Node::ExternFunType(_, _) | Node::RefTy(_) => {
-                // Just a function pointer
-                self.any_ty().size_of().unwrap().as_basic_value_enum()
-            }
             Node::ExternFun(name, params, ret) => {
                 let fun = match self.module.get_function(name) {
                     Some(fun) => fun,
@@ -1162,10 +1528,6 @@ impl<'cxt> Cxt<'cxt> {
                     .as_pointer_value()
                     .as_basic_value_enum()
             }
-            Node::ProdType(_) | Node::SumType(_) => self
-                .as_type(val, slots, uses)
-                .heap_size(self, slots, uses)
-                .as_basic_value_enum(),
             Node::Proj(ty, x, idx) => {
                 let ty = self.as_type(*ty, slots, uses);
                 match &ty {
@@ -1496,22 +1858,27 @@ impl<'cxt> Cxt<'cxt> {
                 let ptr = self.blocks.borrow().get(f)?.1[*i as usize];
                 self.builder.build_load(ptr, "param")
             }
-            Node::Const(c) => match c {
-                crate::ir::Constant::TypeType => self.size_ty().size_of().as_basic_value_enum(),
-                crate::ir::Constant::IntType(w) => self
-                    .cxt
-                    .custom_width_int_type(w.bits())
-                    .size_of()
-                    .as_basic_value_enum(),
-                crate::ir::Constant::Int(w, val) => self
-                    .cxt
-                    .custom_width_int_type(w.bits())
-                    .const_int(*val as u64, false)
-                    .as_basic_value_enum(),
-                crate::ir::Constant::Stop | crate::ir::Constant::Unreachable => {
-                    panic!("stop or unreachable isn't a first-class function!")
-                }
-            },
+            Node::Const(Constant::Int(w, val)) => self
+                .cxt
+                .custom_width_int_type(w.bits())
+                .const_int(*val as u64, false)
+                .as_basic_value_enum(),
+            Node::Const(Constant::Stop) | Node::Const(Constant::Unreachable) => {
+                panic!("stop or unreachable isn't a first-class function!")
+            }
+            Node::FunType(_)
+            | Node::ExternFunType(_, _)
+            | Node::RefTy(_)
+            | Node::ProdType(_)
+            | Node::SumType(_)
+            | Node::Const(Constant::TypeType)
+            | Node::Const(Constant::IntType(_)) => {
+                let ty = self.as_type(val, slots, uses);
+                let mut tyinfo = TyInfo::new();
+                ty.tyinfo(&mut tyinfo);
+                let ty_size = ty.heap_size(self, slots, uses);
+                tyinfo.codegen(ty_size, self).as_basic_value_enum()
+            }
             Node::ExternCall(_, _) => panic!("externcall isn't a first-class function!"),
             Node::BinOp(op, a, b) => {
                 let a = self.try_gen_value(*a, slots, uses)?;

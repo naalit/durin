@@ -54,8 +54,8 @@ fn run_file(source: &str) {
     let l = backend.codegen_module(&mut m);
     let s = l.print_to_string();
     let s = s.to_str().unwrap();
-    l.verify().unwrap();
     println!("{}", s);
+    l.verify().unwrap();
 
     // The main function is tailcc, so generate a ccc wrapper function which just calls it
     let cxt = &backend.cxt;
@@ -98,8 +98,8 @@ fn basic() {
     let l = backend.codegen_module(&mut m);
     let s = l.print_to_string();
     let s = s.to_str().unwrap();
-    l.verify().unwrap();
     println!("{}", s);
+    l.verify().unwrap();
     assert!(
         s.contains("define tailcc i32 @f("),
         "f should use the LLVM stack!"

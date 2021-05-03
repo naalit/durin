@@ -1,8 +1,7 @@
-use std::collections::{HashMap, HashSet};
-
 use crate::ir::*;
 use specs::prelude::*;
 use specs::Component;
+use std::collections::HashMap;
 
 pub struct SSA;
 
