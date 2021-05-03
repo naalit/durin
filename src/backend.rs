@@ -217,18 +217,22 @@ impl<'cxt> Cxt<'cxt> {
                 .into_pointer_value(),
 
             // It's an integer, so do an inttoptr
-            // TODO: don't try to memcpy it when it's an Unknown
-            Type::Int(bits) => {
-                assert!(*bits <= 64, "too big for inttoptr");
-                self.builder.build_int_to_ptr(
-                    val.into_int_value(),
-                    self.any_ty().into_pointer_type(),
-                    "to_any",
-                )
+            Type::Int(bits) if *bits < 64 => {
+                let val = val.into_int_value();
+                let val = self.builder.build_left_shift(
+                    val,
+                    val.get_type().const_int(1, false),
+                    "int_shl",
+                );
+                let val =
+                    self.builder
+                        .build_or(val, val.get_type().const_int(1, false), "int_mark");
+                self.builder
+                    .build_int_to_ptr(val, self.any_ty().into_pointer_type(), "to_any")
             }
 
             // Allocate and call `store`
-            Type::StackStruct(_) | Type::StackEnum(_, _) => {
+            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) => {
                 let size = ty.heap_size(self, data);
                 let malloc = self
                     .builder
@@ -261,16 +265,21 @@ impl<'cxt> Cxt<'cxt> {
             }
 
             // It's an integer, so do an ptrtoint
-            Type::Int(bits) => {
-                assert!(*bits <= 64, "too big for ptrtoint");
+            Type::Int(bits) if *bits < 64 => {
                 let int_type = self.cxt.custom_width_int_type(*bits);
-                self.builder
-                    .build_ptr_to_int(ptr, int_type, "from_any")
-                    .as_basic_value_enum()
+                let val = self.builder.build_ptr_to_int(ptr, int_type, "from_any");
+                // TODO check signedness
+                let val = self.builder.build_right_shift(
+                    val,
+                    val.get_type().const_int(1, false),
+                    true,
+                    "int_unmarked",
+                );
+                val.as_basic_value_enum()
             }
 
             // Load from the pointer
-            Type::StackStruct(_) | Type::StackEnum(_, _) => self.load(ty, ptr, data),
+            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) => self.load(ty, ptr, data),
         }
     }
 
@@ -338,7 +347,7 @@ impl<'cxt> Cxt<'cxt> {
             Type::Unknown(_) | Type::Unknown2(_) | Type::PtrStruct(_) | Type::PtrEnum(_) => {
                 let size = ty.heap_size(self, data);
                 let fits = self.builder.build_int_compare(
-                    IntPredicate::ULE,
+                    IntPredicate::ULT,
                     size,
                     self.size_ty().const_int(8, false),
                     "fits_in_word",
@@ -429,7 +438,7 @@ impl<'cxt> Cxt<'cxt> {
             Type::Unknown(_) | Type::Unknown2(_) | Type::PtrStruct(_) | Type::PtrEnum(_) => {
                 let size = ty.heap_size(self, data);
                 let fits = self.builder.build_int_compare(
-                    IntPredicate::ULE,
+                    IntPredicate::ULT,
                     size,
                     self.size_ty().const_int(8, false),
                     "fits_in_word",
@@ -528,7 +537,7 @@ impl<'cxt> Cxt<'cxt> {
                         // TODO only compute the size once, and use bitwise and instead of alloca
                         let size = ty.heap_size(self, data);
                         let fits = self.builder.build_int_compare(
-                            IntPredicate::ULE,
+                            IntPredicate::ULT,
                             size,
                             self.size_ty().const_int(8, false),
                             "fits_in_word",
@@ -539,10 +548,15 @@ impl<'cxt> Cxt<'cxt> {
                                 fits,
                                 || {
                                     // If it fits in a word, put it in an alloca so we can still work with a pointer
-                                    let ptr2 =
-                                        self.builder.build_alloca(self.any_ty(), "proj_slot");
-                                    self.builder.build_store(ptr2, val);
-                                    ptr2.as_basic_value_enum()
+                                    let ptr = self.builder.build_alloca(self.size_ty(), "proj_slot");
+                                    let val = self.builder.build_ptr_to_int(ptr, self.size_ty(), "proj_val");
+                                    let val = self.builder.build_right_shift(val, self.size_ty().const_int(1, false), false, "proj_val_unmarked");
+                                    self.builder.build_store(ptr, val);
+                                    self.builder.build_bitcast(
+                                        ptr,
+                                        self.any_ty(),
+                                        "proj_slot_casted",
+                                    )
                                 },
                                 || val,
                             )
@@ -597,7 +611,7 @@ impl<'cxt> Cxt<'cxt> {
                     Type::StackEnum(_, v) | Type::PtrEnum(v) => {
                         let size = vty.heap_size(self, data);
                         let fits = self.builder.build_int_compare(
-                            IntPredicate::ULE,
+                            IntPredicate::ULT,
                             size,
                             self.size_ty().const_int(8, false),
                             "fits_in_word",
@@ -753,7 +767,7 @@ impl<'cxt> Cxt<'cxt> {
                         let val = self.try_gen_value(*x, data)?;
                         let size = ty.heap_size(self, data);
                         let fits = self.builder.build_int_compare(
-                            IntPredicate::ULE,
+                            IntPredicate::ULT,
                             size,
                             self.size_ty().const_int(8, false),
                             "fits_in_word",
@@ -763,7 +777,9 @@ impl<'cxt> Cxt<'cxt> {
                                 fits,
                                 || {
                                     // If it fits in a word, put it in an alloca so we can still work with a pointer
-                                    let ptr = self.builder.build_alloca(self.any_ty(), "proj_slot");
+                                    let ptr = self.builder.build_alloca(self.size_ty(), "proj_slot");
+                                    let val = self.builder.build_ptr_to_int(ptr, self.size_ty(), "proj_val");
+                                    let val = self.builder.build_right_shift(val, self.size_ty().const_int(1, false), false, "proj_val_unmarked");
                                     self.builder.build_store(ptr, val);
                                     self.builder.build_bitcast(
                                         ptr,
@@ -848,7 +864,7 @@ impl<'cxt> Cxt<'cxt> {
                             "sum_type_size",
                         );
                         let fits = self.builder.build_int_compare(
-                            IntPredicate::ULE,
+                            IntPredicate::ULT,
                             size,
                             self.size_ty().const_int(8, false),
                             "fits_in_word",
@@ -940,7 +956,11 @@ impl<'cxt> Cxt<'cxt> {
                                             "sum_type_bitcast_slot_again",
                                         )
                                         .into_pointer_value();
-                                    self.builder.build_load(ptr, "sum_type_as_word")
+                                    let val = self.builder.build_load(ptr, "sum_type_as_word").into_pointer_value();
+                                    let val = self.builder.build_ptr_to_int(val, self.size_ty(), "sum_type_word");
+                                    let val = self.builder.build_right_shift(val, self.size_ty().const_int(1, false), false, "sum_type_shl");
+                                    let val = self.builder.build_or(val, self.size_ty().const_int(1, false), "sum_type_marked");
+                                    self.builder.build_int_to_ptr(val, self.any_ty().into_pointer_type(), "sum_type_word_ptr").as_basic_value_enum()
                                 },
                                 || malloc.as_basic_value_enum(),
                             ),
@@ -977,7 +997,7 @@ impl<'cxt> Cxt<'cxt> {
                         let size = ty.heap_size(self, data);
 
                         let fits = self.builder.build_int_compare(
-                            IntPredicate::ULE,
+                            IntPredicate::ULT,
                             size,
                             self.size_ty().const_int(8, false),
                             "fits_in_word",
@@ -1017,7 +1037,11 @@ impl<'cxt> Cxt<'cxt> {
                                         "struct_bitcast_slot_again",
                                     )
                                     .into_pointer_value();
-                                self.builder.build_load(ptr, "struct_as_word")
+                                let val = self.builder.build_load(ptr, "struct_as_word").into_pointer_value();
+                                let val = self.builder.build_ptr_to_int(val, self.size_ty(), "struct_word");
+                                let val = self.builder.build_right_shift(val, self.size_ty().const_int(1, false), false, "struct_shl");
+                                let val = self.builder.build_or(val, self.size_ty().const_int(1, false), "struct_marked");
+                                self.builder.build_int_to_ptr(val, self.any_ty().into_pointer_type(), "struct_word_ptr").as_basic_value_enum()
                             },
                             || malloc.as_basic_value_enum(),
                         )
@@ -1620,11 +1644,7 @@ impl<'cxt> Cxt<'cxt> {
                     // If its size might depend on other upvalues, always box it since we don't know the order of upvalues
                     // and even if we did, we could have e.g. `x : { Type, y.0 }; y : { Type, x.0 }`
                     // so we just need to box those all the time
-                    let ty = if ty.has_unknown() {
-                        &Type::Pointer
-                    } else {
-                        ty
-                    };
+                    let ty = if ty.has_unknown() { &Type::Pointer } else { ty };
                     let x = ty.heap_size(self, data);
                     let align = ty.alignment();
                     if align > 0 {
