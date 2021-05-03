@@ -268,7 +268,7 @@ impl<'cxt> Type<'cxt> {
         }
     }
 
-    pub fn tyinfo(&self, info: &mut TyInfo<'cxt>) {
+    fn tyinfo(&self, info: &mut TyInfo<'cxt>) {
         match self {
             Type::Pointer => info.word(true),
             Type::StackStruct(tys) | Type::PtrStruct(tys) => {
@@ -302,6 +302,13 @@ impl<'cxt> Type<'cxt> {
             Type::Type => info.word(true),
         }
     }
+
+    pub fn as_rtti(&self, cxt: &Cxt<'cxt>, data: &Data) -> PointerValue<'cxt> {
+        let mut tyinfo = TyInfo::new();
+        self.tyinfo(&mut tyinfo);
+        let ty_size = self.heap_size(cxt, data);
+        tyinfo.codegen(ty_size, cxt)
+    }
 }
 
 enum TyInfoPart<'cxt> {
@@ -323,7 +330,7 @@ impl<'cxt> TyInfoPart<'cxt> {
 enum LastType {
     Normal,
     VariantNext,
-    VariantEnd(usize),
+    VariantEnd((usize, usize)),
 }
 
 // Type information is structured as a 16-bit size of the type in bytes, 16-bit size of the type info in bytes, then a number of 32-bit *entries*, one after another.
@@ -350,9 +357,9 @@ enum LastType {
 // |      | 10 is the type for a run-length encoding
 // |      whether the words in this run are pointers
 // 28-bit size of the run in words
-pub struct TyInfo<'cxt> {
+struct TyInfo<'cxt> {
     run_words: Vec<bool>,
-    variant_stack: Vec<usize>,
+    variant_stack: Vec<(usize, usize)>,
     last: LastType,
     extra_bytes: u32,
     entries: Vec<TyInfoPart<'cxt>>,
@@ -364,7 +371,10 @@ impl<'cxt> TyInfo<'cxt> {
                 self.entries.last_mut().map(TyInfoPart::extend);
             }
             LastType::VariantNext => (),
-            LastType::VariantEnd(i) => self.entries[i].extend(),
+            LastType::VariantEnd((i, j)) => match &mut self.entries[i] {
+                TyInfoPart::Constant(v) => v[j] |= 1,
+                _ => unreachable!(),
+            },
         }
         self.last = LastType::Normal;
     }
@@ -399,11 +409,18 @@ impl<'cxt> TyInfo<'cxt> {
         self.extra_bytes = offset;
         self.finish_bitset();
 
-        self.variant_stack.push(self.entries.len());
         let num: u16 = num.try_into().expect("Too many variants");
         assert!(tag_size <= 8, "tag must be <= 8 bytes, got {}", tag_size);
         let entry = 0b01_0 | ((tag_size - 1) << 3) | (offset << 6) | ((num as u32) << 16);
         self.entry(entry);
+
+        self.variant_stack.push((
+            self.entries.len() - 1,
+            match self.entries.last().unwrap() {
+                TyInfoPart::Constant(v) => v.len() - 1,
+                _ => unreachable!(),
+            },
+        ));
     }
 
     fn next_variant(&mut self) {
@@ -475,7 +492,7 @@ impl<'cxt> TyInfo<'cxt> {
             .builder
             .build_int_truncate(ty_size, cxt.cxt.i32_type(), "ty_size_i32");
 
-        // Don't malloc if it's constant
+        // Don't allocate if it's constant
         if self.entries.len() == 1 {
             if let TyInfoPart::Constant(v) = &self.entries[0] {
                 let rtti_size = v.len() * 4;
@@ -539,14 +556,48 @@ impl<'cxt> TyInfo<'cxt> {
             }
         }
 
-        let malloc = cxt
-            .builder
-            .build_array_malloc(cxt.cxt.i8_type(), size, "rtti_slot")
-            .unwrap();
+        let rtti_rtti = if let Some(size) = size.get_zero_extended_constant() {
+            let global = cxt
+                .module
+                .add_global(cxt.cxt.i32_type(), None, "rtti_const_rtti");
+            global.set_unnamed_addr(true);
+            global.set_constant(true);
+            global.set_alignment(8);
+            // The size of the RTTI RTTI is 0, since it doesn't include space for the size itself
+            global.set_initializer(&cxt.cxt.i32_type().const_int(size, false));
+            global.as_pointer_value()
+        } else {
+            let global = cxt
+                .module
+                .add_global(cxt.cxt.i32_type(), None, "just_size_rtti");
+            global.set_unnamed_addr(true);
+            global.set_constant(true);
+            global.set_alignment(8);
+            global.set_initializer(&cxt.cxt.i32_type().const_int(4, false));
+            let just_size_rtti = global.as_pointer_value();
+
+            let alloc = cxt.alloc(
+                cxt.cxt.i32_type().const_int(4, false),
+                just_size_rtti,
+                "rtti_rtti",
+            );
+            let alloc_i32 = cxt.builder.build_bitcast(
+                alloc,
+                cxt.cxt.i32_type().ptr_type(AddressSpace::Generic),
+                "rtti_size_slot",
+            );
+            let size = cxt
+                .builder
+                .build_int_truncate(size, cxt.cxt.i32_type(), "size_i32");
+            cxt.builder
+                .build_store(alloc_i32.into_pointer_value(), size);
+            alloc
+        };
+        let alloc = cxt.alloc(size, rtti_rtti, "rtti_slot");
         let mut slot = cxt
             .builder
             .build_bitcast(
-                malloc,
+                alloc,
                 cxt.cxt.i32_type().ptr_type(AddressSpace::Generic),
                 "rtti_slot_i32",
             )
@@ -610,7 +661,7 @@ impl<'cxt> TyInfo<'cxt> {
                     cxt.builder.build_memcpy(slot, 4, ptr, 4, size).unwrap();
                     let size_i32s = cxt.builder.build_int_unsigned_div(
                         size,
-                        cxt.size_ty().const_int(8, false),
+                        cxt.size_ty().const_int(4, false),
                         "spliced_rtti_size_i32s",
                     );
 
@@ -650,7 +701,7 @@ impl<'cxt> TyInfo<'cxt> {
 
         cxt.builder
             .build_bitcast(
-                malloc,
+                alloc,
                 cxt.cxt.i32_type().ptr_type(AddressSpace::Generic),
                 "rtti_slot_i32",
             )

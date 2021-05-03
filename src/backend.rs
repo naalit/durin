@@ -126,6 +126,17 @@ pub struct Cxt<'cxt> {
     pub cont: RefCell<Option<(Val, Vec<Type<'cxt>>)>>,
 }
 impl<'cxt> Cxt<'cxt> {
+    pub fn alloc(
+        &self,
+        size: IntValue<'cxt>,
+        header: PointerValue<'cxt>,
+        name: &str,
+    ) -> PointerValue<'cxt> {
+        self.builder
+            .build_array_malloc(self.cxt.i8_type(), size, name)
+            .unwrap()
+    }
+
     pub fn if_expr(
         &self,
         cond: IntValue<'cxt>,
@@ -234,12 +245,9 @@ impl<'cxt> Cxt<'cxt> {
             // Allocate and call `store`
             Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) => {
                 let size = ty.heap_size(self, data);
-                let malloc = self
-                    .builder
-                    .build_array_malloc(self.cxt.i8_type(), size, "any_slot")
-                    .unwrap();
-                self.store(ty, val, malloc, data);
-                malloc
+                let alloc = self.alloc(size, ty.as_rtti(self, data), "any_slot");
+                self.store(ty, val, alloc, data);
+                alloc
             }
         }
     }
@@ -548,9 +556,19 @@ impl<'cxt> Cxt<'cxt> {
                                 fits,
                                 || {
                                     // If it fits in a word, put it in an alloca so we can still work with a pointer
-                                    let ptr = self.builder.build_alloca(self.size_ty(), "proj_slot");
-                                    let val = self.builder.build_ptr_to_int(ptr, self.size_ty(), "proj_val");
-                                    let val = self.builder.build_right_shift(val, self.size_ty().const_int(1, false), false, "proj_val_unmarked");
+                                    let ptr =
+                                        self.builder.build_alloca(self.size_ty(), "proj_slot");
+                                    let val = self.builder.build_ptr_to_int(
+                                        ptr,
+                                        self.size_ty(),
+                                        "proj_val",
+                                    );
+                                    let val = self.builder.build_right_shift(
+                                        val,
+                                        self.size_ty().const_int(1, false),
+                                        false,
+                                        "proj_val_unmarked",
+                                    );
                                     self.builder.build_store(ptr, val);
                                     self.builder.build_bitcast(
                                         ptr,
@@ -715,11 +733,8 @@ impl<'cxt> Cxt<'cxt> {
                     .chain(env.iter().map(|&(x, _, _)| x))
                     .collect();
 
-                let malloc = self
-                    .builder
-                    .build_array_malloc(self.cxt.i8_type(), size, "env_slot")
-                    .unwrap();
-                self.gen_struct(&values, &env_ty, malloc, data);
+                let alloc = self.alloc(size, env_ty.as_rtti(self, data), "env_slot");
+                self.gen_struct(&values, &env_ty, alloc, data);
                 self.pop_val(fun_ptr_val);
 
                 // We use the unknown version of the function, which takes one environment parameter and all of type i8* (any)
@@ -730,11 +745,8 @@ impl<'cxt> Cxt<'cxt> {
                     .fn_type(&arg_tys, false)
                     .ptr_type(AddressSpace::Generic);
 
-                self.builder.build_bitcast(
-                    malloc,
-                    fun_ty.ptr_type(AddressSpace::Generic),
-                    "closure",
-                )
+                self.builder
+                    .build_bitcast(alloc, fun_ty.ptr_type(AddressSpace::Generic), "closure")
             }
             Node::ExternFun(name, params, ret) => {
                 let fun = match self.module.get_function(name) {
@@ -777,9 +789,19 @@ impl<'cxt> Cxt<'cxt> {
                                 fits,
                                 || {
                                     // If it fits in a word, put it in an alloca so we can still work with a pointer
-                                    let ptr = self.builder.build_alloca(self.size_ty(), "proj_slot");
-                                    let val = self.builder.build_ptr_to_int(ptr, self.size_ty(), "proj_val");
-                                    let val = self.builder.build_right_shift(val, self.size_ty().const_int(1, false), false, "proj_val_unmarked");
+                                    let ptr =
+                                        self.builder.build_alloca(self.size_ty(), "proj_slot");
+                                    let val = self.builder.build_ptr_to_int(
+                                        ptr,
+                                        self.size_ty(),
+                                        "proj_val",
+                                    );
+                                    let val = self.builder.build_right_shift(
+                                        val,
+                                        self.size_ty().const_int(1, false),
+                                        false,
+                                        "proj_val_unmarked",
+                                    );
                                     self.builder.build_store(ptr, val);
                                     self.builder.build_bitcast(
                                         ptr,
@@ -869,7 +891,7 @@ impl<'cxt> Cxt<'cxt> {
                             self.size_ty().const_int(8, false),
                             "fits_in_word",
                         );
-                        let malloc = match &ty {
+                        let alloc = match &ty {
                             Type::StackEnum(_, _) => {
                                 let alloca = self.builder.build_array_alloca(
                                     self.cxt.i8_type(),
@@ -897,13 +919,7 @@ impl<'cxt> Cxt<'cxt> {
                                         )
                                     },
                                     || {
-                                        self.builder
-                                            .build_array_malloc(
-                                                self.cxt.i8_type(),
-                                                size,
-                                                "sum_type_malloc",
-                                            )
-                                            .unwrap()
+                                        self.alloc(size, ty.as_rtti(self, data), "sum_type_alloc")
                                             .as_basic_value_enum()
                                     },
                                 )
@@ -915,7 +931,7 @@ impl<'cxt> Cxt<'cxt> {
                             let tag = tag * 8;
                             let tag = self.cxt.custom_width_int_type(tag);
                             let tag_slot = self.builder.build_bitcast(
-                                malloc,
+                                alloc,
                                 tag.ptr_type(AddressSpace::Generic),
                                 "tag_slot",
                             );
@@ -925,7 +941,7 @@ impl<'cxt> Cxt<'cxt> {
 
                         let payload_slot = unsafe {
                             self.builder.build_in_bounds_gep(
-                                malloc,
+                                alloc,
                                 &[self.size_ty().const_int(tag.into(), false)],
                                 "payload_slot",
                             )
@@ -936,13 +952,13 @@ impl<'cxt> Cxt<'cxt> {
                             Type::StackEnum(_, _) => {
                                 // Copy the enum out of the alloca
                                 let llvm_ty = ty.llvm_ty(self);
-                                let malloc = self.builder.build_bitcast(
-                                    malloc,
+                                let alloc = self.builder.build_bitcast(
+                                    alloc,
                                     llvm_ty.ptr_type(AddressSpace::Generic),
                                     "sum_type_casted",
                                 );
                                 self.builder
-                                    .build_load(malloc.into_pointer_value(), "sum_type")
+                                    .build_load(alloc.into_pointer_value(), "sum_type")
                             }
                             // Just return the pointer
                             Type::PtrEnum(_) => self.if_expr(
@@ -951,18 +967,40 @@ impl<'cxt> Cxt<'cxt> {
                                     let ptr = self
                                         .builder
                                         .build_bitcast(
-                                            malloc,
+                                            alloc,
                                             self.any_ty().ptr_type(AddressSpace::Generic),
                                             "sum_type_bitcast_slot_again",
                                         )
                                         .into_pointer_value();
-                                    let val = self.builder.build_load(ptr, "sum_type_as_word").into_pointer_value();
-                                    let val = self.builder.build_ptr_to_int(val, self.size_ty(), "sum_type_word");
-                                    let val = self.builder.build_right_shift(val, self.size_ty().const_int(1, false), false, "sum_type_shl");
-                                    let val = self.builder.build_or(val, self.size_ty().const_int(1, false), "sum_type_marked");
-                                    self.builder.build_int_to_ptr(val, self.any_ty().into_pointer_type(), "sum_type_word_ptr").as_basic_value_enum()
+                                    let val = self
+                                        .builder
+                                        .build_load(ptr, "sum_type_as_word")
+                                        .into_pointer_value();
+                                    let val = self.builder.build_ptr_to_int(
+                                        val,
+                                        self.size_ty(),
+                                        "sum_type_word",
+                                    );
+                                    let val = self.builder.build_right_shift(
+                                        val,
+                                        self.size_ty().const_int(1, false),
+                                        false,
+                                        "sum_type_shl",
+                                    );
+                                    let val = self.builder.build_or(
+                                        val,
+                                        self.size_ty().const_int(1, false),
+                                        "sum_type_marked",
+                                    );
+                                    self.builder
+                                        .build_int_to_ptr(
+                                            val,
+                                            self.any_ty().into_pointer_type(),
+                                            "sum_type_word_ptr",
+                                        )
+                                        .as_basic_value_enum()
                                 },
-                                || malloc.as_basic_value_enum(),
+                                || alloc.as_basic_value_enum(),
                             ),
                             _ => unreachable!(),
                         }
@@ -1002,7 +1040,7 @@ impl<'cxt> Cxt<'cxt> {
                             self.size_ty().const_int(8, false),
                             "fits_in_word",
                         );
-                        let malloc = self
+                        let alloc = self
                             .if_expr(
                                 fits,
                                 || {
@@ -1013,18 +1051,13 @@ impl<'cxt> Cxt<'cxt> {
                                         .build_bitcast(alloca, self.any_ty(), "struct_slot")
                                 },
                                 || {
-                                    self.builder
-                                        .build_array_malloc(
-                                            self.cxt.i8_type(),
-                                            size,
-                                            "struct_malloc",
-                                        )
-                                        .unwrap()
+                                    self.alloc(size, ty.as_rtti(self, data), "struct_alloc")
                                         .as_basic_value_enum()
                                 },
                             )
                             .into_pointer_value();
-                        self.gen_struct(values, &ty, malloc, data);
+
+                        self.gen_struct(values, &ty, alloc, data);
 
                         self.if_expr(
                             fits,
@@ -1032,18 +1065,40 @@ impl<'cxt> Cxt<'cxt> {
                                 let ptr = self
                                     .builder
                                     .build_bitcast(
-                                        malloc,
+                                        alloc,
                                         self.any_ty().ptr_type(AddressSpace::Generic),
                                         "struct_bitcast_slot_again",
                                     )
                                     .into_pointer_value();
-                                let val = self.builder.build_load(ptr, "struct_as_word").into_pointer_value();
-                                let val = self.builder.build_ptr_to_int(val, self.size_ty(), "struct_word");
-                                let val = self.builder.build_right_shift(val, self.size_ty().const_int(1, false), false, "struct_shl");
-                                let val = self.builder.build_or(val, self.size_ty().const_int(1, false), "struct_marked");
-                                self.builder.build_int_to_ptr(val, self.any_ty().into_pointer_type(), "struct_word_ptr").as_basic_value_enum()
+                                let val = self
+                                    .builder
+                                    .build_load(ptr, "struct_as_word")
+                                    .into_pointer_value();
+                                let val = self.builder.build_ptr_to_int(
+                                    val,
+                                    self.size_ty(),
+                                    "struct_word",
+                                );
+                                let val = self.builder.build_right_shift(
+                                    val,
+                                    self.size_ty().const_int(1, false),
+                                    false,
+                                    "struct_shl",
+                                );
+                                let val = self.builder.build_or(
+                                    val,
+                                    self.size_ty().const_int(1, false),
+                                    "struct_marked",
+                                );
+                                self.builder
+                                    .build_int_to_ptr(
+                                        val,
+                                        self.any_ty().into_pointer_type(),
+                                        "struct_word_ptr",
+                                    )
+                                    .as_basic_value_enum()
                             },
-                            || malloc.as_basic_value_enum(),
+                            || alloc.as_basic_value_enum(),
                         )
                     }
                     _ => unreachable!(),
@@ -1073,13 +1128,10 @@ impl<'cxt> Cxt<'cxt> {
             | Node::ProdType(_)
             | Node::SumType(_)
             | Node::Const(Constant::TypeType)
-            | Node::Const(Constant::IntType(_)) => {
-                let ty = self.as_type(val, data);
-                let mut tyinfo = TyInfo::new();
-                ty.tyinfo(&mut tyinfo);
-                let ty_size = ty.heap_size(self, data);
-                tyinfo.codegen(ty_size, self).as_basic_value_enum()
-            }
+            | Node::Const(Constant::IntType(_)) => self
+                .as_type(val, data)
+                .as_rtti(self, data)
+                .as_basic_value_enum(),
             Node::ExternCall(_, _) => panic!("externcall isn't a first-class function!"),
             Node::BinOp(op, a, b) => {
                 let a = self.try_gen_value(*a, data)?;
@@ -1277,10 +1329,7 @@ impl<'cxt> Cxt<'cxt> {
                 let arg = match op {
                     crate::ir::RefOp::RefNew => {
                         let size = ty.heap_size(self, data);
-                        let ptr = self
-                            .builder
-                            .build_array_malloc(self.cxt.i8_type(), size, "ref_ptr")
-                            .unwrap();
+                        let ptr = self.alloc(size, ty.as_rtti(self, data), "ref_ptr");
                         Some((ptr.as_basic_value_enum(), Type::Pointer))
                     }
                     crate::ir::RefOp::RefGet(r) => {
