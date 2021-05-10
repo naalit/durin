@@ -10,6 +10,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     convert::TryInto,
+    path::Path,
 };
 
 mod types;
@@ -25,6 +26,114 @@ pub struct Data<'a> {
     slots: ReadStorage<'a, Slot>,
     uses: ReadStorage<'a, Uses>,
     entities: Entities<'a>,
+}
+
+impl crate::ir::Module {
+    pub fn compile_and_link(&mut self, out_file: &Path) -> Result<(), String> {
+        let backend = Backend::native();
+        let module = backend.codegen_module(self);
+        let cxt = &backend.cxt;
+        module.verify().map_err(|s| s.to_string())?;
+        module.set_triple(&backend.machine.get_triple());
+
+        // Create a wrapper around the program's main function if there is one
+        if let Some(f) = module.get_function("main") {
+            f.as_global_value().set_name("pk$main");
+            let ty = f.get_type().print_to_string();
+            // Durin might or might not have succeeded in turning `main` into direct style
+            let run = match ty.to_str().unwrap() {
+                // () -> () in CPS
+                "void ({}, void (i8*, i8*)**)" => true,
+                // () -> () in direct style
+                "{} ({})" => true,
+                t => {
+                    eprintln!("Warning: main function has type {}, not wrapping it", t);
+                    false
+                }
+            };
+            if run {
+                let new_fun = module.add_function("main", cxt.i32_type().fn_type(&[], false), None);
+                {
+                    let b = cxt.create_builder();
+                    let bl = cxt.append_basic_block(new_fun, "entry");
+                    b.position_at_end(bl);
+                    if f.get_type().get_return_type().is_none() {
+                        // CPS
+                        // We need a tailcc stop function to pass as `main`'s continuation, as well as the start function
+                        let any_ty = cxt
+                            .i8_type()
+                            .ptr_type(AddressSpace::Generic)
+                            .as_basic_type_enum();
+                        let fun2 = module.add_function(
+                            "$_stop",
+                            cxt.void_type().fn_type(&[any_ty, any_ty], false),
+                            None,
+                        );
+                        fun2.set_call_conventions(TAILCC);
+
+                        let fun_ty = fun2
+                            .get_type()
+                            .ptr_type(AddressSpace::Generic)
+                            .as_basic_type_enum();
+                        let clos = b.build_alloca(fun_ty, "stop_closure");
+                        b.build_store(clos, fun2.as_global_value().as_pointer_value());
+
+                        let unit = cxt
+                            .struct_type(&[], false)
+                            .get_undef()
+                            .as_basic_value_enum();
+                        let call =
+                            b.build_call(f, &[unit, clos.as_basic_value_enum()], "main_call");
+                        call.set_call_convention(TAILCC);
+                        b.build_return(None);
+
+                        let bl2 = cxt.append_basic_block(fun2, "entry");
+                        b.position_at_end(bl2);
+                        b.build_return(Some(&cxt.i32_type().const_zero()));
+                    } else {
+                        // Direct style
+                        let unit = cxt
+                            .struct_type(&[], false)
+                            .get_undef()
+                            .as_basic_value_enum();
+                        let call = b.build_call(f, &[unit], "main_call");
+                        call.set_call_convention(TAILCC);
+                        call.set_tail_call(true);
+                        b.build_return(Some(&cxt.i32_type().const_zero()));
+                    }
+                }
+            }
+        }
+
+        // Call out to clang to compile and link it
+        {
+            use std::io::Write;
+            use std::process::*;
+            let buffer = module.write_bitcode_to_memory();
+            let mut child = Command::new("clang")
+                .stdin(Stdio::piped())
+                .args(&["-x", "ir", "-", "-o"])
+                .arg(out_file)
+                .spawn()
+                .map_err(|e| format!("Failed to launch clang: {}", e))?;
+            child
+                .stdin
+                .as_ref()
+                .unwrap()
+                .write_all(buffer.as_slice())
+                .expect("Failed to pipe bitcode to clang");
+            let code = child
+                .wait()
+                .map_err(|e| format!("Failed to wait on clang process: {}", e))?
+                .code()
+                .unwrap_or(0);
+            if code != 0 {
+                return Err(format!("Call to clang exited with error code {}", code));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// An owning wrapper around the Inkwell context
