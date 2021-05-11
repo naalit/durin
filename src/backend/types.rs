@@ -1,4 +1,4 @@
-use super::{Cxt, Data};
+use super::{Cxt, Data, InkwellTyExt};
 use crate::ir::{Constant, Node, Slots, Val};
 use inkwell::{types::*, values::*, AddressSpace, IntPredicate};
 use std::{collections::VecDeque, convert::TryInto};
@@ -253,18 +253,14 @@ impl<'cxt> Type<'cxt> {
                     .void_type()
                     .fn_type(&args, false)
                     .ptr_type(AddressSpace::Generic)
-                    .ptr_type(AddressSpace::Generic)
+                    .gc_ptr()
                     .as_basic_type_enum()
             }
             Type::ExternFun(v, ret) => ret
                 .fn_type(&v, false)
                 .ptr_type(AddressSpace::Generic)
                 .as_basic_type_enum(),
-            Type::Type => cxt
-                .cxt
-                .i32_type()
-                .ptr_type(AddressSpace::Generic)
-                .as_basic_type_enum(),
+            Type::Type => cxt.cxt.i32_type().gc_ptr().as_basic_type_enum(),
         }
     }
 
@@ -515,14 +511,11 @@ impl<'cxt> TyInfo<'cxt> {
                 global.set_alignment(8);
                 global.set_initializer(&arr);
 
-                return cxt
-                    .builder
-                    .build_bitcast(
-                        global.as_pointer_value(),
-                        cxt.cxt.i32_type().ptr_type(AddressSpace::Generic),
-                        "const_rtti_ptr",
-                    )
-                    .into_pointer_value();
+                return cxt.builder.build_address_space_cast(
+                    global.as_pointer_value(),
+                    cxt.cxt.i32_type().gc_ptr(),
+                    "const_rtti_ptr",
+                );
             }
         }
 
@@ -565,7 +558,11 @@ impl<'cxt> TyInfo<'cxt> {
             global.set_alignment(8);
             // The size of the RTTI RTTI is 0, since it doesn't include space for the size itself
             global.set_initializer(&cxt.cxt.i32_type().const_int(size, false));
-            global.as_pointer_value()
+            cxt.builder.build_address_space_cast(
+                global.as_pointer_value(),
+                cxt.cxt.i32_type().gc_ptr(),
+                "rtti_const_rtti_ptr",
+            )
         } else {
             let global = cxt
                 .module
@@ -574,33 +571,31 @@ impl<'cxt> TyInfo<'cxt> {
             global.set_constant(true);
             global.set_alignment(8);
             global.set_initializer(&cxt.cxt.i32_type().const_int(4, false));
-            let just_size_rtti = global.as_pointer_value();
+            let just_size_rtti = cxt.builder.build_address_space_cast(
+                global.as_pointer_value(),
+                cxt.cxt.i32_type().gc_ptr(),
+                "just_size_rtti_ptr",
+            );
 
             let alloc = cxt.alloc(
-                cxt.cxt.i32_type().const_int(4, false),
+                cxt.cxt.i64_type().const_int(4, false),
                 just_size_rtti,
                 "rtti_rtti",
             );
-            let alloc_i32 = cxt.builder.build_bitcast(
-                alloc,
-                cxt.cxt.i32_type().ptr_type(AddressSpace::Generic),
-                "rtti_size_slot",
-            );
+            let alloc_i32 = cxt
+                .builder
+                .build_bitcast(alloc, cxt.cxt.i32_type().gc_ptr(), "rtti_size_slot")
+                .into_pointer_value();
             let size = cxt
                 .builder
                 .build_int_truncate(size, cxt.cxt.i32_type(), "size_i32");
-            cxt.builder
-                .build_store(alloc_i32.into_pointer_value(), size);
-            alloc
+            cxt.builder.build_store(alloc_i32, size);
+            alloc_i32
         };
         let alloc = cxt.alloc(size, rtti_rtti, "rtti_slot");
         let mut slot = cxt
             .builder
-            .build_bitcast(
-                alloc,
-                cxt.cxt.i32_type().ptr_type(AddressSpace::Generic),
-                "rtti_slot_i32",
-            )
+            .build_bitcast(alloc, cxt.cxt.i32_type().gc_ptr(), "rtti_slot_i32")
             .into_pointer_value();
 
         let sizes = cxt
@@ -631,11 +626,7 @@ impl<'cxt> TyInfo<'cxt> {
                     let arr = cxt.cxt.i32_type().const_array(&values);
                     let arr_slot = cxt
                         .builder
-                        .build_bitcast(
-                            slot,
-                            arr.get_type().ptr_type(AddressSpace::Generic),
-                            "const_rtti_slot",
-                        )
+                        .build_bitcast(slot, arr.get_type().gc_ptr(), "const_rtti_slot")
                         .into_pointer_value();
                     cxt.builder.build_store(arr_slot, arr);
 
@@ -700,21 +691,14 @@ impl<'cxt> TyInfo<'cxt> {
         }
 
         cxt.builder
-            .build_bitcast(
-                alloc,
-                cxt.cxt.i32_type().ptr_type(AddressSpace::Generic),
-                "rtti_slot_i32",
-            )
+            .build_bitcast(alloc, cxt.cxt.i32_type().gc_ptr(), "rtti_slot_i32")
             .into_pointer_value()
     }
 }
 
 impl<'cxt> Cxt<'cxt> {
     pub fn any_ty(&self) -> BasicTypeEnum<'cxt> {
-        self.cxt
-            .i8_type()
-            .ptr_type(AddressSpace::Generic)
-            .as_basic_type_enum()
+        self.cxt.i8_type().gc_ptr().as_basic_type_enum()
     }
 
     pub fn size_ty(&self) -> IntType<'cxt> {

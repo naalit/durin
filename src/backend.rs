@@ -2,14 +2,14 @@ use crate::emit::ValPretty;
 use crate::ir::{Constant, Function, Name, Node, Slot, Slots, Uses, Val, ValExt, ValType};
 use crate::ssa::{FunMode, SSA};
 use inkwell::{
-    basic_block::BasicBlock, builder::Builder, context::Context, module::Module,
-    targets::TargetMachine, types::*, values::*, AddressSpace, IntPredicate,
+    basic_block::BasicBlock, builder::Builder, context::Context, memory_buffer::MemoryBuffer,
+    module::Module, targets::TargetMachine, types::*, values::*, AddressSpace, IntPredicate,
 };
 use specs::prelude::*;
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
-    convert::TryInto,
+    convert::{TryFrom, TryInto},
     path::Path,
 };
 
@@ -37,13 +37,13 @@ impl crate::ir::Module {
         module.set_triple(&backend.machine.get_triple());
 
         // Create a wrapper around the program's main function if there is one
-        if let Some(f) = module.get_function("main") {
+        let do_run = if let Some(f) = module.get_function("main") {
             f.as_global_value().set_name("pk$main");
             let ty = f.get_type().print_to_string();
             // Durin might or might not have succeeded in turning `main` into direct style
             let run = match ty.to_str().unwrap() {
                 // () -> () in CPS
-                "void ({}, void (i8*, i8*)**)" => true,
+                "void ({}, void (i8 addrspace(1)*, i8 addrspace(1)*)* addrspace(1)*)" => true,
                 // () -> () in direct style
                 "{} ({})" => true,
                 t => {
@@ -60,10 +60,7 @@ impl crate::ir::Module {
                     if f.get_type().get_return_type().is_none() {
                         // CPS
                         // We need a tailcc stop function to pass as `main`'s continuation, as well as the start function
-                        let any_ty = cxt
-                            .i8_type()
-                            .ptr_type(AddressSpace::Generic)
-                            .as_basic_type_enum();
+                        let any_ty = cxt.i8_type().gc_ptr().as_basic_type_enum();
                         let fun2 = module.add_function(
                             "$_stop",
                             cxt.void_type().fn_type(&[any_ty, any_ty], false),
@@ -71,12 +68,21 @@ impl crate::ir::Module {
                         );
                         fun2.set_call_conventions(TAILCC);
 
+                        let initialize = module.get_function("initialize").unwrap();
+                        let num_start_blocks = cxt.i32_type().const_int(1, false);
+                        b.build_call(
+                            initialize,
+                            &[num_start_blocks.as_basic_value_enum()],
+                            "_void",
+                        );
+
                         let fun_ty = fun2
                             .get_type()
                             .ptr_type(AddressSpace::Generic)
                             .as_basic_type_enum();
                         let clos = b.build_alloca(fun_ty, "stop_closure");
                         b.build_store(clos, fun2.as_global_value().as_pointer_value());
+                        let clos = b.build_pointer_cast(clos, fun_ty.gc_ptr(), "stop_clos_ptr");
 
                         let unit = cxt
                             .struct_type(&[], false)
@@ -85,11 +91,11 @@ impl crate::ir::Module {
                         let call =
                             b.build_call(f, &[unit, clos.as_basic_value_enum()], "main_call");
                         call.set_call_convention(TAILCC);
-                        b.build_return(None);
+                        b.build_return(Some(&cxt.i32_type().const_zero()));
 
                         let bl2 = cxt.append_basic_block(fun2, "entry");
                         b.position_at_end(bl2);
-                        b.build_return(Some(&cxt.i32_type().const_zero()));
+                        b.build_return(None);
                     } else {
                         // Direct style
                         let unit = cxt
@@ -103,26 +109,62 @@ impl crate::ir::Module {
                     }
                 }
             }
-        }
+            run
+        } else {
+            false
+        };
 
         // Call out to clang to compile and link it
         {
             use std::io::Write;
             use std::process::*;
             let buffer = module.write_bitcode_to_memory();
-            let mut child = Command::new("clang")
+            // We shouldn't need to store the runtime in a file, we could just pipe both files to clang's stdin
+            // But we would need to somehow send an EOF without closing the pipe
+            {
+                use std::fs::File;
+                let runtime = include_bytes!(concat!(env!("OUT_DIR"), "/runtime.bc"));
+                let path: &Path = "_pika_runtime.bc".as_ref();
+                // TODO what if we update the runtime and it's outdated?
+                if !path.exists() {
+                    let mut runtime_bc = File::create(path).unwrap();
+                    runtime_bc.write_all(runtime).unwrap();
+                }
+            }
+
+            let mut clang = Command::new("clang")
                 .stdin(Stdio::piped())
-                .args(&["-x", "ir", "-", "-o"])
-                .arg(out_file)
+                .args(&["-x", "ir", "-", "_pika_runtime.bc"])
+                .args(if do_run {
+                    &["-z", "notext", "-o"] as &[_]
+                } else {
+                    &["-c"] as &[_]
+                })
+                .args(if do_run { Some(out_file) } else { None })
                 .spawn()
                 .map_err(|e| format!("Failed to launch clang: {}", e))?;
-            child
-                .stdin
-                .as_ref()
-                .unwrap()
+            let stdin = clang.stdin.take().unwrap();
+
+            let mut opt = Command::new("opt")
+                .stdin(Stdio::piped())
+                .stdout(stdin)
+                .args(&["--sroa", "--mem2reg", "--rewrite-statepoints-for-gc"])
+                .spawn()
+                .map_err(|e| format!("Failed to launch opt: {}", e))?;
+            let mut stdin = opt.stdin.as_ref().unwrap();
+            stdin
                 .write_all(buffer.as_slice())
-                .expect("Failed to pipe bitcode to clang");
-            let code = child
+                .expect("Failed to pipe bitcode to opt");
+
+            let code = opt
+                .wait()
+                .map_err(|e| format!("Failed to wait on clang process: {}", e))?
+                .code()
+                .unwrap_or(0);
+            if code != 0 {
+                return Err(format!("Call to opt exited with error code {}", code));
+            }
+            let code = clang
                 .wait()
                 .map_err(|e| format!("Failed to wait on clang process: {}", e))?
                 .code()
@@ -204,6 +246,15 @@ impl Backend {
     }
 }
 
+trait InkwellTyExt<'a> {
+    fn gc_ptr(&self) -> PointerType<'a>;
+}
+impl<'a, T: BasicType<'a>> InkwellTyExt<'a> for T {
+    fn gc_ptr(&self) -> PointerType<'a> {
+        self.ptr_type(AddressSpace::try_from(1).unwrap())
+    }
+}
+
 /// Contains all the information needed to call or define a function.
 ///
 /// Each Durin function (that isn't a basic block) corresponds to two LLVM functions:
@@ -241,9 +292,17 @@ impl<'cxt> Cxt<'cxt> {
         header: PointerValue<'cxt>,
         name: &str,
     ) -> PointerValue<'cxt> {
-        self.builder
-            .build_array_malloc(self.cxt.i8_type(), size, name)
+        let gc_alloc = self.module.get_function("gc_alloc").unwrap();
+        let call = self.builder.build_call(
+            gc_alloc,
+            &[size.as_basic_value_enum(), header.as_basic_value_enum()],
+            name,
+        );
+        call.set_call_convention(FASTCC);
+        call.try_as_basic_value()
+            .left()
             .unwrap()
+            .into_pointer_value()
     }
 
     pub fn if_expr(
@@ -302,7 +361,12 @@ impl<'cxt> Cxt<'cxt> {
     }
 
     pub fn new(cxt: &'cxt Context, machine: &'cxt TargetMachine) -> Self {
-        let module = cxt.create_module("main");
+        let module = cxt
+            .create_module_from_ir(MemoryBuffer::create_from_memory_range(
+                include_bytes!(concat!(env!("OUT_DIR"), "/prelude.bc")),
+                "main",
+            ))
+            .unwrap();
 
         Cxt {
             cxt,
@@ -415,11 +479,7 @@ impl<'cxt> Cxt<'cxt> {
                 let lty = ty.llvm_ty(self);
                 let from = self
                     .builder
-                    .build_bitcast(
-                        from,
-                        lty.ptr_type(AddressSpace::Generic),
-                        "casted_load_slot",
-                    )
+                    .build_bitcast(from, lty.gc_ptr(), "casted_load_slot")
                     .into_pointer_value();
                 self.builder.build_load(from, "load")
             }
@@ -477,11 +537,7 @@ impl<'cxt> Cxt<'cxt> {
                         let lty = ty.llvm_ty(self);
                         let from = self
                             .builder
-                            .build_bitcast(
-                                from,
-                                lty.ptr_type(AddressSpace::Generic),
-                                "casted_load_slot",
-                            )
+                            .build_bitcast(from, lty.gc_ptr(), "casted_load_slot")
                             .into_pointer_value();
                         self.builder.build_load(from, "load")
                     },
@@ -515,8 +571,7 @@ impl<'cxt> Cxt<'cxt> {
                 let lty = from.get_type();
                 let to = self
                     .builder
-                    .build_bitcast(to, lty.ptr_type(AddressSpace::Generic), "casted_store_slot")
-                    .into_pointer_value();
+                    .build_pointer_cast(to, lty.gc_ptr(), "casted_store_slot");
                 self.builder.build_store(to, from);
             }
 
@@ -566,14 +621,9 @@ impl<'cxt> Cxt<'cxt> {
                         // It's represented by a bitcasted something else on the stack, not just a pointer
                         // So just store the pointer
                         let lty = from.get_type();
-                        let to = self
-                            .builder
-                            .build_bitcast(
-                                to,
-                                lty.ptr_type(AddressSpace::Generic),
-                                "casted_store_slot",
-                            )
-                            .into_pointer_value();
+                        let to =
+                            self.builder
+                                .build_pointer_cast(to, lty.gc_ptr(), "casted_store_slot");
                         self.builder.build_store(to, from);
                     },
                     || {
@@ -679,11 +729,13 @@ impl<'cxt> Cxt<'cxt> {
                                         "proj_val_unmarked",
                                     );
                                     self.builder.build_store(ptr, val);
-                                    self.builder.build_bitcast(
-                                        ptr,
-                                        self.any_ty(),
-                                        "proj_slot_casted",
-                                    )
+                                    self.builder
+                                        .build_pointer_cast(
+                                            ptr,
+                                            self.any_ty().into_pointer_type(),
+                                            "proj_slot_casted",
+                                        )
+                                        .as_basic_value_enum()
                                 },
                                 || val,
                             )
@@ -758,11 +810,8 @@ impl<'cxt> Cxt<'cxt> {
                                     let tag = tag.max(align);
                                     let tag = tag * 8;
                                     let tag = self.cxt.custom_width_int_type(tag);
-                                    let tag_slot = self.builder.build_bitcast(
-                                        ptr,
-                                        tag.ptr_type(AddressSpace::Generic),
-                                        "tag_slot",
-                                    );
+                                    let tag_slot =
+                                        self.builder.build_bitcast(ptr, tag.gc_ptr(), "tag_slot");
                                     let tag = tag.const_int(*i as u64, false).as_basic_value_enum();
                                     self.builder.build_store(tag_slot.into_pointer_value(), tag);
                                 }
@@ -855,7 +904,7 @@ impl<'cxt> Cxt<'cxt> {
                     .ptr_type(AddressSpace::Generic);
 
                 self.builder
-                    .build_bitcast(alloc, fun_ty.ptr_type(AddressSpace::Generic), "closure")
+                    .build_bitcast(alloc, fun_ty.gc_ptr(), "closure")
             }
             Node::ExternFun(name, params, ret) => {
                 let fun = match self.module.get_function(name) {
@@ -912,11 +961,13 @@ impl<'cxt> Cxt<'cxt> {
                                         "proj_val_unmarked",
                                     );
                                     self.builder.build_store(ptr, val);
-                                    self.builder.build_bitcast(
-                                        ptr,
-                                        self.any_ty(),
-                                        "proj_slot_casted",
-                                    )
+                                    self.builder
+                                        .build_pointer_cast(
+                                            ptr,
+                                            self.any_ty().into_pointer_type(),
+                                            "proj_slot_casted",
+                                        )
+                                        .as_basic_value_enum()
                                 },
                                 || val,
                             )
@@ -1021,11 +1072,13 @@ impl<'cxt> Cxt<'cxt> {
                                         let alloca = self
                                             .builder
                                             .build_alloca(self.any_ty(), "sum_type_bitcast_slot");
-                                        self.builder.build_bitcast(
-                                            alloca,
-                                            self.any_ty(),
-                                            "sum_type_slot",
-                                        )
+                                        self.builder
+                                            .build_pointer_cast(
+                                                alloca,
+                                                self.any_ty().into_pointer_type(),
+                                                "sum_type_slot",
+                                            )
+                                            .as_basic_value_enum()
                                     },
                                     || {
                                         self.alloc(size, ty.as_rtti(self, data), "sum_type_alloc")
@@ -1039,13 +1092,11 @@ impl<'cxt> Cxt<'cxt> {
                         if tag != 0 {
                             let tag = tag * 8;
                             let tag = self.cxt.custom_width_int_type(tag);
-                            let tag_slot = self.builder.build_bitcast(
-                                alloc,
-                                tag.ptr_type(AddressSpace::Generic),
-                                "tag_slot",
-                            );
+                            let tag_slot =
+                                self.builder
+                                    .build_pointer_cast(alloc, tag.gc_ptr(), "tag_slot");
                             let tag = tag.const_int(*i as u64, false).as_basic_value_enum();
-                            self.builder.build_store(tag_slot.into_pointer_value(), tag);
+                            self.builder.build_store(tag_slot, tag);
                         }
 
                         let payload_slot = unsafe {
@@ -1061,13 +1112,12 @@ impl<'cxt> Cxt<'cxt> {
                             Type::StackEnum(_, _) => {
                                 // Copy the enum out of the alloca
                                 let llvm_ty = ty.llvm_ty(self);
-                                let alloc = self.builder.build_bitcast(
+                                let alloc = self.builder.build_pointer_cast(
                                     alloc,
-                                    llvm_ty.ptr_type(AddressSpace::Generic),
+                                    llvm_ty.gc_ptr(),
                                     "sum_type_casted",
                                 );
-                                self.builder
-                                    .build_load(alloc.into_pointer_value(), "sum_type")
+                                self.builder.build_load(alloc, "sum_type")
                             }
                             // Just return the pointer
                             Type::PtrEnum(_) => self.if_expr(
@@ -1077,7 +1127,7 @@ impl<'cxt> Cxt<'cxt> {
                                         .builder
                                         .build_bitcast(
                                             alloc,
-                                            self.any_ty().ptr_type(AddressSpace::Generic),
+                                            self.any_ty().gc_ptr(),
                                             "sum_type_bitcast_slot_again",
                                         )
                                         .into_pointer_value();
@@ -1157,7 +1207,12 @@ impl<'cxt> Cxt<'cxt> {
                                         .builder
                                         .build_alloca(self.any_ty(), "struct_bitcast_slot");
                                     self.builder
-                                        .build_bitcast(alloca, self.any_ty(), "struct_slot")
+                                        .build_pointer_cast(
+                                            alloca,
+                                            self.any_ty().into_pointer_type(),
+                                            "struct_slot",
+                                        )
+                                        .as_basic_value_enum()
                                 },
                                 || {
                                     self.alloc(size, ty.as_rtti(self, data), "struct_alloc")
@@ -1175,7 +1230,7 @@ impl<'cxt> Cxt<'cxt> {
                                     .builder
                                     .build_bitcast(
                                         alloc,
-                                        self.any_ty().ptr_type(AddressSpace::Generic),
+                                        self.any_ty().gc_ptr(),
                                         "struct_bitcast_slot_again",
                                     )
                                     .into_pointer_value();
@@ -1597,11 +1652,7 @@ impl<'cxt> Cxt<'cxt> {
                             .ptr_type(AddressSpace::Generic);
                         let fun_ptr_ptr = self
                             .builder
-                            .build_bitcast(
-                                callee,
-                                fun_ty.ptr_type(AddressSpace::Generic),
-                                "fun_ptr_ptr",
-                            )
+                            .build_bitcast(callee, fun_ty.gc_ptr(), "fun_ptr_ptr")
                             .into_pointer_value();
                         let fun_ptr = self
                             .builder
@@ -1977,10 +2028,11 @@ impl<'cxt> Cxt<'cxt> {
                                 .set_alignment(align)
                                 .unwrap();
                             self.builder.build_store(alloca, x);
-                            let alloca = self
-                                .builder
-                                .build_bitcast(alloca, self.any_ty(), "union_ptr_casted")
-                                .into_pointer_value();
+                            let alloca = self.builder.build_pointer_cast(
+                                alloca,
+                                self.any_ty().into_pointer_type(),
+                                "union_ptr_casted",
+                            );
                             (alloca, v)
                         }
                         Type::PtrEnum(v) => (x.into_pointer_value(), v),
@@ -1995,7 +2047,7 @@ impl<'cxt> Cxt<'cxt> {
                         let tag_ty = self.cxt.custom_width_int_type(tag_bits);
                         let tag_slot = self
                             .builder
-                            .build_bitcast(ptr, tag_ty.ptr_type(AddressSpace::Generic), "tag_slot")
+                            .build_bitcast(ptr, tag_ty.gc_ptr(), "tag_slot")
                             .into_pointer_value();
                         self.builder
                             .build_load(tag_slot, "ifcase_tag")
