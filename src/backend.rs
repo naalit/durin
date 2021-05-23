@@ -2,8 +2,15 @@ use crate::emit::ValPretty;
 use crate::ir::{Constant, Function, Name, Node, Slot, Slots, Uses, Val, ValExt, ValType};
 use crate::ssa::{FunMode, SSA};
 use inkwell::{
-    basic_block::BasicBlock, builder::Builder, context::Context, memory_buffer::MemoryBuffer,
-    module::Module, targets::TargetMachine, types::*, values::*, AddressSpace, IntPredicate,
+    basic_block::BasicBlock,
+    builder::Builder,
+    context::Context,
+    memory_buffer::MemoryBuffer,
+    module::{Linkage, Module},
+    targets::TargetMachine,
+    types::*,
+    values::*,
+    AddressSpace, IntPredicate,
 };
 use specs::prelude::*;
 use std::{
@@ -53,10 +60,20 @@ impl crate::ir::Module {
             };
             if run {
                 let new_fun = module.add_function("main", cxt.i32_type().fn_type(&[], false), None);
+                new_fun.set_gc("statepoint-example");
                 {
                     let b = cxt.create_builder();
                     let bl = cxt.append_basic_block(new_fun, "entry");
                     b.position_at_end(bl);
+
+                    let initialize = module.get_function("initialize").unwrap();
+                    let num_start_blocks = cxt.i32_type().const_int(8, false);
+                    b.build_call(
+                        initialize,
+                        &[num_start_blocks.as_basic_value_enum()],
+                        "_void",
+                    );
+
                     if f.get_type().get_return_type().is_none() {
                         // CPS
                         // We need a tailcc stop function to pass as `main`'s continuation, as well as the start function
@@ -68,19 +85,13 @@ impl crate::ir::Module {
                         );
                         fun2.set_call_conventions(TAILCC);
 
-                        let initialize = module.get_function("initialize").unwrap();
-                        let num_start_blocks = cxt.i32_type().const_int(1, false);
-                        b.build_call(
-                            initialize,
-                            &[num_start_blocks.as_basic_value_enum()],
-                            "_void",
-                        );
-
                         let fun_ty = fun2
                             .get_type()
                             .ptr_type(AddressSpace::Generic)
                             .as_basic_type_enum();
-                        let clos = b.build_alloca(fun_ty, "stop_closure");
+                        let clos = module.add_global(fun_ty, None, "stop_closure");
+                        clos.set_initializer(&fun_ty.const_zero());
+                        let clos = clos.as_pointer_value();
                         b.build_store(clos, fun2.as_global_value().as_pointer_value());
                         let clos = b.build_pointer_cast(clos, fun_ty.gc_ptr(), "stop_clos_ptr");
 
@@ -134,7 +145,7 @@ impl crate::ir::Module {
 
             let mut clang = Command::new("clang")
                 .stdin(Stdio::piped())
-                .args(&["-x", "ir", "-", "_pika_runtime.bc"])
+                .args(&["-O2", "-g", "-x", "ir", "-", "_pika_runtime.bc"])
                 .args(if do_run {
                     &["-z", "notext", "-o"] as &[_]
                 } else {
@@ -148,7 +159,12 @@ impl crate::ir::Module {
             let mut opt = Command::new("opt")
                 .stdin(Stdio::piped())
                 .stdout(stdin)
-                .args(&["--sroa", "--mem2reg", "--rewrite-statepoints-for-gc"])
+                .args(&[
+                    "--sroa",
+                    "--mem2reg",
+                    "--sccp",
+                    "--rewrite-statepoints-for-gc",
+                ])
                 .spawn()
                 .map_err(|e| format!("Failed to launch opt: {}", e))?;
             let mut stdin = opt.stdin.as_ref().unwrap();
@@ -158,7 +174,7 @@ impl crate::ir::Module {
 
             let code = opt
                 .wait()
-                .map_err(|e| format!("Failed to wait on clang process: {}", e))?
+                .map_err(|e| format!("Failed to wait on opt process: {}", e))?
                 .code()
                 .unwrap_or(0);
             if code != 0 {
@@ -305,6 +321,46 @@ impl<'cxt> Cxt<'cxt> {
             .into_pointer_value()
     }
 
+    /// LLVM doesn't understand `inttoptr` to a GC pointer, so we need to wrap it in a `noinline` function which doesn't use GC.
+    pub fn inttoptr(&self, i: IntValue<'cxt>) -> PointerValue<'cxt> {
+        let i = self
+            .builder
+            .build_int_z_extend_or_bit_cast(i, self.cxt.i64_type(), "to_i64");
+        let fun = if let Some(fun) = self.module.get_function("$_i2p") {
+            fun
+        } else {
+            use inkwell::attributes::*;
+            let ty = self
+                .any_ty()
+                .fn_type(&[self.cxt.i64_type().as_basic_type_enum()], false);
+            let fun = self
+                .module
+                .add_function("$_i2p", ty, Some(Linkage::Private));
+            fun.add_attribute(
+                AttributeLoc::Function,
+                self.cxt
+                    .create_enum_attribute(Attribute::get_named_enum_kind_id("noinline"), 0),
+            );
+
+            let bb = self.cxt.append_basic_block(fun, "entry");
+            let before = self.builder.get_insert_block().unwrap();
+            self.builder.position_at_end(bb);
+            let ptr = self.builder.build_int_to_ptr(
+                fun.get_first_param().unwrap().into_int_value(),
+                self.any_ty().into_pointer_type(),
+                "inttoptr",
+            );
+            self.builder.build_return(Some(&ptr));
+
+            self.builder.position_at_end(before);
+            fun
+        };
+        let call = self
+            .builder
+            .build_call(fun, &[i.as_basic_value_enum()], "inttoptr");
+        call.as_any_value_enum().into_pointer_value()
+    }
+
     pub fn if_expr(
         &self,
         cond: IntValue<'cxt>,
@@ -394,7 +450,7 @@ impl<'cxt> Cxt<'cxt> {
             | Type::Unknown(_)
             | Type::Unknown2(_)
             | Type::Type
-            | Type::Closure(_)
+            // | Type::Closure(_)
             | Type::ExternFun(_, _) => self
                 .builder
                 .build_bitcast(val, self.any_ty(), "to_any")
@@ -403,6 +459,7 @@ impl<'cxt> Cxt<'cxt> {
             // It's an integer, so do an inttoptr
             Type::Int(bits) if *bits < 64 => {
                 let val = val.into_int_value();
+                let val = self.builder.build_int_z_extend_or_bit_cast(val, self.cxt.i64_type(), "to_i64");
                 let val = self.builder.build_left_shift(
                     val,
                     val.get_type().const_int(1, false),
@@ -411,12 +468,11 @@ impl<'cxt> Cxt<'cxt> {
                 let val =
                     self.builder
                         .build_or(val, val.get_type().const_int(1, false), "int_mark");
-                self.builder
-                    .build_int_to_ptr(val, self.any_ty().into_pointer_type(), "to_any")
+                self.inttoptr(val)
             }
 
             // Allocate and call `store`
-            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) => {
+            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) | Type::Closure(_) => {
                 let size = ty.heap_size(self, data);
                 let alloc = self.alloc(size, ty.as_rtti(self, data), "any_slot");
                 self.store(ty, val, alloc, data);
@@ -439,7 +495,7 @@ impl<'cxt> Cxt<'cxt> {
             | Type::Unknown(_)
             | Type::Unknown2(_)
             | Type::Type
-            | Type::Closure(_)
+            // | Type::Closure(_)
             | Type::ExternFun(_, _) => {
                 let lty = ty.llvm_ty(self);
                 self.builder.build_bitcast(ptr, lty, "from_any")
@@ -448,7 +504,7 @@ impl<'cxt> Cxt<'cxt> {
             // It's an integer, so do an ptrtoint
             Type::Int(bits) if *bits < 64 => {
                 let int_type = self.cxt.custom_width_int_type(*bits);
-                let val = self.builder.build_ptr_to_int(ptr, int_type, "from_any");
+                let val = self.builder.build_ptr_to_int(ptr, self.cxt.i64_type(), "from_any");
                 // TODO check signedness
                 let val = self.builder.build_right_shift(
                     val,
@@ -456,11 +512,12 @@ impl<'cxt> Cxt<'cxt> {
                     true,
                     "int_unmarked",
                 );
+                let val = self.builder.build_int_truncate_or_bit_cast(val, int_type, "to_i");
                 val.as_basic_value_enum()
             }
 
             // Load from the pointer
-            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) => self.load(ty, ptr, data),
+            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) | Type::Closure(_) => self.load(ty, ptr, data),
         }
     }
 
@@ -542,9 +599,13 @@ impl<'cxt> Cxt<'cxt> {
                         self.builder.build_load(from, "load")
                     },
                     || {
-                        // Leave it, it's a pointer anyway
-                        // TODO: we probably will need to reallocate and copy for GC reasons, or maybe mutable ref reasons
-                        from.as_basic_value_enum()
+                        // Reallocate and copy: we don't allow interior pointers besides temporarily
+                        let header = ty.as_rtti(self, data);
+                        let alloc = self.alloc(size, header, "realloc");
+                        self.builder
+                            .build_memcpy(alloc, 8, from, ty.alignment(), size)
+                            .unwrap();
+                        alloc.as_basic_value_enum()
                     },
                 )
             }
@@ -1151,13 +1212,7 @@ impl<'cxt> Cxt<'cxt> {
                                         self.size_ty().const_int(1, false),
                                         "sum_type_marked",
                                     );
-                                    self.builder
-                                        .build_int_to_ptr(
-                                            val,
-                                            self.any_ty().into_pointer_type(),
-                                            "sum_type_word_ptr",
-                                        )
-                                        .as_basic_value_enum()
+                                    self.inttoptr(val).as_basic_value_enum()
                                 },
                                 || alloc.as_basic_value_enum(),
                             ),
@@ -1254,13 +1309,7 @@ impl<'cxt> Cxt<'cxt> {
                                     self.size_ty().const_int(1, false),
                                     "struct_marked",
                                 );
-                                self.builder
-                                    .build_int_to_ptr(
-                                        val,
-                                        self.any_ty().into_pointer_type(),
-                                        "struct_word_ptr",
-                                    )
-                                    .as_basic_value_enum()
+                                self.inttoptr(val).as_basic_value_enum()
                             },
                             || alloc.as_basic_value_enum(),
                         )
@@ -1779,6 +1828,7 @@ impl<'cxt> Cxt<'cxt> {
                     .unwrap_or_else(|| format!("fun${}", val.id()));
                 let known = self.module.add_function(&name, known_ty, None);
                 known.set_call_conventions(TAILCC);
+                known.set_gc("statepoint-example");
 
                 let uargs: Vec<_> = fun
                     .params
@@ -1790,6 +1840,7 @@ impl<'cxt> Cxt<'cxt> {
                 let uname = format!("u${}", &name);
                 let unknown = self.module.add_function(&uname, unknown_ty, None);
                 unknown.set_call_conventions(TAILCC);
+                unknown.set_gc("statepoint-example");
 
                 let env = args[0..env.len()]
                     .iter()

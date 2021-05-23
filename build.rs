@@ -21,7 +21,7 @@ fn main() {
     let mut out_file = PathBuf::from(out_dir);
     out_file.push("runtime.bc");
     if !Command::new("clang")
-        .args(&["src/runtime/runtime.c", "-c", "-emit-llvm", "-o"])
+        .args(&["src/runtime/runtime.c", "-c", "-emit-llvm", "-g", "-o"])
         .arg(out_file)
         .status()
         .unwrap()

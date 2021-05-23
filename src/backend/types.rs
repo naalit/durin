@@ -264,22 +264,23 @@ impl<'cxt> Type<'cxt> {
         }
     }
 
-    fn tyinfo(&self, info: &mut TyInfo<'cxt>) {
+    fn tyinfo(&self, info: &mut TyInfo<'cxt>, cxt: &Cxt<'cxt>, data: &Data) {
         match self {
             Type::Pointer => info.word(true),
             Type::StackStruct(tys) | Type::PtrStruct(tys) => {
                 for (_, ty) in tys {
-                    ty.tyinfo(info);
+                    ty.tyinfo(info, cxt, data);
                 }
             }
             Type::StackEnum(_, tys) | Type::PtrEnum(tys) => {
                 // For enums, the tag size happens to always equal alignment
                 let tag_size = self.alignment();
-                info.start_variant(tys.len(), tag_size);
+                let heap_size = self.heap_size(cxt, data);
+                info.start_variant(tys.len(), tag_size, heap_size, cxt);
 
                 for ty in tys {
                     info.next_variant();
-                    ty.tyinfo(info);
+                    ty.tyinfo(info, cxt, data);
                 }
 
                 info.end_variant();
@@ -301,7 +302,7 @@ impl<'cxt> Type<'cxt> {
 
     pub fn as_rtti(&self, cxt: &Cxt<'cxt>, data: &Data) -> PointerValue<'cxt> {
         let mut tyinfo = TyInfo::new();
-        self.tyinfo(&mut tyinfo);
+        self.tyinfo(&mut tyinfo, cxt, data);
         let ty_size = self.heap_size(cxt, data);
         tyinfo.codegen(ty_size, cxt)
     }
@@ -309,6 +310,7 @@ impl<'cxt> Type<'cxt> {
 
 enum TyInfoPart<'cxt> {
     Constant(Vec<u32>),
+    Entry(IntValue<'cxt>, bool),
     Splice(PointerValue<'cxt>, bool),
 }
 impl<'cxt> TyInfoPart<'cxt> {
@@ -318,7 +320,7 @@ impl<'cxt> TyInfoPart<'cxt> {
                 // Mark the last entry as continued
                 v.last_mut().map(|x| *x |= 1);
             }
-            TyInfoPart::Splice(_, b) => *b = true,
+            TyInfoPart::Entry(_, b) | TyInfoPart::Splice(_, b) => *b = true,
         }
     }
 }
@@ -339,13 +341,14 @@ enum LastType {
 // |    5-bit number of words in this bitset
 // 24-bit bitset
 //
-// 0..0 0..0 000 01 0
-// ---- ---- --- -- - whether there's another struct member after this
-// |    |    |   |
-// |    |    |   01 is the type for a case split
-// |    |    3-bit size of the tag in bytes (up to 8)
-// |    10-bit offset of the tag in bytes from the end of the last entry
-// 16-bit number of variants
+// 0..0 0..0 0..0 000 01 0
+// ---- ---- ---- --- -- - whether there's another struct member after this
+// |    |    |    |   |
+// |    |    |    |   01 is the type for a case split
+// |    |    |    3-bit size of the tag in bytes (up to 8)
+// |    |    3-bit offset of the tag in bytes from the end of the last entry
+// |    11-bit number of variants
+// 12-bit size of the variant in words, including the tag
 //
 // 0....0 0 10 0
 // ------ - -- - whether there's another struct member after this
@@ -369,6 +372,7 @@ impl<'cxt> TyInfo<'cxt> {
             LastType::VariantNext => (),
             LastType::VariantEnd((i, j)) => match &mut self.entries[i] {
                 TyInfoPart::Constant(v) => v[j] |= 1,
+                TyInfoPart::Entry(_, b) => *b = true,
                 _ => unreachable!(),
             },
         }
@@ -400,26 +404,82 @@ impl<'cxt> TyInfo<'cxt> {
         self.entries.push(TyInfoPart::Splice(ty, false));
     }
 
-    fn start_variant(&mut self, num: usize, tag_size: u32) {
-        let offset = self.extra_bytes & 7;
-        self.extra_bytes = offset;
-        self.finish_bitset();
+    fn start_variant(
+        &mut self,
+        num: usize,
+        tag_size: u32,
+        total_size: IntValue<'cxt>,
+        cxt: &Cxt<'cxt>,
+    ) {
+        if let Some(total_size) = total_size.get_zero_extended_constant() {
+            let offset = self.extra_bytes & 7;
+            self.extra_bytes -= offset;
+            self.finish_bitset();
 
-        let num: u16 = num.try_into().expect("Too many variants");
-        assert!(tag_size <= 8, "tag must be <= 8 bytes, got {}", tag_size);
-        let entry = 0b01_0 | ((tag_size - 1) << 3) | (offset << 6) | ((num as u32) << 16);
-        self.entry(entry);
+            let num: u16 = num.try_into().expect("Too many variants");
+            assert!(tag_size <= 8, "tag must be <= 8 bytes, got {}", tag_size);
+            assert!(
+                total_size < 4096,
+                "Total size must be less than 4096, got {}",
+                total_size
+            );
+            assert!(
+                num < 2048,
+                "Number of variants must be less than 2048, got {}",
+                num
+            );
+            let entry = total_size as u32;
+            let entry = (entry << 11) | num as u32;
+            let entry = (entry << 3) | offset;
+            let entry = (entry << 3) | (tag_size - 1);
+            let entry = (entry << 3) | 0b01_0;
+            self.entry(entry);
 
-        self.variant_stack.push((
-            self.entries.len() - 1,
-            match self.entries.last().unwrap() {
-                TyInfoPart::Constant(v) => v.len() - 1,
-                _ => unreachable!(),
-            },
-        ));
+            self.variant_stack.push((
+                self.entries.len() - 1,
+                match self.entries.last().unwrap() {
+                    TyInfoPart::Constant(v) => v.len() - 1,
+                    _ => unreachable!(),
+                },
+            ));
+        } else {
+            let offset = self.extra_bytes & 7;
+            self.extra_bytes -= offset;
+            self.finish_bitset();
+
+            let num: u16 = num.try_into().expect("Too many variants");
+            assert!(tag_size <= 8, "tag must be <= 8 bytes, got {}", tag_size);
+            assert!(
+                num < 2048,
+                "Number of variants must be less than 2048, got {}",
+                num
+            );
+            let entry = num as u32;
+            let entry = (entry << 3) | offset;
+            let entry = (entry << 3) | (tag_size - 1);
+            let entry = (entry << 3) | 0b01_0;
+            let total_size =
+                cxt.builder
+                    .build_int_truncate(total_size, cxt.cxt.i32_type(), "size_i32");
+            let total_size = cxt.builder.build_left_shift(
+                total_size,
+                cxt.cxt.i32_type().const_int(20, false),
+                "size_shl",
+            );
+            let entry = cxt.builder.build_or(
+                total_size,
+                cxt.cxt.i32_type().const_int(entry as u64, false),
+                "variant_start_entry",
+            );
+            self.extend();
+            self.entries.push(TyInfoPart::Entry(entry, false));
+
+            self.variant_stack.push((self.entries.len() - 1, 0));
+        }
     }
 
     fn next_variant(&mut self) {
+        self.finish_bitset();
         self.last = LastType::VariantNext;
     }
 
@@ -527,6 +587,10 @@ impl<'cxt> TyInfo<'cxt> {
                     let esize = cxt.size_ty().const_int((v.len() * 4) as u64, false);
                     size = cxt.builder.build_int_add(size, esize, "rtti_size");
                 }
+                TyInfoPart::Entry(_, _) => {
+                    let esize = cxt.size_ty().const_int(1, false);
+                    size = cxt.builder.build_int_add(size, esize, "rtti_size");
+                }
                 TyInfoPart::Splice(ptr, _) => {
                     let esize = cxt
                         .builder
@@ -548,6 +612,9 @@ impl<'cxt> TyInfo<'cxt> {
                 }
             }
         }
+        let alloc_size =
+            cxt.builder
+                .build_int_add(size, cxt.size_ty().const_int(4, false), "alloc_size");
 
         let rtti_rtti = if let Some(size) = size.get_zero_extended_constant() {
             let global = cxt
@@ -557,7 +624,7 @@ impl<'cxt> TyInfo<'cxt> {
             global.set_constant(true);
             global.set_alignment(8);
             // The size of the RTTI RTTI is 0, since it doesn't include space for the size itself
-            global.set_initializer(&cxt.cxt.i32_type().const_int(size, false));
+            global.set_initializer(&cxt.cxt.i32_type().const_int(size + 4, false));
             cxt.builder.build_address_space_cast(
                 global.as_pointer_value(),
                 cxt.cxt.i32_type().gc_ptr(),
@@ -586,13 +653,13 @@ impl<'cxt> TyInfo<'cxt> {
                 .builder
                 .build_bitcast(alloc, cxt.cxt.i32_type().gc_ptr(), "rtti_size_slot")
                 .into_pointer_value();
-            let size = cxt
-                .builder
-                .build_int_truncate(size, cxt.cxt.i32_type(), "size_i32");
+            let size =
+                cxt.builder
+                    .build_int_truncate(alloc_size, cxt.cxt.i32_type(), "alloc_size_i32");
             cxt.builder.build_store(alloc_i32, size);
             alloc_i32
         };
-        let alloc = cxt.alloc(size, rtti_rtti, "rtti_slot");
+        let alloc = cxt.alloc(alloc_size, rtti_rtti, "rtti_slot");
         let mut slot = cxt
             .builder
             .build_bitcast(alloc, cxt.cxt.i32_type().gc_ptr(), "rtti_slot_i32")
@@ -638,6 +705,26 @@ impl<'cxt> TyInfo<'cxt> {
                         )
                     };
                 }
+                TyInfoPart::Entry(entry, b) => {
+                    let entry = if *b {
+                        cxt.builder.build_or(
+                            *entry,
+                            cxt.cxt.i32_type().const_int(1, false),
+                            "rtti_entry_extend",
+                        )
+                    } else {
+                        *entry
+                    };
+                    cxt.builder.build_store(slot, entry);
+
+                    slot = unsafe {
+                        cxt.builder.build_in_bounds_gep(
+                            slot,
+                            &[cxt.cxt.i32_type().const_int(1, false)],
+                            "rtti_next_slot",
+                        )
+                    };
+                }
                 TyInfoPart::Splice(ptr, b) => {
                     // Skip the size to get to the actual entries
                     let ptr = unsafe {
@@ -660,7 +747,7 @@ impl<'cxt> TyInfo<'cxt> {
                         // Mark the last entry that it's continued
                         let last_idx = cxt.builder.build_int_sub(
                             size_i32s,
-                            cxt.cxt.i32_type().const_int(1, false),
+                            cxt.cxt.i64_type().const_int(1, false),
                             "spliced_rtti_last_idx",
                         );
                         let last_slot = unsafe {
@@ -805,7 +892,9 @@ impl<'cxt> Cxt<'cxt> {
                     tag = tag.max(align);
                 }
                 let size = tag + payload;
-                if is_static && size <= STACK_THRESHOLD {
+                // For now, LLVM doesn't support returning arrays of more than 3 elements in GC'd functions
+                // TODO pass an output pointer like C compilers do for structs
+                if is_static && size < 4 {
                     Type::StackEnum(size, v)
                 } else {
                     Type::PtrEnum(v)

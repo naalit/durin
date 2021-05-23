@@ -20,6 +20,12 @@ define private i8 addrspace(1)* @gc_alloc_slow(i64 %size, i32 addrspace(1)* %hea
     ret i8 addrspace(1)* %alloc
 }
 
+; gc_alloc() will be inlined, but we don't want LLVM to think that the pointer to the header is the base pointer
+define private fastcc i8 addrspace(1)* @get_base_pointer(i8 addrspace(1)* %0) noinline {
+    %2 = getelementptr inbounds i8, i8 addrspace(1)* %0, i32 8
+    ret i8 addrspace(1)* %2
+}
+
 define private fastcc i8 addrspace(1)* @gc_alloc(i64 %size1, i32 addrspace(1)* %header) gc "statepoint-example" {
     ; Add 1-word header
     %size2 = add i64 %size1, 8
@@ -51,9 +57,7 @@ fast:
     %next.rtti = bitcast i8 addrspace(1)* %next to i32 addrspace(1)* addrspace(1)*
     store i32 addrspace(1)* %header, i32 addrspace(1)* addrspace(1)* %next.rtti, align 8
 
-    %alloc = getelementptr i8, i8 addrspace(1)* %next, i32 8
-    ; %alloc.i8 = addrspacecast i8 addrspace(1)* %alloc to i8 addrspace(1)*
-    ; %alloc.i8 = bitcast i64 addrspace(1)* %alloc to i8 addrspace(1)*
+    %alloc = call fastcc i8 addrspace(1)* @get_base_pointer(i8 addrspace(1)* %next)
 
     ret i8 addrspace(1)* %alloc
 }

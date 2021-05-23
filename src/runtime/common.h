@@ -8,7 +8,12 @@
 #include <assert.h>
 #include <time.h>
 
-#define panic(...) { printf(__VA_ARGS__); exit(1); }
+// A separate function so it can be a breakpoint
+static void panic_exit() {
+    exit(1);
+}
+
+#define panic(...) { printf(__VA_ARGS__); panic_exit(); }
 
 static struct {
     uint32_t len;

@@ -21,6 +21,7 @@ typedef struct StackBucket {
 typedef struct Location {
     uint32_t base_offset;
     uint32_t derived_offset;
+    uint32_t num_pointers;
 } Location;
 
 typedef struct StackEntry {
@@ -169,7 +170,7 @@ static void gen_stack_table() {
 
             // The actual locations can technically describe values in registers and more complex situations, but with statepoints they will always be on the stack.
             // That's represented as an indirect location [reg + offset], type `0x3`, with register `rsp` which is number 7, and size 8 since it's one pointer.
-            // Technically, LLVM is allowed to put a group of pointers in one location with a size greater than 8, but as of LLVM 12 it doesn't actually do that.
+            // LLVM can also put a group of pointers in one location with a size greater than 8, in which case there's a group of base pointers then a group of derived pointers.
             for (int l = 0; l < num_locations; l++) {
                 // Base pointer
                 {
@@ -182,10 +183,11 @@ static void gen_stack_table() {
                     // Reserved
                     GET(uint16_t);
                     int32_t offset = GET(int32_t);
+
                     assert(type == 0x3);
-                    assert(size == 8);
                     assert(regnum == 7);
                     locations[l].base_offset = offset;
+                    locations[l].num_pointers = (uint32_t)size / 8;
                 }
                 // Derived pointer
                 {
@@ -198,8 +200,9 @@ static void gen_stack_table() {
                     // Reserved
                     GET(uint16_t);
                     int32_t offset = GET(int32_t);
+
                     assert(type == 0x3);
-                    assert(size == 8);
+                    assert((uint32_t)size == locations[l].num_pointers * 8);
                     assert(regnum == 7);
                     locations[l].derived_offset = offset;
                 }

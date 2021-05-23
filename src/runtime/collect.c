@@ -27,13 +27,14 @@
 // |    5-bit number of words in this bitset
 // 24-bit bitset
 //
-// 0..0 0..0 000 01 0
-// ---- ---- --- -- - whether there's another struct member after this
-// |    |    |   |
-// |    |    |   01 is the type for a case split
-// |    |    3-bit size of the tag in bytes (up to 8)
-// |    10-bit offset of the tag in bytes from the end of the last entry
-// 16-bit number of variants
+// 0..0 0..0 0..0 000 01 0
+// ---- ---- ---- --- -- - whether there's another struct member after this
+// |    |    |    |   |
+// |    |    |    |   01 is the type for a case split
+// |    |    |    3-bit size of the tag in bytes (up to 8)
+// |    |    3-bit offset of the tag in bytes from the end of the last entry
+// |    11-bit number of variants
+// 12-bit size of the variant in words, including the tag
 //
 // 0....0 0 10 0
 // ------ - -- - whether there's another struct member after this
@@ -70,6 +71,9 @@ static void* evac_heap_end;
 static bool evacuate(uint64_t** object_ptr, uint64_t size) {
     if (!can_evacuate)
         return false;
+    
+    // Round size up to the next word
+    size = (size + 7) & ~7UL;
 
     // Allocate space
     void* new_heap_ptr = evac_heap_ptr + size;
@@ -142,8 +146,7 @@ static void trace_gray_stack() {
 static void mark(uint64_t** ptr, uint64_t** derived) {
     // If the last bit is set, it means it's not actually a pointer
     // All real pointers are aligned to at least 2 bytes
-    if ((uint64_t)*ptr & 0b111) {
-        panic("Unaligned pointer %lx!", (uint64_t)*ptr);
+    if ((uint64_t)*ptr & 0b1) {
         return;
     }
 
@@ -173,6 +176,7 @@ static void mark(uint64_t** ptr, uint64_t** derived) {
     if (color == COLOR_WHITE || color == current_off_white) {
         uint32_t* rtti = (uint32_t*)(header & ~COLOR_MASK);
         uint32_t size = *rtti & ((1 << 16) - 1);
+        uint32_t rtti_size = *rtti >> 16;
 
         void* block = all_blocks[0].start + ((void*)(*ptr - 1) - all_blocks[0].start) / BLOCK_SIZE * BLOCK_SIZE;
         uint32_t block_idx = (block - all_blocks[0].start) / BLOCK_SIZE;
@@ -206,7 +210,7 @@ static void mark(uint64_t** ptr, uint64_t** derived) {
 
         // If there aren't any pointers, the first entry will be 0 and we can skip tracing
         // This is mostly useful in incremental mode, since we don't need to add it to the gray stack
-        if (rtti[1]) {
+        if (rtti_size) {
             #ifdef INCREMENTAL
             // Add to gray stack to be traced later
             gray_stack_push(iptr);
@@ -272,13 +276,19 @@ static void rtti_go(uint32_t** rtti, uint64_t** object) {
         }
         case 0b01: {
             // Case split
+            // 0..0 0..0 000 000 01 0
+            // ---- ---- --- --- -- - whether there's another struct member after this
+            // |    |    |   |   |
+            // |    |    |   |   01 is the type for a case split
+            // |    |    |   3-bit size of the tag in bytes (up to 8)
+            // |    |    3-bit offset of the tag in bytes from the end of the last entry
+            // |    11-bit number of variants
+            // 12-bit size of the variant in words, including the tag
             uint32_t tag_bytes = ((entry >> 3) & 0b111) + 1;
-            uint32_t offset = (entry >> 6) & ((1 << 10) - 1);
-            uint32_t variants = entry >> 16;
+            uint32_t offset_bytes = (entry >> 6) & 0b111;
+            uint32_t variants = (entry >> 9) & ((1 << 11) - 1);
+            uint32_t total_size = entry >> 20;
 
-            uint32_t offset_words = offset / 8;
-            uint32_t offset_bytes = offset % 8;
-            *object += offset_words;
             // Only works on little-endian systems
             // Example:
             // Offset 1, size 2
@@ -293,10 +303,11 @@ static void rtti_go(uint32_t** rtti, uint64_t** object) {
             //      00000000CCCCBBBB
             uint64_t mask = (1UL << (tag_bytes * 8)) - 1;
             uint64_t tag = (**object >> (offset_bytes * 8)) & mask;
-            
+
             if (tag >= variants) {
                 panic("tag %lu in word %lu out of range, expected one of %u variants\n", tag, **object, variants);
             }
+            uint64_t* end = *object + total_size;
             *object += 1;
 
             for (int v = 0; v < variants; v++) {
@@ -305,6 +316,9 @@ static void rtti_go(uint32_t** rtti, uint64_t** object) {
                 else
                     rtti_skip(rtti);
             }
+            // The variant might not occupy the entire space if it's not the biggest one
+            // But the next entry doesn't start until after the total size
+            *object = end;
 
             break;
         }
@@ -312,7 +326,7 @@ static void rtti_go(uint32_t** rtti, uint64_t** object) {
             // RLE
             bool pointer = (entry & 0b1000) != 0;
             uint32_t size = entry >> 4;
-            
+
             for (int word = 0; word < size; word++, *object += 1) {
                 if (pointer) {
                     mark((uint64_t**)*object, NULL);
@@ -333,8 +347,13 @@ static void rtti_go(uint32_t** rtti, uint64_t** object) {
 static void trace(uint32_t* rtti, uint64_t* object) {
     // Mark all pointers in the object and then set it black
     uint64_t* iptr = object;
+    uint32_t size = rtti[-1] & ((1 << 16) - 1);
+    uint64_t* end = iptr + (size / 8);
     // printf("Tracing object\n");
     rtti_go(&rtti, &object);
+    if (object != end) {
+        panic("Object = %lx, end = %lx (iptr = %lx, size = %u)\n", (uint64_t)object, (uint64_t)end, (uint64_t)iptr, size);
+    }
     iptr[-1] = (iptr[-1] & ~COLOR_MASK) | current_black;
 }
 
@@ -351,7 +370,8 @@ static void mark_stack(uint64_t* rsp) {
         if (entry->num_locations) {
             Location* end = entry->locations + entry->num_locations;
             for (Location* loc = entry->locations; loc < end; loc++) {
-                mark((uint64_t**)rsp + loc->base_offset/8, (uint64_t**)rsp + loc->derived_offset/8);
+                for (uint32_t p = 0; p < loc->num_pointers; p++)
+                    mark((uint64_t**)rsp + loc->base_offset/8 + p, (uint64_t**)rsp + loc->derived_offset/8 + p);
             }
         }
 
@@ -375,6 +395,8 @@ static uint64_t open_lines;
 static uint64_t full_lines;
 
 static void run_full_gc(uint64_t* rsp, bool major) {
+    // printf("Starting %s GC\n", major ? "major" : "minor");
+
     #ifdef REPORT_PAUSES
     clock_t before = clock();
     #endif
