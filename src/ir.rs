@@ -559,7 +559,7 @@ pub enum Node {
     /// The `Val` should point to a function
     Param(Val, u8),
     Const(Constant),
-    BinOp(BinOp, Val, Val),
+    BinOp(BinOp, Signed, Val, Val),
 }
 impl Node {
     /// Arguments that, *if they're only known at runtime*, exist in the generated LLVM IR.
@@ -579,7 +579,7 @@ impl Node {
                 .collect(),
             Node::Product(t, v) => v.iter().copied().chain(std::iter::once(*t)).collect(),
             Node::ProdType(v) | Node::SumType(v) => v.clone(),
-            Node::BinOp(_, a, b) | Node::Proj(a, b, _) => smallvec![*a, *b],
+            Node::BinOp(_, _, a, b) | Node::Proj(a, b, _) => smallvec![*a, *b],
             Node::IfCase(_, x)
             | Node::Inj(_, _, x)
             | Node::If(x)
@@ -618,7 +618,7 @@ impl Node {
                 v.iter().copied().chain(std::iter::once(*r)).collect()
             }
             Node::Param(f, _) => smallvec![*f],
-            Node::BinOp(_, a, b)
+            Node::BinOp(_, _, a, b)
             | Node::Inj(a, _, b)
             | Node::Proj(a, b, _)
             | Node::ExternCall(a, b) => smallvec![*a, *b],
@@ -669,10 +669,10 @@ impl Node {
                 Constant::Int(w, _) => m.add(Node::Const(Constant::IntType(*w)), None),
                 Constant::Stop | Constant::Unreachable => m.add(Node::FunType(0), None),
             },
-            Node::BinOp(op, _, _) if op.is_comp() => {
+            Node::BinOp(op, _, _, _) if op.is_comp() => {
                 m.add(Node::Const(Constant::IntType(Width::W1)), None)
             }
-            Node::BinOp(_, a, _) => a.ty(m),
+            Node::BinOp(_, _, a, _) => a.ty(m),
             Node::If(_) => {
                 // Takes `then` and `else` blocks as arguments
                 m.add(Node::FunType(2), None)
@@ -733,29 +733,32 @@ pub enum Constant {
     Int(Width, i64),
 }
 
+pub type Signed = bool;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum BinOp {
-    IAdd,
-    ISub,
-    IMul,
-    IDiv,
-    IExp,
-    IAnd,
-    IOr,
-    IXor,
-    IShl,
-    IShr,
-    IEq,
-    INEq,
-    IGt,
-    ILt,
-    IGeq,
-    ILeq,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Pow,
+    Mod,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Eq,
+    NEq,
+    Gt,
+    Lt,
+    Geq,
+    Leq,
 }
 impl BinOp {
     pub fn is_comp(self) -> bool {
         use BinOp::*;
-        matches!(self, IEq | INEq | IGt | ILt | IGeq | ILeq)
+        matches!(self, Eq | NEq | Gt | Lt | Geq | Leq)
     }
 }
 
@@ -781,22 +784,23 @@ mod display {
     impl std::fmt::Display for BinOp {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             match self {
-                BinOp::IEq => write!(f, "=="),
-                BinOp::IAdd => write!(f, "+"),
-                BinOp::ISub => write!(f, "-"),
-                BinOp::IMul => write!(f, "*"),
-                BinOp::IDiv => write!(f, "/"),
-                BinOp::IExp => write!(f, "**"),
-                BinOp::IAnd => write!(f, "&"),
-                BinOp::IOr => write!(f, "|"),
-                BinOp::IXor => write!(f, "^"),
-                BinOp::IShl => write!(f, "<<"),
-                BinOp::IShr => write!(f, ">>"),
-                BinOp::INEq => write!(f, "!="),
-                BinOp::IGt => write!(f, ">"),
-                BinOp::ILt => write!(f, "<"),
-                BinOp::IGeq => write!(f, ">="),
-                BinOp::ILeq => write!(f, "<="),
+                BinOp::Eq => write!(f, "=="),
+                BinOp::Add => write!(f, "+"),
+                BinOp::Sub => write!(f, "-"),
+                BinOp::Mul => write!(f, "*"),
+                BinOp::Div => write!(f, "/"),
+                BinOp::Pow => write!(f, "**"),
+                BinOp::Mod => write!(f, "%"),
+                BinOp::And => write!(f, "&"),
+                BinOp::Or => write!(f, "|"),
+                BinOp::Xor => write!(f, "^"),
+                BinOp::Shl => write!(f, "<<"),
+                BinOp::Shr => write!(f, ">>"),
+                BinOp::NEq => write!(f, "!="),
+                BinOp::Gt => write!(f, ">"),
+                BinOp::Lt => write!(f, "<"),
+                BinOp::Geq => write!(f, ">="),
+                BinOp::Leq => write!(f, "<="),
             }
         }
     }

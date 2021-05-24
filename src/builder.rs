@@ -170,8 +170,8 @@ impl<'m> Builder<'m> {
         }
     }
 
-    pub fn binop(&mut self, op: BinOp, a: Val, b: Val) -> Val {
-        self.module.add(Node::BinOp(op, a, b), None)
+    pub fn binop(&mut self, op: BinOp, signed: bool, a: Val, b: Val) -> Val {
+        self.module.add(Node::BinOp(op, signed, a, b), None)
     }
 
     /// Turns `f (if a then b else c)` into something like:

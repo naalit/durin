@@ -922,7 +922,7 @@ impl<'cxt> Cxt<'cxt> {
             | Node::Ref(_, _)
             | Node::Inj(_, _, _)
             | Node::Product(_, _)
-            | Node::BinOp(_, _, _) => panic!("not a type"),
+            | Node::BinOp(_, _, _, _) => panic!("not a type"),
         }
     }
 }

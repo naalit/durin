@@ -94,8 +94,15 @@ impl<'a> Display for PrettyVal<'a> {
             Node::ExternCall(x, ret_ty) => {
                 write!(f, "externcall {} -> {}", x.pretty(m), ret_ty.pretty(m))
             }
-            Node::BinOp(op, a, b) => {
-                write!(f, "({} {} {})", a.pretty(m), op, b.pretty(m))
+            Node::BinOp(op, signed, a, b) => {
+                write!(
+                    f,
+                    "({} {}{} {})",
+                    a.pretty(m),
+                    if *signed { 's' } else { 'u' },
+                    op,
+                    b.pretty(m)
+                )
             }
             // Node::Param(a, b) => write!(f, "{}.{}", a.pretty(m), b),
             _ => match m.name(v) {

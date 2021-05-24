@@ -138,39 +138,43 @@ impl<'a> Parser<'a> {
     /// Basically the same operators as Pika are (will be) supported
     fn binop(&mut self) -> BinOp {
         match self.peek().unwrap() {
-            '=' if self.matches("==") => BinOp::IEq,
-            '!' if self.matches("!=") => BinOp::INEq,
+            '=' if self.matches("==") => BinOp::Eq,
+            '!' if self.matches("!=") => BinOp::NEq,
             '*' if self.matches("**") => self.error("Exponentiation not supported yet"),
             '*' => {
                 self.next();
-                BinOp::IMul
+                BinOp::Mul
+            }
+            '%' => {
+                self.next();
+                BinOp::Mod
             }
             '+' => {
                 self.next();
-                BinOp::IAdd
+                BinOp::Add
             }
             '-' => {
                 self.next();
-                BinOp::ISub
+                BinOp::Sub
             }
             '/' => {
                 self.next();
-                BinOp::IDiv
+                BinOp::Div
             }
             '<' => {
                 if self.matches("<=") {
-                    BinOp::ILeq
+                    BinOp::Leq
                 } else {
                     self.next();
-                    BinOp::ILt
+                    BinOp::Lt
                 }
             }
             '>' => {
                 if self.matches(">=") {
-                    BinOp::IGeq
+                    BinOp::Geq
                 } else {
                     self.next();
-                    BinOp::IGt
+                    BinOp::Gt
                 }
             }
             _ => self.error("Expected operator"),
@@ -297,7 +301,7 @@ impl<'a> Parser<'a> {
                 let rhs = self.expr();
                 self.skip_whitespace();
                 self.expect(")");
-                self.module.add(Node::BinOp(op, lhs, rhs), None)
+                self.module.add(Node::BinOp(op, true, lhs, rhs), None)
             }
         } else if self.matches("fun") {
             self.skip_whitespace();

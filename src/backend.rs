@@ -1346,106 +1346,61 @@ impl<'cxt> Cxt<'cxt> {
                 .as_rtti(self, data)
                 .as_basic_value_enum(),
             Node::ExternCall(_, _) => panic!("externcall isn't a first-class function!"),
-            Node::BinOp(op, a, b) => {
+            Node::BinOp(op, signed, a, b) => {
                 let a = self.try_gen_value(*a, data)?;
                 let b = self.try_gen_value(*b, data)?;
-                // let name = self.name(val).unwrap_or_else(|| "binop".to_string());
-                // let name = &name;
-                let name = "binop";
-                match op {
-                    crate::ir::BinOp::IAdd => self
-                        .builder
-                        .build_int_add(a.into_int_value(), b.into_int_value(), name)
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::ISub => self
-                        .builder
-                        .build_int_sub(a.into_int_value(), b.into_int_value(), name)
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::IMul => self
-                        .builder
-                        .build_int_mul(a.into_int_value(), b.into_int_value(), name)
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::IDiv => self
-                        .builder
-                        .build_int_signed_div(a.into_int_value(), b.into_int_value(), name)
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::IAnd => self
-                        .builder
-                        .build_and(a.into_int_value(), b.into_int_value(), name)
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::IOr => self
-                        .builder
-                        .build_or(a.into_int_value(), b.into_int_value(), name)
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::IXor => self
-                        .builder
-                        .build_xor(a.into_int_value(), b.into_int_value(), name)
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::IShl => self
-                        .builder
-                        .build_left_shift(a.into_int_value(), b.into_int_value(), name)
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::IShr => self
-                        .builder
-                        // TODO unsigned vs signed (division too)
-                        .build_right_shift(a.into_int_value(), b.into_int_value(), true, name)
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::IExp => todo!("llvm.powi intrinsic"),
+                match a {
+                    BasicValueEnum::IntValue(a) => {
+                        let b = b.into_int_value();
+                        // let name = self.name(val).unwrap_or_else(|| "binop".to_string());
+                        // let name = &name;
+                        let name = "binop";
+                        use crate::ir::BinOp::*;
+                        macro_rules! lop {
+                            (? $met1:ident : $met2:ident) => {
+                                if *signed {
+                                    lop!($met1)
+                                } else {
+                                    lop!($met2)
+                                }
+                            };
+                            ($met:ident ? $($a:expr)* ; $($b:expr)*) => {
+                                if *signed {
+                                    lop!($met $($a),*)
+                                } else {
+                                    lop!($met $($b),*)
+                                }
+                            };
+                            ($met:ident $($p:expr),* $(;$q:expr)*) => {
+                                self
+                                    .builder
+                                    .$met($($p,)* a, b, $($q,)* name)
+                                    .as_basic_value_enum()
+                            };
+                        }
+                        match op {
+                            Add => lop!(build_int_add),
+                            Sub => lop!(build_int_sub),
+                            Mul => lop!(build_int_mul),
+                            Div => lop!(? build_int_signed_div : build_int_unsigned_div),
+                            Mod => lop!(? build_int_signed_rem : build_int_unsigned_rem),
+                            And => lop!(build_and),
+                            Or => lop!(build_or),
+                            Xor => lop!(build_xor),
+                            Shl => lop!(build_left_shift),
+                            Shr => lop!(build_right_shift; *signed),
+                            Pow => todo!("int power"),
 
-                    crate::ir::BinOp::IEq => self
-                        .builder
-                        .build_int_compare(
-                            IntPredicate::EQ,
-                            a.into_int_value(),
-                            b.into_int_value(),
-                            name,
-                        )
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::INEq => self
-                        .builder
-                        .build_int_compare(
-                            IntPredicate::NE,
-                            a.into_int_value(),
-                            b.into_int_value(),
-                            name,
-                        )
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::IGt => self
-                        .builder
-                        .build_int_compare(
-                            IntPredicate::SGT,
-                            a.into_int_value(),
-                            b.into_int_value(),
-                            name,
-                        )
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::ILt => self
-                        .builder
-                        .build_int_compare(
-                            IntPredicate::SLT,
-                            a.into_int_value(),
-                            b.into_int_value(),
-                            name,
-                        )
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::IGeq => self
-                        .builder
-                        .build_int_compare(
-                            IntPredicate::SGE,
-                            a.into_int_value(),
-                            b.into_int_value(),
-                            name,
-                        )
-                        .as_basic_value_enum(),
-                    crate::ir::BinOp::ILeq => self
-                        .builder
-                        .build_int_compare(
-                            IntPredicate::SLE,
-                            a.into_int_value(),
-                            b.into_int_value(),
-                            name,
-                        )
-                        .as_basic_value_enum(),
+                            Eq => lop!(build_int_compare IntPredicate::EQ),
+                            NEq => lop!(build_int_compare IntPredicate::NE),
+                            // TODO unsigned vs signed
+                            Lt => lop!(build_int_compare ? IntPredicate::SLT ; IntPredicate::ULT),
+                            Gt => lop!(build_int_compare ? IntPredicate::SGT ; IntPredicate::UGT),
+                            Leq => lop!(build_int_compare ? IntPredicate::SLE ; IntPredicate::ULE),
+                            Geq => lop!(build_int_compare ? IntPredicate::SGE ; IntPredicate::UGE),
+                        }
+                    }
+                    _ => unreachable!(),
                 }
             }
         })
