@@ -66,7 +66,19 @@ fast:
 @istr = private unnamed_addr constant [4 x i8] c"%d\0a\00", align 1
 declare i32 @printf(i8*, ...)
 
-define {} @print_i32(i32 %a) {
+define private {} @print_i32(i32 %a) {
     %_0 = call i32 (i8*, ...) @printf(i8* getelementptr inbounds ([4 x i8], [4 x i8]* @istr, i32 0, i32 0), i32 %a)
+    ret {} undef
+}
+
+; "%.*s"
+@sstr = private unnamed_addr constant [5 x i8] c"%.*s\00", align 1
+define private {} @print_str(i8 addrspace(1)* %str) {
+entry:
+    %as_i32 = bitcast i8 addrspace(1)* %str to i32 addrspace(1)*
+    %size = load i32, i32 addrspace(1)* %as_i32
+    %bytes = getelementptr inbounds i8, i8 addrspace(1)* %str, i32 4
+    %q = addrspacecast i8 addrspace(1)* %bytes to i8*
+    %_0 = call i32 (i8*, ...) @printf(i8* getelementptr inbounds ([5 x i8], [5 x i8]* @sstr, i32 0, i32 0), i32 %size, i8* %q)
     ret {} undef
 }

@@ -1373,15 +1373,25 @@ impl<'cxt> Cxt<'cxt> {
                     .as_basic_value_enum(),
             },
             Node::Const(Constant::String(s)) => {
-                let bytes: Vec<_> = s
-                    .bytes()
+                let size = s.len() as u32;
+                let bytes: Vec<_> = size
+                    .to_le_bytes()
+                    .iter()
+                    .cloned()
+                    .chain(s.bytes())
                     .map(|x| self.cxt.i8_type().const_int(x as u64, false))
                     .collect();
                 let arr = self.cxt.i8_type().const_array(&bytes);
                 let g = self.module.add_global(arr.get_type(), None, "const_str");
                 g.set_initializer(&arr);
                 g.set_constant(true);
-                g.as_pointer_value().as_basic_value_enum()
+                let ptr = g.as_pointer_value();
+                let ptr = self.builder.build_address_space_cast(
+                    ptr,
+                    self.any_ty().into_pointer_type(),
+                    "str_ptr",
+                );
+                ptr.as_basic_value_enum()
             }
             Node::Const(Constant::Stop) | Node::Const(Constant::Unreachable) => {
                 panic!("stop or unreachable isn't a first-class function!")
