@@ -663,9 +663,10 @@ impl Node {
                 _ => unreachable!(),
             },
             Node::Const(c) => match c {
-                Constant::TypeType | Constant::IntType(_) | Constant::FloatType(_) => {
-                    m.add(Node::Const(Constant::TypeType), None)
-                }
+                Constant::TypeType
+                | Constant::IntType(_)
+                | Constant::FloatType(_)
+                | Constant::StringTy => m.add(Node::Const(Constant::TypeType), None),
                 Constant::Int(w, _) => m.add(Node::Const(Constant::IntType(*w)), None),
                 Constant::Stop | Constant::Unreachable => m.add(Node::FunType(0), None),
                 Constant::Float(Float::F32(_)) => {
@@ -674,6 +675,7 @@ impl Node {
                 Constant::Float(Float::F64(_)) => {
                     m.add(Node::Const(Constant::FloatType(FloatType::F64)), None)
                 }
+                Constant::String(_) => m.add(Node::Const(Constant::StringTy), None),
             },
             Node::BinOp(op, _, _, _) if op.is_comp() => {
                 m.add(Node::Const(Constant::IntType(Width::W1)), None)
@@ -742,7 +744,7 @@ pub enum Float {
 }
 
 /// Types are generally constants
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Constant {
     Stop,
     Unreachable,
@@ -751,6 +753,8 @@ pub enum Constant {
     Int(Width, i64),
     FloatType(FloatType),
     Float(Float),
+    StringTy,
+    String(String),
 }
 
 pub type Signed = bool;
@@ -795,6 +799,8 @@ mod display {
                 Constant::Int(w, i) => write!(f, "{}i{}", i, w),
                 Constant::FloatType(t) => write!(f, "{}", t),
                 Constant::Float(x) => write!(f, "{}", x),
+                Constant::StringTy => write!(f, "String"),
+                Constant::String(s) => write!(f, "{:?}", s),
             }
         }
     }

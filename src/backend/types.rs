@@ -924,9 +924,11 @@ impl<'cxt> Cxt<'cxt> {
                 Constant::TypeType => Type::Type,
                 Constant::IntType(w) => Type::Int(w.bits()),
                 Constant::FloatType(t) => Type::Float(t),
+                Constant::StringTy => Type::Pointer,
                 Constant::Int(_, _)
                 | Constant::Float(_)
                 | Constant::Stop
+                | Constant::String(_)
                 | Constant::Unreachable => {
                     panic!("not a type")
                 }

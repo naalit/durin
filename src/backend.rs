@@ -1372,6 +1372,17 @@ impl<'cxt> Cxt<'cxt> {
                     .const_float(f64::from_bits(*x))
                     .as_basic_value_enum(),
             },
+            Node::Const(Constant::String(s)) => {
+                let bytes: Vec<_> = s
+                    .bytes()
+                    .map(|x| self.cxt.i8_type().const_int(x as u64, false))
+                    .collect();
+                let arr = self.cxt.i8_type().const_array(&bytes);
+                let g = self.module.add_global(arr.get_type(), None, "const_str");
+                g.set_initializer(&arr);
+                g.set_constant(true);
+                g.as_pointer_value().as_basic_value_enum()
+            }
             Node::Const(Constant::Stop) | Node::Const(Constant::Unreachable) => {
                 panic!("stop or unreachable isn't a first-class function!")
             }
@@ -1380,6 +1391,7 @@ impl<'cxt> Cxt<'cxt> {
             | Node::RefTy(_)
             | Node::ProdType(_)
             | Node::SumType(_)
+            | Node::Const(Constant::StringTy)
             | Node::Const(Constant::TypeType)
             | Node::Const(Constant::FloatType(_))
             | Node::Const(Constant::IntType(_)) => self
