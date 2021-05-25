@@ -663,11 +663,17 @@ impl Node {
                 _ => unreachable!(),
             },
             Node::Const(c) => match c {
-                Constant::TypeType | Constant::IntType(_) => {
+                Constant::TypeType | Constant::IntType(_) | Constant::FloatType(_) => {
                     m.add(Node::Const(Constant::TypeType), None)
                 }
                 Constant::Int(w, _) => m.add(Node::Const(Constant::IntType(*w)), None),
                 Constant::Stop | Constant::Unreachable => m.add(Node::FunType(0), None),
+                Constant::Float(Float::F32(_)) => {
+                    m.add(Node::Const(Constant::FloatType(FloatType::F32)), None)
+                }
+                Constant::Float(Float::F64(_)) => {
+                    m.add(Node::Const(Constant::FloatType(FloatType::F64)), None)
+                }
             },
             Node::BinOp(op, _, _, _) if op.is_comp() => {
                 m.add(Node::Const(Constant::IntType(Width::W1)), None)
@@ -723,6 +729,18 @@ impl Width {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum FloatType {
+    F32,
+    F64,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum Float {
+    F32(u32),
+    F64(u64),
+}
+
 /// Types are generally constants
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Constant {
@@ -731,6 +749,8 @@ pub enum Constant {
     TypeType,
     IntType(Width),
     Int(Width, i64),
+    FloatType(FloatType),
+    Float(Float),
 }
 
 pub type Signed = bool;
@@ -773,6 +793,24 @@ mod display {
                 Constant::TypeType => write!(f, "Type"),
                 Constant::IntType(w) => write!(f, "I{}", w),
                 Constant::Int(w, i) => write!(f, "{}i{}", i, w),
+                Constant::FloatType(t) => write!(f, "{}", t),
+                Constant::Float(x) => write!(f, "{}", x),
+            }
+        }
+    }
+    impl std::fmt::Display for FloatType {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            match self {
+                FloatType::F32 => write!(f, "F32"),
+                FloatType::F64 => write!(f, "F64"),
+            }
+        }
+    }
+    impl std::fmt::Display for Float {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            match self {
+                Float::F32(x) => write!(f, "{}", f32::from_bits(*x)),
+                Float::F64(x) => write!(f, "{}", f64::from_bits(*x)),
             }
         }
     }

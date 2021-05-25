@@ -34,6 +34,7 @@ pub enum Type<'cxt> {
     Unknown(PointerValue<'cxt>),
     Unknown2(Val),
     Int(u32),
+    Float(crate::ir::FloatType),
     Closure(usize),
     ExternFun(Vec<BasicTypeEnum<'cxt>>, BasicTypeEnum<'cxt>),
     Type,
@@ -63,6 +64,10 @@ impl<'cxt> Type<'cxt> {
             // Word-alignment for values of unknown type
             Type::Unknown(_) | Type::Unknown2(_) => 8,
             Type::Int(bits) => (bits / 8).min(8),
+            Type::Float(t) => match t {
+                crate::ir::FloatType::F32 => 4,
+                crate::ir::FloatType::F64 => 8,
+            },
             Type::Closure(_) | Type::ExternFun(_, _) | Type::Pointer | Type::Type => 8,
         }
     }
@@ -116,6 +121,10 @@ impl<'cxt> Type<'cxt> {
             Type::Unknown(_) | Type::Unknown2(_) => None,
             // Round up - an i1 should be 1 byte, not 0
             Type::Int(bits) => Some((bits + 7) / 8),
+            Type::Float(t) => match t {
+                crate::ir::FloatType::F32 => Some(4),
+                crate::ir::FloatType::F64 => Some(8),
+            },
             Type::Closure(_) => Some(8),
             Type::ExternFun(_, _) => Some(8),
             Type::Type => Some(8),
@@ -184,6 +193,7 @@ impl<'cxt> Type<'cxt> {
             Type::StackEnum(_, _)
             | Type::Pointer
             | Type::Int(_)
+            | Type::Float(_)
             | Type::Closure(_)
             | Type::ExternFun(_, _)
             | Type::Type => cxt
@@ -204,6 +214,7 @@ impl<'cxt> Type<'cxt> {
             Type::Type => true,
 
             Type::Int(_) => false,
+            Type::Float(_) => false,
             Type::ExternFun(_, _) => false,
 
             // Stack structs and enums can't have pointers in them
@@ -245,6 +256,10 @@ impl<'cxt> Type<'cxt> {
             Type::Unknown(_) | Type::Unknown2(_) => cxt.any_ty(),
             Type::Pointer => cxt.any_ty(),
             Type::Int(bits) => cxt.cxt.custom_width_int_type(*bits).as_basic_type_enum(),
+            Type::Float(t) => match t {
+                crate::ir::FloatType::F32 => cxt.cxt.f32_type().as_basic_type_enum(),
+                crate::ir::FloatType::F64 => cxt.cxt.f64_type().as_basic_type_enum(),
+            },
             Type::Closure(nargs) => {
                 // Add an argument for the environment
                 let args = vec![cxt.any_ty(); *nargs as usize + 1];
@@ -287,6 +302,10 @@ impl<'cxt> Type<'cxt> {
             }
             Type::Unknown(v) => info.splice(*v),
             Type::Unknown2(_) => panic!("Unknown2 not supported"),
+            Type::Float(t) => match t {
+                crate::ir::FloatType::F32 => info.extra_bytes(4),
+                crate::ir::FloatType::F64 => info.word(false),
+            },
             Type::Int(i) => {
                 if *i == 64 {
                     info.word(false);
@@ -904,7 +923,11 @@ impl<'cxt> Cxt<'cxt> {
             Node::Const(c) => match *c {
                 Constant::TypeType => Type::Type,
                 Constant::IntType(w) => Type::Int(w.bits()),
-                Constant::Int(_, _) | Constant::Stop | Constant::Unreachable => {
+                Constant::FloatType(t) => Type::Float(t),
+                Constant::Int(_, _)
+                | Constant::Float(_)
+                | Constant::Stop
+                | Constant::Unreachable => {
                     panic!("not a type")
                 }
             },

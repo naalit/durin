@@ -10,7 +10,7 @@ use inkwell::{
     targets::TargetMachine,
     types::*,
     values::*,
-    AddressSpace, IntPredicate,
+    AddressSpace, FloatPredicate, IntPredicate,
 };
 use specs::prelude::*;
 use std::{
@@ -470,9 +470,22 @@ impl<'cxt> Cxt<'cxt> {
                         .build_or(val, val.get_type().const_int(1, false), "int_mark");
                 self.inttoptr(val)
             }
+            Type::Float(crate::ir::FloatType::F32) => {
+                let val = self.builder.build_bitcast(val, self.cxt.i32_type(), "to_i32").into_int_value();
+                let val = self.builder.build_int_z_extend_or_bit_cast(val, self.cxt.i64_type(), "to_i64");
+                let val = self.builder.build_left_shift(
+                    val,
+                    val.get_type().const_int(1, false),
+                    "int_shl",
+                );
+                let val =
+                    self.builder
+                        .build_or(val, val.get_type().const_int(1, false), "int_mark");
+                self.inttoptr(val)
+            }
 
             // Allocate and call `store`
-            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) | Type::Closure(_) => {
+            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) | Type::Closure(_) | Type::Float(crate::ir::FloatType::F64) => {
                 let size = ty.heap_size(self, data);
                 let alloc = self.alloc(size, ty.as_rtti(self, data), "any_slot");
                 self.store(ty, val, alloc, data);
@@ -515,9 +528,22 @@ impl<'cxt> Cxt<'cxt> {
                 let val = self.builder.build_int_truncate_or_bit_cast(val, int_type, "to_i");
                 val.as_basic_value_enum()
             }
+            Type::Float(crate::ir::FloatType::F32) => {
+                let val = self.builder.build_ptr_to_int(ptr, self.cxt.i64_type(), "from_any");
+                // TODO check signedness
+                let val = self.builder.build_right_shift(
+                    val,
+                    val.get_type().const_int(1, false),
+                    true,
+                    "int_unmarked",
+                );
+                let val = self.builder.build_int_truncate_or_bit_cast(val, self.cxt.i32_type(), "to_i");
+                self.builder.build_bitcast(val, self.cxt.f32_type(), "to_f32")
+                    .as_basic_value_enum()
+            }
 
             // Load from the pointer
-            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) | Type::Closure(_) => self.load(ty, ptr, data),
+            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) | Type::Closure(_) | Type::Float(crate::ir::FloatType::F64)=> self.load(ty, ptr, data),
         }
     }
 
@@ -530,6 +556,7 @@ impl<'cxt> Cxt<'cxt> {
             Type::Pointer
             | Type::StackEnum(_, _)
             | Type::Int(_)
+            | Type::Float(_)
             | Type::Closure(_)
             | Type::ExternFun(_, _)
             | Type::Type => {
@@ -626,6 +653,7 @@ impl<'cxt> Cxt<'cxt> {
             Type::Pointer
             | Type::StackEnum(_, _)
             | Type::Int(_)
+            | Type::Float(_)
             | Type::Closure(_)
             | Type::ExternFun(_, _)
             | Type::Type => {
@@ -1332,6 +1360,18 @@ impl<'cxt> Cxt<'cxt> {
                 .custom_width_int_type(w.bits())
                 .const_int(*val as u64, false)
                 .as_basic_value_enum(),
+            Node::Const(Constant::Float(x)) => match x {
+                crate::ir::Float::F32(x) => self
+                    .cxt
+                    .f32_type()
+                    .const_float(f32::from_bits(*x) as f64)
+                    .as_basic_value_enum(),
+                crate::ir::Float::F64(x) => self
+                    .cxt
+                    .f64_type()
+                    .const_float(f64::from_bits(*x))
+                    .as_basic_value_enum(),
+            },
             Node::Const(Constant::Stop) | Node::Const(Constant::Unreachable) => {
                 panic!("stop or unreachable isn't a first-class function!")
             }
@@ -1341,6 +1381,7 @@ impl<'cxt> Cxt<'cxt> {
             | Node::ProdType(_)
             | Node::SumType(_)
             | Node::Const(Constant::TypeType)
+            | Node::Const(Constant::FloatType(_))
             | Node::Const(Constant::IntType(_)) => self
                 .as_type(val, data)
                 .as_rtti(self, data)
@@ -1398,6 +1439,52 @@ impl<'cxt> Cxt<'cxt> {
                             Gt => lop!(build_int_compare ? IntPredicate::SGT ; IntPredicate::UGT),
                             Leq => lop!(build_int_compare ? IntPredicate::SLE ; IntPredicate::ULE),
                             Geq => lop!(build_int_compare ? IntPredicate::SGE ; IntPredicate::UGE),
+                        }
+                    }
+                    BasicValueEnum::FloatValue(a) => {
+                        let b = b.into_float_value();
+                        // let name = self.name(val).unwrap_or_else(|| "binop".to_string());
+                        // let name = &name;
+                        let name = "binop";
+                        use crate::ir::BinOp::*;
+                        macro_rules! lop {
+                            (? $met1:ident : $met2:ident) => {
+                                if *signed {
+                                    lop!($met1)
+                                } else {
+                                    lop!($met2)
+                                }
+                            };
+                            ($met:ident ? $($a:expr)* ; $($b:expr)*) => {
+                                if *signed {
+                                    lop!($met $($a),*)
+                                } else {
+                                    lop!($met $($b),*)
+                                }
+                            };
+                            ($met:ident $($p:expr),* $(;$q:expr)*) => {
+                                self
+                                    .builder
+                                    .$met($($p,)* a, b, $($q,)* name)
+                                    .as_basic_value_enum()
+                            };
+                        }
+                        match op {
+                            Add => lop!(build_float_add),
+                            Sub => lop!(build_float_sub),
+                            Mul => lop!(build_float_mul),
+                            Div => lop!(build_float_div),
+                            Mod => lop!(build_float_rem),
+                            And | Or | Xor | Shl | Shr => panic!("No bitwise operations on floats"),
+                            Pow => todo!("float power"),
+
+                            Eq => lop!(build_float_compare FloatPredicate::OEQ),
+                            NEq => lop!(build_float_compare FloatPredicate::ONE),
+                            // TODO unsigned vs signed
+                            Lt => lop!(build_float_compare FloatPredicate::OLT),
+                            Gt => lop!(build_float_compare FloatPredicate::OGT),
+                            Leq => lop!(build_float_compare FloatPredicate::OLE),
+                            Geq => lop!(build_float_compare FloatPredicate::OGE),
                         }
                     }
                     _ => unreachable!(),
