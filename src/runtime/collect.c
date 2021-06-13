@@ -85,7 +85,7 @@ static bool evacuate(uint64_t** object_ptr, uint64_t size) {
     evac_heap_ptr = new_heap_ptr;
 
     // Pointer to the header
-    uint64_t* from = *object_ptr - 1;
+    uint64_t* from = *object_ptr;
 
     memcpy(to, from, size);
 
@@ -93,8 +93,8 @@ static bool evacuate(uint64_t** object_ptr, uint64_t size) {
         panic("Evacuation target pointer isn't word-aligned!");
 
     // Set the relocation bit in the old object header, and set the rest to the pointer to the new object
-    *from = ((uint64_t)to + 8) | RELOC_MASK;
-    *object_ptr = (uint64_t*)(to + 8);
+    *from = (uint64_t)to | RELOC_MASK;
+    *object_ptr = (uint64_t*)to;
 
     return true;
 }
@@ -155,7 +155,7 @@ static void mark(uint64_t** ptr, uint64_t** derived) {
         return;
     }
 
-    uint64_t header = *(*ptr - 1);
+    uint64_t header = **ptr;
     #ifdef EVACUATE
     if (header & RELOC_MASK) {
         // printf("Relocated %lx to %lx\n", *ptr, header & ~RELOC_MASK);
@@ -175,10 +175,10 @@ static void mark(uint64_t** ptr, uint64_t** derived) {
     // If it's gray or black, we've already marked it so we don't need to do it again
     if (color == COLOR_WHITE || color == current_off_white) {
         uint32_t* rtti = (uint32_t*)(header & ~COLOR_MASK);
-        uint32_t size = *rtti & ((1 << 16) - 1);
-        uint32_t rtti_size = *rtti >> 16;
+        uint32_t size = rtti[2] & ((1 << 16) - 1);
+        uint32_t rtti_size = rtti[2] >> 16;
 
-        void* block = all_blocks[0].start + ((void*)(*ptr - 1) - all_blocks[0].start) / BLOCK_SIZE * BLOCK_SIZE;
+        void* block = all_blocks[0].start + ((void*)*ptr - all_blocks[0].start) / BLOCK_SIZE * BLOCK_SIZE;
         uint32_t block_idx = (block - all_blocks[0].start) / BLOCK_SIZE;
 
         #ifdef EVACUATE
@@ -189,21 +189,21 @@ static void mark(uint64_t** ptr, uint64_t** derived) {
                 uint64_t offset = (uint64_t)(*derived) - (uint64_t)before;
                 *(uint64_t*)derived = (uint64_t)*ptr + offset;
             }
-            block = all_blocks[0].start + ((void*)(*ptr - 1) - all_blocks[0].start) / BLOCK_SIZE * BLOCK_SIZE;
+            block = all_blocks[0].start + ((void*)*ptr - all_blocks[0].start) / BLOCK_SIZE * BLOCK_SIZE;
             block_idx = (block - all_blocks[0].start) / BLOCK_SIZE;
         }
-        assert(*(*ptr - 1) == header);
+        assert(**ptr == header);
         #endif
 
         uint64_t* iptr = *ptr;
 
         // Mark gray
-        iptr[-1] = (header & ~COLOR_MASK) | COLOR_GRAY;
+        *iptr = (header & ~COLOR_MASK) | COLOR_GRAY;
 
         // Mark each line it covers
-        uint32_t line_idx = ((void*)(iptr - 1) - block) / LINE_SIZE;
-        // size doesn't include the header, so calc the offset from iptr instead of (iptr - 1)
-        void* end_ptr = (void*)iptr + size;
+        uint32_t line_idx = ((void*)iptr - block) / LINE_SIZE;
+        // size doesn't include the header
+        void* end_ptr = (void*)iptr + size + 8;
         // The `end` argument of `bitset_set_range` is exclusive, so +1
         uint32_t line_end = (end_ptr - block) / LINE_SIZE + 1;
         bitset_set_range(all_blocks[block_idx].line_mark, line_idx, line_end);
@@ -215,12 +215,12 @@ static void mark(uint64_t** ptr, uint64_t** derived) {
             // Add to gray stack to be traced later
             gray_stack_push(iptr);
             #else
-            // Trace now, starting at the first entry, not the size
-            trace(rtti + 1, iptr);
+            // Trace now, starting at the first entry, not the header or size
+            trace(rtti + 3, iptr);
             #endif
         } else {
             // Mark black right away, don't trace
-            iptr[-1] = (header & ~COLOR_MASK) | current_black;
+            *iptr = (header & ~COLOR_MASK) | current_black;
         }
 
         // Mark the type info
@@ -228,8 +228,8 @@ static void mark(uint64_t** ptr, uint64_t** derived) {
         mark(&rtti2, NULL);
         if ((void*)rtti != (void*)rtti2) {
             // The type info got moved, so update the header
-            color = iptr[-1] & COLOR_MASK;
-            iptr[-1] = (uint64_t)rtti2 | color;
+            color = *iptr & COLOR_MASK;
+            *iptr = (uint64_t)rtti2 | color;
         }
     }
 }
@@ -348,13 +348,14 @@ static void trace(uint32_t* rtti, uint64_t* object) {
     // Mark all pointers in the object and then set it black
     uint64_t* iptr = object;
     uint32_t size = rtti[-1] & ((1 << 16) - 1);
-    uint64_t* end = iptr + (size / 8);
-    // printf("Tracing object\n");
+    uint64_t* end = iptr + 1 + (size / 8);
+    // Move to the start of the object fields
+    object += 1;
     rtti_go(&rtti, &object);
     if (object != end) {
         panic("Object = %lx, end = %lx (iptr = %lx, size = %u)\n", (uint64_t)object, (uint64_t)end, (uint64_t)iptr, size);
     }
-    iptr[-1] = (iptr[-1] & ~COLOR_MASK) | current_black;
+    *iptr = (*iptr & ~COLOR_MASK) | current_black;
 }
 
 static void mark_stack(uint64_t* rsp) {

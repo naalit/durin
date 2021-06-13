@@ -15,7 +15,7 @@ fn main() {
         .unwrap()
         .success()
     {
-        println!("cargo:warning=Failed to assemble prelude.ll");
+        panic!("Failed to assemble prelude.ll");
     }
 
     let mut out_file = PathBuf::from(out_dir);
@@ -27,6 +27,6 @@ fn main() {
         .unwrap()
         .success()
     {
-        println!("cargo:warning=Failed to compile runtime.c");
+        panic!("Failed to compile runtime.c");
     }
 }

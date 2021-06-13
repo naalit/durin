@@ -1,6 +1,7 @@
 // Immix block allocator
 #include "common.h"
 #include "immix.h"
+#include <string.h>
 
 void initialize(uint32_t num_start_blocks) {
     if (BLOCK_SIZE % LINE_SIZE)
@@ -51,6 +52,8 @@ static bool next_line() {
                 found = true;
                 local_alloc.ptr = next_ptr;
             }
+            // Zero-initialize the line to make sure the GC never sees old data if it runs before stores to the region
+            memset(next_ptr, 0, LINE_SIZE);
         } else if (found) {
             local_alloc.end = next_ptr;
             return true;
@@ -130,7 +133,7 @@ void* immix_alloc(uint64_t size, uint32_t* header, uint64_t* rsp) {
             local_alloc.ptr = next_ptr;
             if ((uint64_t)next_ptr & 1)
                 panic("Unaligned pointer in immix_alloc()");
-            return next_ptr + 8;
+            return next_ptr;
         // Try this block
         } else if (next_line()) {
             continue;

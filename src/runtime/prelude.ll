@@ -1,9 +1,11 @@
+target datalayout = "ni:1"
+
 ; _Thread_local struct {
 ;     uint8_t* block;
 ;     uint8_t* end;
 ;     uint8_t* ptr;
 ; } local_alloc;
-%struct_alloc = type { i8 addrspace(1)*, i8 addrspace(1)*, i8 addrspace(1)* }
+%struct_alloc = type { i8*, i8*, i8* }
 @local_alloc = external thread_local global %struct_alloc, align 8
 
 ; `%size` should include a word for the header
@@ -20,12 +22,12 @@ define private i8 addrspace(1)* @gc_alloc_slow(i64 %size, i32 addrspace(1)* %hea
     ret i8 addrspace(1)* %alloc
 }
 
-; gc_alloc() will be inlined, but we don't want LLVM to think that the pointer to the header is the base pointer
-define private fastcc i8 addrspace(1)* @get_base_pointer(i8 addrspace(1)* %0) noinline {
-    %2 = getelementptr inbounds i8, i8 addrspace(1)* %0, i32 8
-    ret i8 addrspace(1)* %2
+define private fastcc i8 addrspace(1)* @to_gc_pointer(i8* %x) noinline {
+    %y = addrspacecast i8* %x to i8 addrspace(1)*
+    ret i8 addrspace(1)* %y
 }
 
+; The returned pointer points to the header of the object; the actual object starts one word later
 define private fastcc i8 addrspace(1)* @gc_alloc(i64 %size1, i32 addrspace(1)* %header) gc "statepoint-example" {
     ; Add 1-word header
     %size2 = add i64 %size1, 8
@@ -41,10 +43,10 @@ define private fastcc i8 addrspace(1)* @gc_alloc(i64 %size1, i32 addrspace(1)* %
     %heapPtr = getelementptr inbounds %struct_alloc, %struct_alloc* @local_alloc, i64 0, i32 2
     %heapEnd = getelementptr inbounds %struct_alloc, %struct_alloc* @local_alloc, i64 0, i32 1
 
-    %ptr = load i8 addrspace(1)*, i8 addrspace(1)** %heapPtr, align 8
-    %next = getelementptr inbounds i8, i8 addrspace(1)* %ptr, i64 %nsize
-    %end = load i8 addrspace(1)*, i8 addrspace(1)** %heapEnd, align 8
-    %cond = icmp slt i8 addrspace(1)* %next, %end
+    %ptr = load i8*, i8** %heapPtr, align 8
+    %next = getelementptr inbounds i8, i8* %ptr, i64 %nsize
+    %end = load i8*, i8** %heapEnd, align 8
+    %cond = icmp slt i8* %next, %end
     br i1 %cond, label %slow, label %fast
 
 slow:
@@ -52,12 +54,12 @@ slow:
     ret i8 addrspace(1)* %r
 
 fast:
-    store i8 addrspace(1)* %next, i8 addrspace(1)** %heapPtr, align 8
+    store i8* %next, i8** %heapPtr, align 8
 
-    %next.rtti = bitcast i8 addrspace(1)* %next to i32 addrspace(1)* addrspace(1)*
-    store i32 addrspace(1)* %header, i32 addrspace(1)* addrspace(1)* %next.rtti, align 8
+    %next.rtti = bitcast i8* %next to i32 addrspace(1)**
+    store i32 addrspace(1)* %header, i32 addrspace(1)** %next.rtti, align 8
 
-    %alloc = call fastcc i8 addrspace(1)* @get_base_pointer(i8 addrspace(1)* %next)
+    %alloc = call fastcc i8 addrspace(1)* @to_gc_pointer(i8* %next)
 
     ret i8 addrspace(1)* %alloc
 }
@@ -73,8 +75,11 @@ define private {} @print_i32(i32 %a) {
 
 ; "%.*s"
 @sstr = private unnamed_addr constant [5 x i8] c"%.*s\00", align 1
-define private {} @print_str(i8 addrspace(1)* %str) {
+define private {} @print_str(i8 addrspace(1)* %str_) {
 entry:
+    ; Skip the header
+    %str = getelementptr inbounds i8, i8 addrspace(1)* %str_, i32 8
+
     %as_i32 = bitcast i8 addrspace(1)* %str to i32 addrspace(1)*
     %size = load i32, i32 addrspace(1)* %as_i32
     %bytes = getelementptr inbounds i8, i8 addrspace(1)* %str, i32 4

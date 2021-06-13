@@ -40,7 +40,6 @@ impl crate::ir::Module {
         let backend = Backend::native();
         let module = backend.codegen_module(self);
         let cxt = &backend.cxt;
-        module.verify().map_err(|s| s.to_string())?;
         module.set_triple(&backend.machine.get_triple());
 
         // Create a wrapper around the program's main function if there is one
@@ -49,8 +48,8 @@ impl crate::ir::Module {
             let ty = f.get_type().print_to_string();
             // Durin might or might not have succeeded in turning `main` into direct style
             let run = match ty.to_str().unwrap() {
-                // () -> () in CPS
-                "void ({}, void (i8 addrspace(1)*, i8 addrspace(1)*)* addrspace(1)*)" => true,
+                // () -> _ in CPS
+                "void ({}, i8 addrspace(1)*)" => true,
                 // () -> () in direct style
                 "{} ({})" => true,
                 t => {
@@ -93,7 +92,16 @@ impl crate::ir::Module {
                         clos.set_initializer(&fun_ty.const_zero());
                         let clos = clos.as_pointer_value();
                         b.build_store(clos, fun2.as_global_value().as_pointer_value());
-                        let clos = b.build_pointer_cast(clos, fun_ty.gc_ptr(), "stop_clos_ptr");
+                        let clos =
+                            b.build_pointer_cast(clos, cxt.i8_type().gc_ptr(), "stop_clos_ptr");
+                        // Callers expect a pointer to the header
+                        let clos = unsafe {
+                            b.build_gep(
+                                clos,
+                                &[cxt.i64_type().const_int((-8i64) as u64, true)],
+                                "stop_clos_header",
+                            )
+                        };
 
                         let unit = cxt
                             .struct_type(&[], false)
@@ -125,6 +133,8 @@ impl crate::ir::Module {
             false
         };
 
+        module.verify().map_err(|s| s.to_string())?;
+
         // Call out to clang to compile and link it
         {
             use std::io::Write;
@@ -143,34 +153,32 @@ impl crate::ir::Module {
                 }
             }
 
-            let mut clang = Command::new("clang")
-                .stdin(Stdio::piped())
-                .args(&["-O2", "-g", "-x", "ir", "-", "_pika_runtime.bc"])
-                .args(if do_run {
-                    &["-z", "notext", "-o"] as &[_]
-                } else {
-                    &["-c"] as &[_]
-                })
-                .args(if do_run { Some(out_file) } else { None })
-                .spawn()
-                .map_err(|e| format!("Failed to launch clang: {}", e))?;
-            let stdin = clang.stdin.take().unwrap();
+
+            let objfile = {
+                let mut objfile = out_file.to_path_buf();
+                let mut name = objfile.file_name().unwrap().to_os_string();
+                name.push(".o");
+                objfile.set_file_name(name);
+                objfile
+            };
 
             let mut opt = Command::new("opt")
                 .stdin(Stdio::piped())
-                .stdout(stdin)
-                .args(&[
-                    "--sroa",
-                    "--mem2reg",
-                    "--sccp",
-                    "--rewrite-statepoints-for-gc",
-                ])
+                .stdout(Stdio::piped())
+                .arg("--passes=default<O3>,rewrite-statepoints-for-gc,instcombine")
                 .spawn()
                 .map_err(|e| format!("Failed to launch opt: {}", e))?;
             let mut stdin = opt.stdin.as_ref().unwrap();
             stdin
                 .write_all(buffer.as_slice())
                 .expect("Failed to pipe bitcode to opt");
+
+            let mut llc = Command::new("llc")
+                .stdin(opt.stdout.take().unwrap())
+                .args(&["-O3", "-filetype=obj", "--relocation-model=pic", "-o"])
+                .arg(&objfile)
+                .spawn()
+                .map_err(|e| format!("Failed to launch llc: {}", e))?;
 
             let code = opt
                 .wait()
@@ -180,6 +188,23 @@ impl crate::ir::Module {
             if code != 0 {
                 return Err(format!("Call to opt exited with error code {}", code));
             }
+            let code = llc
+                .wait()
+                .map_err(|e| format!("Failed to wait on llc process: {}", e))?
+                .code()
+                .unwrap_or(0);
+            if code != 0 {
+                return Err(format!("Call to llc exited with error code {}", code));
+            }
+
+            // No need to link if it doesn't have a main function
+            if do_run {
+                let mut clang = Command::new("clang")
+                    .stdin(Stdio::piped())
+                    .args(&["-O3", "-g", "_pika_runtime.bc", "-z", "notext", "-o"])
+                    .args(&[out_file, &objfile])
+                    .spawn()
+                    .map_err(|e| format!("Failed to launch clang: {}", e))?;
             let code = clang
                 .wait()
                 .map_err(|e| format!("Failed to wait on clang process: {}", e))?
@@ -188,6 +213,7 @@ impl crate::ir::Module {
             if code != 0 {
                 return Err(format!("Call to clang exited with error code {}", code));
             }
+        }
         }
 
         Ok(())
@@ -347,8 +373,13 @@ impl<'cxt> Cxt<'cxt> {
             self.builder.position_at_end(bb);
             let ptr = self.builder.build_int_to_ptr(
                 fun.get_first_param().unwrap().into_int_value(),
-                self.any_ty().into_pointer_type(),
+                self.cxt.i8_type().ptr_type(AddressSpace::Generic),
                 "inttoptr",
+            );
+            let ptr = self.builder.build_pointer_cast(
+                ptr,
+                self.any_ty().into_pointer_type(),
+                "inttoptr_gc",
             );
             self.builder.build_return(Some(&ptr));
 
@@ -359,6 +390,16 @@ impl<'cxt> Cxt<'cxt> {
             .builder
             .build_call(fun, &[i.as_basic_value_enum()], "inttoptr");
         call.as_any_value_enum().into_pointer_value()
+    }
+
+    pub fn ptrtoint(&self, ptr: PointerValue<'cxt>) -> IntValue<'cxt> {
+        let ptr = self.builder.build_pointer_cast(
+            ptr,
+            self.cxt.i8_type().ptr_type(AddressSpace::Generic),
+            "raw_pointer",
+        );
+        self.builder
+            .build_ptr_to_int(ptr, self.size_ty(), "ptrtoint")
     }
 
     pub fn if_expr(
@@ -488,7 +529,10 @@ impl<'cxt> Cxt<'cxt> {
             Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) | Type::Closure(_) | Type::Float(crate::ir::FloatType::F64) => {
                 let size = ty.heap_size(self, data);
                 let alloc = self.alloc(size, ty.as_rtti(self, data), "any_slot");
-                self.store(ty, val, alloc, data);
+                let slot = unsafe {
+                    self.builder.build_in_bounds_gep(alloc, &[self.size_ty().const_int(8,  false)], "store_slot")
+                };
+                self.store(ty, val, slot, data);
                 alloc
             }
         }
@@ -517,7 +561,7 @@ impl<'cxt> Cxt<'cxt> {
             // It's an integer, so do an ptrtoint
             Type::Int(bits) if *bits < 64 => {
                 let int_type = self.cxt.custom_width_int_type(*bits);
-                let val = self.builder.build_ptr_to_int(ptr, self.cxt.i64_type(), "from_any");
+                let val = self.ptrtoint(ptr);
                 // TODO check signedness
                 let val = self.builder.build_right_shift(
                     val,
@@ -529,7 +573,7 @@ impl<'cxt> Cxt<'cxt> {
                 val.as_basic_value_enum()
             }
             Type::Float(crate::ir::FloatType::F32) => {
-                let val = self.builder.build_ptr_to_int(ptr, self.cxt.i64_type(), "from_any");
+                let val = self.ptrtoint(ptr);
                 // TODO check signedness
                 let val = self.builder.build_right_shift(
                     val,
@@ -543,7 +587,12 @@ impl<'cxt> Cxt<'cxt> {
             }
 
             // Load from the pointer
-            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) | Type::Closure(_) | Type::Float(crate::ir::FloatType::F64)=> self.load(ty, ptr, data),
+            Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) | Type::Closure(_) | Type::Float(crate::ir::FloatType::F64)=> {
+                let ptr = unsafe {
+                    self.builder.build_in_bounds_gep(ptr, &[self.size_ty().const_int(8,  false)], "load_slot")
+                };
+                self.load(ty, ptr, data)
+            }
         }
     }
 
@@ -629,8 +678,15 @@ impl<'cxt> Cxt<'cxt> {
                         // Reallocate and copy: we don't allow interior pointers besides temporarily
                         let header = ty.as_rtti(self, data);
                         let alloc = self.alloc(size, header, "realloc");
+                        let to = unsafe {
+                            self.builder.build_in_bounds_gep(
+                                alloc,
+                                &[self.size_ty().const_int(8, false)],
+                                "to_slot",
+                            )
+                        };
                         self.builder
-                            .build_memcpy(alloc, 8, from, ty.alignment(), size)
+                            .build_memcpy(to, 8, from, ty.alignment(), size)
                             .unwrap();
                         alloc.as_basic_value_enum()
                     },
@@ -718,8 +774,16 @@ impl<'cxt> Cxt<'cxt> {
                     || {
                         // Copy the data this points to to the new location
                         let align = ty.alignment().max(1);
+                        // `from` is a pointer to the header
+                        let from = unsafe {
+                            self.builder.build_in_bounds_gep(
+                                from.into_pointer_value(),
+                                &[self.size_ty().const_int(8, false)],
+                                "store_slot",
+                            )
+                        };
                         self.builder
-                            .build_memcpy(to, align, from.into_pointer_value(), align, size)
+                            .build_memcpy(to, align, from, align, size)
                             .unwrap();
                     },
                 )
@@ -806,11 +870,7 @@ impl<'cxt> Cxt<'cxt> {
                                     // If it fits in a word, put it in an alloca so we can still work with a pointer
                                     let ptr =
                                         self.builder.build_alloca(self.size_ty(), "proj_slot");
-                                    let val = self.builder.build_ptr_to_int(
-                                        ptr,
-                                        self.size_ty(),
-                                        "proj_val",
-                                    );
+                                    let val = self.ptrtoint(ptr);
                                     let val = self.builder.build_right_shift(
                                         val,
                                         self.size_ty().const_int(1, false),
@@ -826,7 +886,16 @@ impl<'cxt> Cxt<'cxt> {
                                         )
                                         .as_basic_value_enum()
                                 },
-                                || val,
+                                // `val` is a pointer to the header, we need a pointer to the fields
+                                || unsafe {
+                                    self.builder
+                                        .build_in_bounds_gep(
+                                            val.into_pointer_value(),
+                                            &[self.size_ty().const_int(8, false)],
+                                            "store_slot",
+                                        )
+                                        .as_basic_value_enum()
+                                },
                             )
                             .into_pointer_value();
 
@@ -944,12 +1013,7 @@ impl<'cxt> Cxt<'cxt> {
             Node::Fun(_) => {
                 // Create a closure
                 let functions = self.functions.borrow();
-                let LFunction {
-                    arity,
-                    unknown,
-                    env,
-                    ..
-                } = functions
+                let LFunction { unknown, env, .. } = functions
                     .get(&val)
                     .unwrap_or_else(|| panic!("Couldn't find fun {}", val.id()));
 
@@ -968,6 +1032,7 @@ impl<'cxt> Cxt<'cxt> {
                 );
                 let size = env_ty.heap_size(self, data);
 
+                // We use the unknown version of the function, which takes one environment parameter and all of type i8* (any)
                 let fun_ptr_val = data.entities.create();
                 self.push_val(
                     fun_ptr_val,
@@ -981,19 +1046,18 @@ impl<'cxt> Cxt<'cxt> {
                     .collect();
 
                 let alloc = self.alloc(size, env_ty.as_rtti(self, data), "env_slot");
-                self.gen_struct(&values, &env_ty, alloc, data);
+                let slot = unsafe {
+                    self.builder.build_in_bounds_gep(
+                        alloc,
+                        &[self.size_ty().const_int(8, false)],
+                        "store_slot",
+                    )
+                };
+                self.gen_struct(&values, &env_ty, slot, data);
                 self.pop_val(fun_ptr_val);
 
-                // We use the unknown version of the function, which takes one environment parameter and all of type i8* (any)
-                let arg_tys: Vec<_> = (0..arity + 1).map(|_| self.any_ty()).collect();
-                let fun_ty = self
-                    .cxt
-                    .void_type()
-                    .fn_type(&arg_tys, false)
-                    .ptr_type(AddressSpace::Generic);
-
                 self.builder
-                    .build_bitcast(alloc, fun_ty.gc_ptr(), "closure")
+                    .build_bitcast(alloc, self.any_ty().into_pointer_type(), "closure")
             }
             Node::ExternFun(name, params, ret) => {
                 let fun = match self.module.get_function(name) {
@@ -1038,11 +1102,7 @@ impl<'cxt> Cxt<'cxt> {
                                     // If it fits in a word, put it in an alloca so we can still work with a pointer
                                     let ptr =
                                         self.builder.build_alloca(self.size_ty(), "proj_slot");
-                                    let val = self.builder.build_ptr_to_int(
-                                        ptr,
-                                        self.size_ty(),
-                                        "proj_val",
-                                    );
+                                    let val = self.ptrtoint(ptr);
                                     let val = self.builder.build_right_shift(
                                         val,
                                         self.size_ty().const_int(1, false),
@@ -1058,7 +1118,15 @@ impl<'cxt> Cxt<'cxt> {
                                         )
                                         .as_basic_value_enum()
                                 },
-                                || val,
+                                || unsafe {
+                                    self.builder
+                                        .build_in_bounds_gep(
+                                            val.into_pointer_value(),
+                                            &[self.size_ty().const_int(8, false)],
+                                            "store_slot",
+                                        )
+                                        .as_basic_value_enum()
+                                },
                             )
                             .into_pointer_value();
 
@@ -1170,8 +1238,19 @@ impl<'cxt> Cxt<'cxt> {
                                             .as_basic_value_enum()
                                     },
                                     || {
-                                        self.alloc(size, ty.as_rtti(self, data), "sum_type_alloc")
-                                            .as_basic_value_enum()
+                                        let alloc = self.alloc(
+                                            size,
+                                            ty.as_rtti(self, data),
+                                            "sum_type_alloc",
+                                        );
+                                        let alloc = unsafe {
+                                            self.builder.build_in_bounds_gep(
+                                                alloc,
+                                                &[self.size_ty().const_int(8, false)],
+                                                "store_slot",
+                                            )
+                                        };
+                                        alloc.as_basic_value_enum()
                                     },
                                 )
                                 .into_pointer_value(),
@@ -1224,11 +1303,7 @@ impl<'cxt> Cxt<'cxt> {
                                         .builder
                                         .build_load(ptr, "sum_type_as_word")
                                         .into_pointer_value();
-                                    let val = self.builder.build_ptr_to_int(
-                                        val,
-                                        self.size_ty(),
-                                        "sum_type_word",
-                                    );
+                                    let val = self.ptrtoint(val);
                                     let val = self.builder.build_right_shift(
                                         val,
                                         self.size_ty().const_int(1, false),
@@ -1242,7 +1317,16 @@ impl<'cxt> Cxt<'cxt> {
                                     );
                                     self.inttoptr(val).as_basic_value_enum()
                                 },
-                                || alloc.as_basic_value_enum(),
+                                || {
+                                    let alloc = unsafe {
+                                        self.builder.build_in_bounds_gep(
+                                            alloc,
+                                            &[self.size_ty().const_int(-8i64 as u64, true)],
+                                            "store_slot",
+                                        )
+                                    };
+                                    alloc.as_basic_value_enum()
+                                },
                             ),
                             _ => unreachable!(),
                         }
@@ -1298,8 +1382,16 @@ impl<'cxt> Cxt<'cxt> {
                                         .as_basic_value_enum()
                                 },
                                 || {
-                                    self.alloc(size, ty.as_rtti(self, data), "struct_alloc")
-                                        .as_basic_value_enum()
+                                    let alloc =
+                                        self.alloc(size, ty.as_rtti(self, data), "struct_alloc");
+                                    let alloc = unsafe {
+                                        self.builder.build_in_bounds_gep(
+                                            alloc,
+                                            &[self.size_ty().const_int(8, false)],
+                                            "store_slot",
+                                        )
+                                    };
+                                    alloc.as_basic_value_enum()
                                 },
                             )
                             .into_pointer_value();
@@ -1321,11 +1413,7 @@ impl<'cxt> Cxt<'cxt> {
                                     .builder
                                     .build_load(ptr, "struct_as_word")
                                     .into_pointer_value();
-                                let val = self.builder.build_ptr_to_int(
-                                    val,
-                                    self.size_ty(),
-                                    "struct_word",
-                                );
+                                let val = self.ptrtoint(val);
                                 let val = self.builder.build_right_shift(
                                     val,
                                     self.size_ty().const_int(1, false),
@@ -1339,7 +1427,16 @@ impl<'cxt> Cxt<'cxt> {
                                 );
                                 self.inttoptr(val).as_basic_value_enum()
                             },
-                            || alloc.as_basic_value_enum(),
+                            || {
+                                let alloc = unsafe {
+                                    self.builder.build_in_bounds_gep(
+                                        alloc,
+                                        &[self.size_ty().const_int(-8i64 as u64, true)],
+                                        "store_slot",
+                                    )
+                                };
+                                alloc.as_basic_value_enum()
+                            },
                         )
                     }
                     _ => unreachable!(),
@@ -1374,9 +1471,10 @@ impl<'cxt> Cxt<'cxt> {
             },
             Node::Const(Constant::String(s)) => {
                 let size = s.len() as u32;
-                let bytes: Vec<_> = size
-                    .to_le_bytes()
+                // We need a fake 8-byte header to be ABI-compatible with heap-allocated strings
+                let bytes: Vec<_> = [0; 8]
                     .iter()
+                    .chain(size.to_le_bytes().iter())
                     .cloned()
                     .chain(s.bytes())
                     .map(|x| self.cxt.i8_type().const_int(x as u64, false))
@@ -1611,11 +1709,25 @@ impl<'cxt> Cxt<'cxt> {
                     }
                     crate::ir::RefOp::RefGet(r) => {
                         let ptr = self.gen_value(*r, data).into_pointer_value();
+                        let ptr = unsafe {
+                            self.builder.build_in_bounds_gep(
+                                ptr,
+                                &[self.size_ty().const_int(8, false)],
+                                "ref_slot",
+                            )
+                        };
                         let val = self.load(&ty, ptr, data);
                         Some((val, ty))
                     }
                     crate::ir::RefOp::RefSet(r, v) => {
                         let ptr = self.gen_value(*r, data).into_pointer_value();
+                        let ptr = unsafe {
+                            self.builder.build_in_bounds_gep(
+                                ptr,
+                                &[self.size_ty().const_int(8, false)],
+                                "ref_slot",
+                            )
+                        };
                         // TODO are there circumstances when we can use `gen_at`?
                         let val = self.gen_value(*v, data);
                         self.store(&ty, val, ptr, data);
@@ -1757,6 +1869,13 @@ impl<'cxt> Cxt<'cxt> {
                         }
 
                         let callee = self.gen_value(callee, data).into_pointer_value();
+                        let fun_ptr_slot = unsafe {
+                            self.builder.build_in_bounds_gep(
+                                callee,
+                                &[self.size_ty().const_int(8, false)],
+                                "store_slot",
+                            )
+                        };
                         let fun_ty = vec![self.any_ty(); args.len() + 1];
                         let fun_ty = self
                             .cxt
@@ -1765,23 +1884,20 @@ impl<'cxt> Cxt<'cxt> {
                             .ptr_type(AddressSpace::Generic);
                         let fun_ptr_ptr = self
                             .builder
-                            .build_bitcast(callee, fun_ty.gc_ptr(), "fun_ptr_ptr")
+                            .build_bitcast(fun_ptr_slot, fun_ty.gc_ptr(), "fun_ptr_ptr")
                             .into_pointer_value();
                         let fun_ptr = self
                             .builder
                             .build_load(fun_ptr_ptr, "fun_ptr")
                             .into_pointer_value();
-                        let env = self
-                            .builder
-                            .build_bitcast(callee, self.any_ty(), "closure_env");
 
                         // It could be polymorphic, so we pass all arguments as word-size "any"
                         let mut args: Vec<_> = args
                             .into_iter()
                             .map(|(val, ty)| self.to_any(&ty, val, data).as_basic_value_enum())
                             .collect();
-                        // The closure environment is the last argument
-                        args.push(env);
+                        // The closure environment (which is just the pointer to the closure) is the last argument
+                        args.push(callee.as_basic_value_enum());
 
                         let call = self.builder.build_call(fun_ptr, &args, "closure_call");
 
@@ -1956,10 +2072,11 @@ impl<'cxt> Cxt<'cxt> {
                 env_ptr.set_name("env");
                 // TODO what about dependently sized types?
 
+                // Skip the header and the function pointer
                 let mut ptr = unsafe {
                     self.builder.build_in_bounds_gep(
                         env_ptr.into_pointer_value(),
-                        &[self.cxt.i32_type().const_int(8, false)],
+                        &[self.cxt.i32_type().const_int(16, false)],
                         "env_slots",
                     )
                 };
@@ -2150,7 +2267,16 @@ impl<'cxt> Cxt<'cxt> {
                             );
                             (alloca, v)
                         }
-                        Type::PtrEnum(v) => (x.into_pointer_value(), v),
+                        Type::PtrEnum(v) => {
+                            let ptr = unsafe {
+                                self.builder.build_in_bounds_gep(
+                                    x.into_pointer_value(),
+                                    &[self.size_ty().const_int(8, false)],
+                                    "ref_slot",
+                                )
+                            };
+                            (ptr, v)
+                        }
                         _ => unreachable!(),
                     };
 

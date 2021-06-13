@@ -178,7 +178,14 @@ impl<'cxt> Type<'cxt> {
                 }
             }
             Type::Unknown(v) => {
-                let int32 = cxt.builder.build_load(*v, "ty_size").into_int_value();
+                let rtti_ptr = unsafe {
+                    cxt.builder.build_in_bounds_gep(
+                        *v,
+                        &[cxt.size_ty().const_int(2, false)],
+                        "rtti_ptr",
+                    )
+                };
+                let int32 = cxt.builder.build_load(rtti_ptr, "ty_size").into_int_value();
                 let int32 = cxt.builder.build_and(
                     int32,
                     cxt.cxt.i32_type().const_int((1 << 16) - 1, false),
@@ -260,17 +267,7 @@ impl<'cxt> Type<'cxt> {
                 crate::ir::FloatType::F32 => cxt.cxt.f32_type().as_basic_type_enum(),
                 crate::ir::FloatType::F64 => cxt.cxt.f64_type().as_basic_type_enum(),
             },
-            Type::Closure(nargs) => {
-                // Add an argument for the environment
-                let args = vec![cxt.any_ty(); *nargs as usize + 1];
-                // It's a pointer to a function pointer, with the environment after
-                cxt.cxt
-                    .void_type()
-                    .fn_type(&args, false)
-                    .ptr_type(AddressSpace::Generic)
-                    .gc_ptr()
-                    .as_basic_type_enum()
-            }
+            Type::Closure(_) => cxt.any_ty(),
             Type::ExternFun(v, ret) => ret
                 .fn_type(&v, false)
                 .ptr_type(AddressSpace::Generic)
@@ -300,7 +297,16 @@ impl<'cxt> Type<'cxt> {
 
                 info.end_variant();
             }
-            Type::Unknown(v) => info.splice(*v),
+            Type::Unknown(v) => {
+                let rtti_ptr = unsafe {
+                    cxt.builder.build_in_bounds_gep(
+                        *v,
+                        &[cxt.size_ty().const_int(2, false)],
+                        "rtti_ptr",
+                    )
+                };
+                info.splice(rtti_ptr)
+            }
             Type::Unknown2(_) => panic!("Unknown2 not supported"),
             Type::Float(t) => match t {
                 crate::ir::FloatType::F32 => info.extra_bytes(4),
@@ -413,6 +419,27 @@ impl<'cxt> TyInfo<'cxt> {
             extra_bytes: 0,
             entries: Vec::new(),
         }
+    }
+}
+impl<'cxt> Cxt<'cxt> {
+    fn const_u32_arr(&self, arr: &[u32], name: &str) -> PointerValue<'cxt> {
+        // Include a 64-bit fake header
+        let arr: Vec<_> = [0, 0]
+            .iter()
+            .chain(arr.iter())
+            .map(|&x| self.cxt.i32_type().const_int(x as u64, false))
+            .collect();
+        let arr = self.cxt.i32_type().const_array(&arr);
+        let global = self.module.add_global(arr.get_type(), None, name);
+        global.set_unnamed_addr(true);
+        global.set_constant(true);
+        global.set_alignment(8);
+        global.set_initializer(&arr);
+        self.builder.build_address_space_cast(
+            global.as_pointer_value(),
+            self.cxt.i32_type().gc_ptr(),
+            "const_arr_ptr",
+        )
     }
 }
 impl<'cxt> TyInfo<'cxt> {
@@ -577,7 +604,11 @@ impl<'cxt> TyInfo<'cxt> {
                     .const_int((rtti_size << 16) as u64, false);
                 let sizes = cxt.builder.build_or(rtti_size, ty_size, "rtti_sizes");
 
-                let values: Vec<_> = std::iter::once(sizes)
+                // We need a 64-bit fake header
+                let values: Vec<_> = [0u32, 0]
+                    .iter()
+                    .map(|&x| cxt.cxt.i32_type().const_int(x as u64, false))
+                    .chain(std::iter::once(sizes))
                     .chain(
                         v.iter()
                             .map(|&x| cxt.cxt.i32_type().const_int(x as u64, false)),
@@ -636,32 +667,10 @@ impl<'cxt> TyInfo<'cxt> {
                 .build_int_add(size, cxt.size_ty().const_int(4, false), "alloc_size");
 
         let rtti_rtti = if let Some(size) = size.get_zero_extended_constant() {
-            let global = cxt
-                .module
-                .add_global(cxt.cxt.i32_type(), None, "rtti_const_rtti");
-            global.set_unnamed_addr(true);
-            global.set_constant(true);
-            global.set_alignment(8);
             // The size of the RTTI RTTI is 0, since it doesn't include space for the size itself
-            global.set_initializer(&cxt.cxt.i32_type().const_int(size + 4, false));
-            cxt.builder.build_address_space_cast(
-                global.as_pointer_value(),
-                cxt.cxt.i32_type().gc_ptr(),
-                "rtti_const_rtti_ptr",
-            )
+            cxt.const_u32_arr(&[size as u32], "rtti_const_rtti")
         } else {
-            let global = cxt
-                .module
-                .add_global(cxt.cxt.i32_type(), None, "just_size_rtti");
-            global.set_unnamed_addr(true);
-            global.set_constant(true);
-            global.set_alignment(8);
-            global.set_initializer(&cxt.cxt.i32_type().const_int(4, false));
-            let just_size_rtti = cxt.builder.build_address_space_cast(
-                global.as_pointer_value(),
-                cxt.cxt.i32_type().gc_ptr(),
-                "just_size_rtti_ptr",
-            );
+            let just_size_rtti = cxt.const_u32_arr(&[4], "just_size_rtti");
 
             let alloc = cxt.alloc(
                 cxt.cxt.i64_type().const_int(4, false),
@@ -670,19 +679,35 @@ impl<'cxt> TyInfo<'cxt> {
             );
             let alloc_i32 = cxt
                 .builder
-                .build_bitcast(alloc, cxt.cxt.i32_type().gc_ptr(), "rtti_size_slot")
+                .build_bitcast(alloc, cxt.cxt.i32_type().gc_ptr(), "rtti_size_alloc")
                 .into_pointer_value();
+            // Store after the header
+            let slot = unsafe {
+                cxt.builder.build_in_bounds_gep(
+                    alloc_i32,
+                    &[cxt.cxt.i32_type().const_int(2, false)],
+                    "rtti_size_slot",
+                )
+            };
             let size =
                 cxt.builder
                     .build_int_truncate(alloc_size, cxt.cxt.i32_type(), "alloc_size_i32");
-            cxt.builder.build_store(alloc_i32, size);
+            cxt.builder.build_store(slot, size);
             alloc_i32
         };
         let alloc = cxt.alloc(alloc_size, rtti_rtti, "rtti_slot");
-        let mut slot = cxt
+        let slot = cxt
             .builder
             .build_bitcast(alloc, cxt.cxt.i32_type().gc_ptr(), "rtti_slot_i32")
             .into_pointer_value();
+        // Skip the header
+        let mut slot = unsafe {
+            cxt.builder.build_in_bounds_gep(
+                slot,
+                &[cxt.cxt.i32_type().const_int(2, false)],
+                "rtti_size_slot",
+            )
+        };
 
         let sizes = cxt
             .builder
