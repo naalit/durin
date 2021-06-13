@@ -213,8 +213,12 @@ impl<'a> System<'a> for SSA {
                     };
                     cont.filter(|&cont| {
                         let cuses = uses_comp.get(cont).unwrap();
-                        !cuses.is_empty()
-                        && cuses.iter().all(|&i| matches!(slots.node(i), Some(Node::Fun(Function { callee, .. })) if *callee == cont))
+                        !cuses.is_empty() && cuses.iter().all(|&i| {
+                            matches!(slots.node(i), Some(Node::Fun(Function { callee, call_args, .. }))
+                                // Theoretically, we support multiple return values by packing them in a struct
+                                // But LLVM doesn't support GC pointers in structs right now, so it's disabled
+                                if *callee == cont && call_args.len() == 1)
+                        })
                     })
                         .and_then(|cont| {
                             let mut reqs = Vec::new();

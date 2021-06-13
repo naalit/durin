@@ -133,6 +133,7 @@ impl crate::ir::Module {
             false
         };
 
+        #[cfg(not(feature = "llvm-13"))]
         module.verify().map_err(|s| s.to_string())?;
 
         // Call out to clang to compile and link it
@@ -153,6 +154,15 @@ impl crate::ir::Module {
                 }
             }
 
+            #[cfg(feature = "llvm-13")]
+            let opt = concat!(env!("LLVM_DIR"), "/opt");
+            #[cfg(not(feature = "llvm-13"))]
+            let opt = "opt";
+
+            #[cfg(feature = "llvm-13")]
+            let llc = concat!(env!("LLVM_DIR"), "/llc");
+            #[cfg(not(feature = "llvm-13"))]
+            let llc = "llc";
 
             let objfile = {
                 let mut objfile = out_file.to_path_buf();
@@ -162,7 +172,7 @@ impl crate::ir::Module {
                 objfile
             };
 
-            let mut opt = Command::new("opt")
+            let mut opt = Command::new(opt)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .arg("--passes=default<O3>,rewrite-statepoints-for-gc,instcombine")
@@ -173,7 +183,7 @@ impl crate::ir::Module {
                 .write_all(buffer.as_slice())
                 .expect("Failed to pipe bitcode to opt");
 
-            let mut llc = Command::new("llc")
+            let mut llc = Command::new(llc)
                 .stdin(opt.stdout.take().unwrap())
                 .args(&["-O3", "-filetype=obj", "--relocation-model=pic", "-o"])
                 .arg(&objfile)
@@ -205,15 +215,15 @@ impl crate::ir::Module {
                     .args(&[out_file, &objfile])
                     .spawn()
                     .map_err(|e| format!("Failed to launch clang: {}", e))?;
-            let code = clang
-                .wait()
-                .map_err(|e| format!("Failed to wait on clang process: {}", e))?
-                .code()
-                .unwrap_or(0);
-            if code != 0 {
-                return Err(format!("Call to clang exited with error code {}", code));
+                let code = clang
+                    .wait()
+                    .map_err(|e| format!("Failed to wait on clang process: {}", e))?
+                    .code()
+                    .unwrap_or(0);
+                if code != 0 {
+                    return Err(format!("Call to clang exited with error code {}", code));
+                }
             }
-        }
         }
 
         Ok(())
@@ -348,6 +358,7 @@ impl<'cxt> Cxt<'cxt> {
     }
 
     /// LLVM doesn't understand `inttoptr` to a GC pointer, so we need to wrap it in a `noinline` function which doesn't use GC.
+    #[cfg(not(feature = "llvm-13"))]
     pub fn inttoptr(&self, i: IntValue<'cxt>) -> PointerValue<'cxt> {
         let i = self
             .builder
@@ -392,12 +403,24 @@ impl<'cxt> Cxt<'cxt> {
         call.as_any_value_enum().into_pointer_value()
     }
 
+    #[cfg(feature = "llvm-13")]
+    pub fn inttoptr(&self, i: IntValue<'cxt>) -> PointerValue<'cxt> {
+        self.builder.build_int_to_ptr(i, self.any_ty().into_pointer_type(), "inttoptr")
+    }
+
+    #[cfg(not(feature = "llvm-13"))]
     pub fn ptrtoint(&self, ptr: PointerValue<'cxt>) -> IntValue<'cxt> {
         let ptr = self.builder.build_pointer_cast(
             ptr,
             self.cxt.i8_type().ptr_type(AddressSpace::Generic),
             "raw_pointer",
         );
+        self.builder
+            .build_ptr_to_int(ptr, self.size_ty(), "ptrtoint")
+    }
+    
+    #[cfg(feature = "llvm-13")]
+    pub fn ptrtoint(&self, ptr: PointerValue<'cxt>) -> IntValue<'cxt> {
         self.builder
             .build_ptr_to_int(ptr, self.size_ty(), "ptrtoint")
     }
