@@ -9,8 +9,11 @@ edition = "2018"
 [dependencies]
 smallvec = "*"
 either = "*"
-inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["llvm11-0"] }
+inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["llvm12-0"] }
 specs = { version = "*", features = ["specs-derive"] }
+
+[build-dependencies]
+cc = "*"
 
 [features]
 llvm-13 = []

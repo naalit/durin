@@ -13,6 +13,8 @@ use inkwell::{
     AddressSpace, FloatPredicate, IntPredicate,
 };
 use specs::prelude::*;
+use std::ffi::CString;
+use std::os::raw::c_char;
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
@@ -29,10 +31,37 @@ pub const CCC: u32 = 0;
 pub const FASTCC: u32 = 8;
 pub const DO_TAIL_CALL: bool = true;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CallKind {
+    Extern,
+    Tail,
+    Stack,
+}
+impl CallKind {
+    pub fn conv(self) -> u32 {
+        match self {
+            CallKind::Extern => CCC,
+            CallKind::Tail => TAILCC,
+            CallKind::Stack => TAILCC,
+        }
+    }
+}
+
 pub struct Data<'a> {
     slots: ReadStorage<'a, Slot>,
     uses: ReadStorage<'a, Uses>,
     entities: Entities<'a>,
+}
+
+extern "C" {
+    /// The interface to the LLVM plugin written in C++
+    fn do_opt(
+        bitcode: *const c_char,
+        bitcode_len: usize,
+        filename: *const c_char,
+        out_file: *const c_char,
+        optimize: bool,
+    ) -> i32;
 }
 
 impl crate::ir::Module {
@@ -155,12 +184,7 @@ impl crate::ir::Module {
             }
 
             #[cfg(feature = "llvm-13")]
-            let opt = concat!(env!("LLVM_DIR"), "/opt");
-            #[cfg(not(feature = "llvm-13"))]
-            let opt = "opt";
-
-            #[cfg(feature = "llvm-13")]
-            let llc = concat!(env!("LLVM_DIR"), "/llc");
+            let llc = concat!(env!("LLVM_DIR"), "/bin/llc");
             #[cfg(not(feature = "llvm-13"))]
             let llc = "llc";
 
@@ -171,33 +195,35 @@ impl crate::ir::Module {
                 objfile.set_file_name(name);
                 objfile
             };
-
-            let mut opt = Command::new(opt)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .arg("--passes=default<O3>,rewrite-statepoints-for-gc,instcombine")
-                .spawn()
-                .map_err(|e| format!("Failed to launch opt: {}", e))?;
-            let mut stdin = opt.stdin.as_ref().unwrap();
-            stdin
-                .write_all(buffer.as_slice())
-                .expect("Failed to pipe bitcode to opt");
+            let module_file = {
+                let mut objfile = out_file.to_path_buf();
+                let mut name = objfile.file_name().unwrap().to_os_string();
+                name.push(".bc");
+                objfile.set_file_name(name);
+                objfile
+            };
+            unsafe {
+                let filename = CString::new(out_file.to_str().unwrap()).unwrap();
+                let module_file = CString::new(module_file.to_str().unwrap()).unwrap();
+                if do_opt(
+                    buffer.as_slice().as_ptr() as *const c_char,
+                    buffer.get_size(),
+                    filename.as_ptr(),
+                    module_file.as_ptr(),
+                    true,
+                ) != 0
+                {
+                    return Err(format!("Optimization failed"));
+                }
+            }
 
             let mut llc = Command::new(llc)
-                .stdin(opt.stdout.take().unwrap())
+                .arg(module_file)
                 .args(&["-O3", "-filetype=obj", "--relocation-model=pic", "-o"])
                 .arg(&objfile)
                 .spawn()
                 .map_err(|e| format!("Failed to launch llc: {}", e))?;
 
-            let code = opt
-                .wait()
-                .map_err(|e| format!("Failed to wait on opt process: {}", e))?
-                .code()
-                .unwrap_or(0);
-            if code != 0 {
-                return Err(format!("Call to opt exited with error code {}", code));
-            }
             let code = llc
                 .wait()
                 .map_err(|e| format!("Failed to wait on llc process: {}", e))?
@@ -378,6 +404,14 @@ impl<'cxt> Cxt<'cxt> {
                 self.cxt
                     .create_enum_attribute(Attribute::get_named_enum_kind_id("noinline"), 0),
             );
+            fun.add_attribute(
+                AttributeLoc::Function,
+                self.cxt.create_string_attribute("inline-late", ""),
+            );
+            fun.add_attribute(
+                AttributeLoc::Function,
+                self.cxt.create_string_attribute("gc-leaf-function", ""),
+            );
 
             let bb = self.cxt.append_basic_block(fun, "entry");
             let before = self.builder.get_insert_block().unwrap();
@@ -405,7 +439,8 @@ impl<'cxt> Cxt<'cxt> {
 
     #[cfg(feature = "llvm-13")]
     pub fn inttoptr(&self, i: IntValue<'cxt>) -> PointerValue<'cxt> {
-        self.builder.build_int_to_ptr(i, self.any_ty().into_pointer_type(), "inttoptr")
+        self.builder
+            .build_int_to_ptr(i, self.any_ty().into_pointer_type(), "inttoptr")
     }
 
     #[cfg(not(feature = "llvm-13"))]
@@ -418,11 +453,33 @@ impl<'cxt> Cxt<'cxt> {
         self.builder
             .build_ptr_to_int(ptr, self.size_ty(), "ptrtoint")
     }
-    
+
     #[cfg(feature = "llvm-13")]
     pub fn ptrtoint(&self, ptr: PointerValue<'cxt>) -> IntValue<'cxt> {
         self.builder
             .build_ptr_to_int(ptr, self.size_ty(), "ptrtoint")
+    }
+
+    pub fn call_raw<F, E>(
+        &self,
+        f: F,
+        args: &[BasicValueEnum<'cxt>],
+        kind: CallKind,
+    ) -> CallSiteValue<'cxt>
+    where
+        F: TryInto<CallableValue<'cxt>, Error = E>,
+        E: std::fmt::Debug,
+    {
+        let conv = kind.conv();
+        let name = match kind {
+            CallKind::Extern => "extern_call",
+            CallKind::Tail => "tail_call",
+            CallKind::Stack => "stack_call",
+        };
+        let call = self.builder.build_call(f.try_into().unwrap(), args, name);
+        call.set_call_convention(conv);
+        call.set_tail_call(DO_TAIL_CALL);
+        call
     }
 
     pub fn if_expr(
@@ -1791,10 +1848,7 @@ impl<'cxt> Cxt<'cxt> {
             Some(Node::ExternCall(f, ret_ty)) => {
                 let args: Vec<_> = args.into_iter().map(|(v, _)| v).collect();
                 let f = self.gen_value(*f, data);
-                let call = self
-                    .builder
-                    .build_call(f.into_pointer_value(), &args, "extern_call");
-                call.set_tail_call(DO_TAIL_CALL);
+                let call = self.call_raw(f.into_pointer_value(), &args, CallKind::Extern);
 
                 let ret_ty = self.as_type(*ret_ty, data);
 
@@ -1838,9 +1892,7 @@ impl<'cxt> Cxt<'cxt> {
                                 panic!("No continuation given for {}", callee.id())
                                 //.pretty(self))
                             });
-                            let call = self.builder.build_call(*known, &args, "stack_call");
-                            call.set_tail_call(DO_TAIL_CALL);
-                            call.set_call_convention(TAILCC);
+                            let call = self.call_raw(*known, &args, CallKind::Stack);
 
                             let call = call.try_as_basic_value().left().unwrap();
                             let atys = &fcont.as_ref().unwrap().1;
@@ -1878,10 +1930,7 @@ impl<'cxt> Cxt<'cxt> {
                                 let v = self.cast(v, &ty, param_tys.last().unwrap(), data);
                                 args.push(v);
                             }
-                            let call = self.builder.build_call(*known, &args, "call");
-
-                            call.set_tail_call(DO_TAIL_CALL);
-                            call.set_call_convention(TAILCC);
+                            self.call_raw(*known, &args, CallKind::Tail);
                             self.builder.build_return(None);
                         }
                     }
@@ -1922,10 +1971,7 @@ impl<'cxt> Cxt<'cxt> {
                         // The closure environment (which is just the pointer to the closure) is the last argument
                         args.push(callee.as_basic_value_enum());
 
-                        let call = self.builder.build_call(fun_ptr, &args, "closure_call");
-
-                        call.set_tail_call(DO_TAIL_CALL);
-                        call.set_call_convention(TAILCC);
+                        self.call_raw(fun_ptr, &args, CallKind::Tail);
                         self.builder.build_return(None);
                     }
                 }

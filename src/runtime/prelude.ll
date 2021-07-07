@@ -22,7 +22,7 @@ define private i8 addrspace(1)* @gc_alloc_slow(i64 %size, i32 addrspace(1)* %hea
     ret i8 addrspace(1)* %alloc
 }
 
-define private fastcc i8 addrspace(1)* @to_gc_pointer(i8* %x) noinline {
+define private fastcc i8 addrspace(1)* @to_gc_pointer(i8* %x) noinline "gc-leaf-function" "inline-late" {
     %y = addrspacecast i8* %x to i8 addrspace(1)*
     ret i8 addrspace(1)* %y
 }
@@ -68,14 +68,14 @@ fast:
 @istr = private unnamed_addr constant [4 x i8] c"%d\0a\00", align 1
 declare i32 @printf(i8*, ...)
 
-define private {} @print_i32(i32 %a) {
+define private {} @print_i32(i32 %a) "gc-leaf-function" {
     %_0 = call i32 (i8*, ...) @printf(i8* getelementptr inbounds ([4 x i8], [4 x i8]* @istr, i32 0, i32 0), i32 %a)
     ret {} undef
 }
 
 ; "%.*s"
 @sstr = private unnamed_addr constant [5 x i8] c"%.*s\00", align 1
-define private {} @print_str(i8 addrspace(1)* %str_) {
+define private {} @print_str(i8 addrspace(1)* %str_) "gc-leaf-function" {
 entry:
     ; Skip the header
     %str = getelementptr inbounds i8, i8 addrspace(1)* %str_, i32 8
