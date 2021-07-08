@@ -65,7 +65,7 @@ extern "C" {
 }
 
 impl crate::ir::Module {
-    pub fn compile_and_link(&mut self, out_file: &Path) -> Result<(), String> {
+    pub fn compile_and_link(&mut self, out_file: &Path, optimize: bool) -> Result<(), String> {
         let backend = Backend::native();
         let module = backend.codegen_module(self);
         let cxt = &backend.cxt;
@@ -186,7 +186,7 @@ impl crate::ir::Module {
                     buffer.get_size(),
                     filename.as_ptr(),
                     module_file.as_ptr(),
-                    true,
+                    optimize,
                 ) != 0
                 {
                     return Err(format!("Optimization failed"));
@@ -204,7 +204,8 @@ impl crate::ir::Module {
 
                 let mut clang = Command::new(clang)
                     .stdin(Stdio::piped())
-                    .args(&["-O3", "-flto=thin", "-g", "-z", "notext"])
+                    .arg(if optimize { "-O3" } else { "-g" })
+                    .args(&["-flto=thin", "-z", "notext"])
                     .args(&["-Wno-override-module", "-x", "ir", "-", "-o"])
                     .args(&[out_file, &module_file])
                     .spawn()
@@ -223,7 +224,8 @@ impl crate::ir::Module {
 
                 Command::new(clang)
                     .stdin(Stdio::piped())
-                    .args(&["-O3", "-flto=thin", "-g", "-z", "notext"])
+                    .arg(if optimize { "-O3" } else { "-g" })
+                    .args(&["-flto=thin", "-z", "notext"])
                     .args(&["-Wno-override-module", "-x", "ir", "-c", "-o"])
                     .args(&[&objfile, &module_file])
                     .spawn()
