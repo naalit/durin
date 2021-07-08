@@ -170,31 +170,7 @@ impl crate::ir::Module {
             use std::io::Write;
             use std::process::*;
             let buffer = module.write_bitcode_to_memory();
-            // We shouldn't need to store the runtime in a file, we could just pipe both files to clang's stdin
-            // But we would need to somehow send an EOF without closing the pipe
-            {
-                use std::fs::File;
-                let runtime = include_bytes!(concat!(env!("OUT_DIR"), "/runtime.bc"));
-                let path: &Path = "_pika_runtime.bc".as_ref();
-                // TODO what if we update the runtime and it's outdated?
-                if !path.exists() {
-                    let mut runtime_bc = File::create(path).unwrap();
-                    runtime_bc.write_all(runtime).unwrap();
-                }
-            }
 
-            #[cfg(feature = "llvm-13")]
-            let llc = concat!(env!("LLVM_DIR"), "/bin/llc");
-            #[cfg(not(feature = "llvm-13"))]
-            let llc = "llc";
-
-            let objfile = {
-                let mut objfile = out_file.to_path_buf();
-                let mut name = objfile.file_name().unwrap().to_os_string();
-                name.push(".o");
-                objfile.set_file_name(name);
-                objfile
-            };
             let module_file = {
                 let mut objfile = out_file.to_path_buf();
                 let mut name = objfile.file_name().unwrap().to_os_string();
@@ -217,38 +193,49 @@ impl crate::ir::Module {
                 }
             }
 
-            let mut llc = Command::new(llc)
-                .arg(module_file)
-                .args(&["-O3", "-filetype=obj", "--relocation-model=pic", "-o"])
-                .arg(&objfile)
-                .spawn()
-                .map_err(|e| format!("Failed to launch llc: {}", e))?;
+            #[cfg(feature = "llvm-13")]
+            let clang = concat!(env!("LLVM_DIR"), "/bin/clang");
+            #[cfg(not(feature = "llvm-13"))]
+            let clang = "clang";
 
-            let code = llc
+            // No need to link if it doesn't have a main function
+            let mut clang = if do_run {
+                let runtime = include_bytes!(concat!(env!("OUT_DIR"), "/runtime.bc"));
+
+                let mut clang = Command::new(clang)
+                    .stdin(Stdio::piped())
+                    .args(&["-O3", "-flto=thin", "-g", "-z", "notext"])
+                    .args(&["-x", "ir", "-", "-o"])
+                    .args(&[out_file, &module_file])
+                    .spawn()
+                    .map_err(|e| format!("Failed to launch clang: {}", e))?;
+                clang.stdin.take().unwrap().write_all(runtime).unwrap();
+
+                clang
+            } else {
+                let objfile = {
+                    let mut objfile = out_file.to_path_buf();
+                    let mut name = objfile.file_name().unwrap().to_os_string();
+                    name.push(".o");
+                    objfile.set_file_name(name);
+                    objfile
+                };
+
+                Command::new(clang)
+                    .stdin(Stdio::piped())
+                    .args(&["-O3", "-flto=thin", "-g", "-z", "notext"])
+                    .args(&["-x", "ir", "-c", "-o"])
+                    .args(&[&objfile, &module_file])
+                    .spawn()
+                    .map_err(|e| format!("Failed to launch clang: {}", e))?
+            };
+            let code = clang
                 .wait()
-                .map_err(|e| format!("Failed to wait on llc process: {}", e))?
+                .map_err(|e| format!("Failed to wait on clang process: {}", e))?
                 .code()
                 .unwrap_or(0);
             if code != 0 {
-                return Err(format!("Call to llc exited with error code {}", code));
-            }
-
-            // No need to link if it doesn't have a main function
-            if do_run {
-                let mut clang = Command::new("clang")
-                    .stdin(Stdio::piped())
-                    .args(&["-O3", "-g", "_pika_runtime.bc", "-z", "notext", "-o"])
-                    .args(&[out_file, &objfile])
-                    .spawn()
-                    .map_err(|e| format!("Failed to launch clang: {}", e))?;
-                let code = clang
-                    .wait()
-                    .map_err(|e| format!("Failed to wait on clang process: {}", e))?
-                    .code()
-                    .unwrap_or(0);
-                if code != 0 {
-                    return Err(format!("Call to clang exited with error code {}", code));
-                }
+                return Err(format!("Call to clang exited with error code {}", code));
             }
         }
 

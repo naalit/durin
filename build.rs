@@ -13,6 +13,12 @@ fn main() {
         }
     }
 
+    #[cfg(not(feature = "llvm-13"))]
+    if option_env!("LLVM_SYS_120_PREFIX").is_some() && option_env!("LLVM_DIR").is_some() {
+        panic!("You forgot to unset LLVM_SYS_120_PREFIX after disabling the llvm-13 feature. This will cause a linking error!
+                If you want to use a custom LLVM prefix without LLVM 13, unset the LLVM_DIR environment variable.");
+    }
+
     println!("cargo:rerun-if-changed=src/runtime");
     println!("cargo:rerun-if-changed=src/llvm");
     let out_dir = env::var("OUT_DIR").unwrap();
