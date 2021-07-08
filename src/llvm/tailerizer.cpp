@@ -16,6 +16,24 @@ PreservedAnalyses Tailerizer::run(Function &F, FunctionAnalysisManager &) {
 
     for (BasicBlock &BB : F) {
         Instruction *Term = BB.getTerminator();
+
+        // Sometimes LLVM creates a common return branch which just returns void.
+        // That doesn't let us use `musttail`, so we replace it with a direct return.
+        if (auto *Branch = dyn_cast<BranchInst>(Term)) {
+            if (Branch->isUnconditional()) {
+                auto *NextBB = Branch->getSuccessor(0);
+                if (auto *Ret = dyn_cast<ReturnInst>(&NextBB->front())) {
+                    if (!Ret->getReturnValue()) {
+                        ReturnInst *Ret2 = ReturnInst::Create(Ret->getContext(), nullptr, Branch);
+                        Branch->eraseFromParent();
+                        if (NextBB->hasNPredecessors(0))
+                            NextBB->eraseFromParent();
+                        Term = Ret2;
+                    }
+                }
+            }
+        }
+
         // Ignore blocks that don't return
         if (!isa<ReturnInst>(Term))
             continue;
@@ -23,7 +41,7 @@ PreservedAnalyses Tailerizer::run(Function &F, FunctionAnalysisManager &) {
         const GCStatepointInst *STI = nullptr;
         for (auto it = BB.rbegin(); it != BB.rend(); ++it) {
             Instruction &I = *it;
-            if (isa<ReturnInst>(I)) {
+            if (isa<ReturnInst>(I) || isa<BranchInst>(I)) {
                 // ignore the return
             } else if (auto *Proj = dyn_cast<GCProjectionInst>(&I)) {
                 if (STI == nullptr) {

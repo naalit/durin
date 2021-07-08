@@ -53,7 +53,7 @@ static bool next_line() {
                 local_alloc.ptr = next_ptr;
             }
             // Zero-initialize the line to make sure the GC never sees old data if it runs before stores to the region
-            memset(next_ptr, 0, LINE_SIZE);
+            memset(next_ptr-LINE_SIZE, 0, LINE_SIZE);
         } else if (found) {
             local_alloc.end = next_ptr;
             return true;

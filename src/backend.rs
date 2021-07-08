@@ -205,7 +205,7 @@ impl crate::ir::Module {
                 let mut clang = Command::new(clang)
                     .stdin(Stdio::piped())
                     .args(&["-O3", "-flto=thin", "-g", "-z", "notext"])
-                    .args(&["-x", "ir", "-", "-o"])
+                    .args(&["-Wno-override-module", "-x", "ir", "-", "-o"])
                     .args(&[out_file, &module_file])
                     .spawn()
                     .map_err(|e| format!("Failed to launch clang: {}", e))?;
@@ -224,7 +224,7 @@ impl crate::ir::Module {
                 Command::new(clang)
                     .stdin(Stdio::piped())
                     .args(&["-O3", "-flto=thin", "-g", "-z", "notext"])
-                    .args(&["-x", "ir", "-c", "-o"])
+                    .args(&["-Wno-override-module", "-x", "ir", "-c", "-o"])
                     .args(&[&objfile, &module_file])
                     .spawn()
                     .map_err(|e| format!("Failed to launch clang: {}", e))?
@@ -1690,7 +1690,7 @@ impl<'cxt> Cxt<'cxt> {
         if from == to {
             x
         } else {
-            eprintln!("durin/info: Casting from {:?} to {:?}", from, to);
+            // eprintln!("durin/info: Casting from {:?} to {:?}", from, to);
             let x = self.to_any(from, x, data);
             self.from_any(to, x, data)
         }

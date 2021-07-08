@@ -456,7 +456,7 @@ static void run_full_gc(uint64_t* rsp, bool major) {
     // printf("%s GC finished, %lu full lines, %lu open lines\n", major ? "Major" : "Minor", full_lines, open_lines);
 
     if (open_lines == 0)
-        panic("Out of space!\n");
+        panic("Error: Ran out of heap space!\nUsed maximum heap size %d KB\n", num_blocks * BLOCK_SIZE / 1024);
 
     #ifdef EVACUATE
     if (can_evacuate || (open_blocks > 0 && (open_blocks > 1 || partial_blocks > 0)))
