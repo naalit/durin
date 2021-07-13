@@ -143,7 +143,7 @@ static void trace_gray_stack() {
 }
 #endif
 
-static void mark(uint64_t** ptr, uint64_t** derived) {
+static void mark(uint64_t** ptr) {
     // If the last bit is set, it means it's not actually a pointer
     // All real pointers are aligned to at least 2 bytes
     if ((uint64_t)*ptr & 0b1) {
@@ -159,13 +159,7 @@ static void mark(uint64_t** ptr, uint64_t** derived) {
     #ifdef EVACUATE
     if (header & RELOC_MASK) {
         // printf("Relocated %lx to %lx\n", *ptr, header & ~RELOC_MASK);
-        if (derived && derived != ptr) {
-            uint64_t offset = (uint64_t)(*derived) - (uint64_t)(*ptr);
-            *ptr = (uint64_t*) (header & ~RELOC_MASK);
-            *(uint64_t*)derived = (uint64_t)*ptr + offset;
-        } else {
-            *ptr = (uint64_t*) (header & ~RELOC_MASK);
-        }
+        *ptr = (uint64_t*) (header & ~RELOC_MASK);
         // If it's been reallocated, we know it's already been marked
         return;
     }
@@ -185,10 +179,6 @@ static void mark(uint64_t** ptr, uint64_t** derived) {
         uint64_t* before = *ptr;
         // Add the header word to the size
         if (block_idx != evac_block_idx && evacuate(ptr, size + 8)) {
-            if (derived && derived != ptr) {
-                uint64_t offset = (uint64_t)(*derived) - (uint64_t)before;
-                *(uint64_t*)derived = (uint64_t)*ptr + offset;
-            }
             block = all_blocks[0].start + ((void*)*ptr - all_blocks[0].start) / BLOCK_SIZE * BLOCK_SIZE;
             block_idx = (block - all_blocks[0].start) / BLOCK_SIZE;
         }
@@ -225,7 +215,7 @@ static void mark(uint64_t** ptr, uint64_t** derived) {
 
         // Mark the type info
         uint64_t* rtti2 = (uint64_t*)rtti;
-        mark(&rtti2, NULL);
+        mark(&rtti2);
         if ((void*)rtti != (void*)rtti2) {
             // The type info got moved, so update the header
             color = *iptr & COLOR_MASK;
@@ -269,7 +259,7 @@ static void rtti_go(uint32_t** rtti, uint64_t** object) {
             
             for (int word = 0; word < size; word++, *object += 1) {
                 if (bitset & (1 << word)) {
-                    mark((uint64_t**)*object, NULL);
+                    mark((uint64_t**)*object);
                 }
             }
             break;
@@ -329,7 +319,7 @@ static void rtti_go(uint32_t** rtti, uint64_t** object) {
 
             for (int word = 0; word < size; word++, *object += 1) {
                 if (pointer) {
-                    mark((uint64_t**)*object, NULL);
+                    mark((uint64_t**)*object);
                 }
             }
             break;
@@ -368,11 +358,21 @@ static void mark_stack(uint64_t* rsp) {
         }
         // printf("Walking stack frame\n");
 
-        if (entry->num_locations) {
-            Location* end = entry->locations + entry->num_locations;
-            for (Location* loc = entry->locations; loc < end; loc++) {
-                for (uint32_t p = 0; p < loc->num_pointers; p++)
-                    mark((uint64_t**)rsp + loc->base_offset/8 + p, (uint64_t**)rsp + loc->derived_offset/8 + p);
+        if (entry->locations) {
+            uint32_t* end = entry->locations + entry->locations_len;
+            for (uint32_t* loc = entry->locations; loc < end; ) {
+                uint32_t base_offset = loc[0];
+                uint64_t** base_ptr_ptr = (uint64_t**) rsp + base_offset/8;
+                uint64_t base_before = *(uint64_t*)base_ptr_ptr;
+                mark(base_ptr_ptr);
+                uint64_t offset = *(uint64_t*)base_ptr_ptr - base_before;
+
+                uint32_t num_derived = loc[1];
+                for (int d = 0; d < num_derived; d++) {
+                    uint32_t derived_offset = loc[2+d];
+                    *(uint64_t*)(rsp + derived_offset/8) += offset;
+                }
+                loc += 2 + num_derived;
             }
         }
 
@@ -414,7 +414,7 @@ static void run_full_gc(uint64_t* rsp, bool major) {
     mark_stack(rsp);
     for (uint32_t i = 0; i < extra_roots.len; i++) {
         uint64_t* root = extra_roots.roots[i];
-        mark(&root, NULL);
+        mark(&root);
         extra_roots.roots[i] = root;
     }
 

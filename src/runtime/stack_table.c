@@ -18,17 +18,15 @@ typedef struct StackBucket {
     uint32_t num_functions;
 } StackBucket;
 
-typedef struct Location {
-    uint32_t base_offset;
-    uint32_t derived_offset;
-    uint32_t num_pointers;
-} Location;
-
 typedef struct StackEntry {
     uint64_t ret_address;
     uint64_t stack_size;
-    Location* locations;
-    uint32_t num_locations;
+    // Structured like this:
+    // uint32_t base_pointer;
+    // uint32_t num_derived;
+    // uint32_t[num_derived] derived_pointers;
+    uint32_t* locations;
+    uint32_t locations_len;
     uint32_t next;
 } StackEntry;
 
@@ -66,6 +64,23 @@ static void stack_table_insert(uint64_t ret_address, uint32_t entry) {
     bucket->first = entry;
 }
 
+static void vec_push(uint32_t *vec, uint32_t *len, uint32_t *max, uint32_t x) {
+    if (*len == *max) {
+        *max *= 2;
+        vec = realloc(vec, *max * sizeof(uint32_t));
+    }
+    vec[(*len)++] = x;
+}
+
+static void vec_insert(uint32_t *vec, uint32_t *len, uint32_t *max, uint32_t idx, uint32_t x) {
+    if (*len == *max) {
+        *max *= 2;
+        vec = realloc(vec, *max * sizeof(uint32_t));
+    }
+    memmove(vec + idx + 1, vec + idx, *len - idx);
+    *len += 1;
+    vec[idx] = x;
+}
 
 // This function just follows the stack map format documented at https://llvm.org/docs/StackMaps.html#stackmap-format
 // and https://www.llvm.org/docs/Statepoints.html#statepoint-stackmap-format.
@@ -130,8 +145,10 @@ static void gen_stack_table() {
 
             entry->stack_size = f->stack_size; 
             entry->ret_address = f->address+(uint64_t)offset;
-            entry->num_locations = num_locations;
-            Location* locations = num_locations > 0 ? (Location*)malloc(sizeof(Location)*num_locations) : NULL;
+            // Guess the size; we'll grow it if we have to
+            uint32_t loc_len = num_locations * 4;
+            uint32_t cur_offset = 0;
+            uint32_t* locations = num_locations > 0 ? (uint32_t*)malloc(sizeof(uint32_t)*loc_len) : NULL;
             entry->locations = locations;
 
             // Add to hash table
@@ -171,8 +188,10 @@ static void gen_stack_table() {
             // The actual locations can technically describe values in registers and more complex situations, but with statepoints they will always be on the stack.
             // That's represented as an indirect location [reg + offset], type `0x3`, with register `rsp` which is number 7, and size 8 since it's one pointer.
             // LLVM can also put a group of pointers in one location with a size greater than 8, in which case there's a group of base pointers then a group of derived pointers.
-            for (int l = 0; l < num_locations; l++) {
+            for (int _l = 0; _l < num_locations; _l++) {
                 // Base pointer
+                uint32_t base_pointer;
+                uint32_t num_pointers;
                 {
                     uint8_t type = GET(uint8_t);
                     // Reserved
@@ -186,10 +205,11 @@ static void gen_stack_table() {
 
                     assert(type == 0x3);
                     assert(regnum == 7);
-                    locations[l].base_offset = offset;
-                    locations[l].num_pointers = (uint32_t)size / 8;
+                    base_pointer = offset;
+                    num_pointers = (uint32_t)size / 8;
                 }
                 // Derived pointer
+                uint32_t derived_pointer;
                 {
                     uint8_t type = GET(uint8_t);
                     // Reserved
@@ -202,9 +222,41 @@ static void gen_stack_table() {
                     int32_t offset = GET(int32_t);
 
                     assert(type == 0x3);
-                    assert((uint32_t)size == locations[l].num_pointers * 8);
+                    assert((uint32_t)size == num_pointers * 8);
                     assert(regnum == 7);
-                    locations[l].derived_offset = offset;
+                    derived_pointer = offset;
+                }
+                // Now add to the list
+                for (int p = 0; p < num_pointers; p++) {
+                    // First try to find an identical base pointer
+                    uint32_t base_offset = base_pointer + p * 8;
+                    uint32_t derived_offset = derived_pointer + p * 8;
+                    bool found = false;
+                    for (int i = 0; i < cur_offset; ) {
+                        uint32_t base_i = locations[i];
+                        if (base_offset == base_i) {
+                            if (base_offset != derived_offset) {
+                                uint32_t old_nderived = locations[i + 1];
+                                locations[i + 1] += 1;
+                                // Insert after the base pointer (i), nderived (i+1), and all the old derived pointers
+                                vec_insert(locations, &cur_offset, &loc_len, i + 2 + old_nderived, derived_offset);
+                            }
+                            found = true;
+                            break;
+                        }
+                        i += 2 + locations[i + 1];
+                    }
+                    if (found)
+                        continue;
+
+                    // Add a new base pointer location
+                    vec_push(locations, &cur_offset, &loc_len, base_pointer);
+                    if (base_offset == derived_offset) {
+                        vec_push(locations, &cur_offset, &loc_len, 0);
+                    } else {
+                        vec_push(locations, &cur_offset, &loc_len, 1);
+                        vec_push(locations, &cur_offset, &loc_len, derived_offset);
+                    }
                 }
             }
 
@@ -221,6 +273,8 @@ static void gen_stack_table() {
             // Padding to align to 8 bytes
             // This is always required because it was aligned to 8 bytes 4 bytes ago
             GET(uint32_t);
+
+            entry->locations_len = cur_offset;
 
             // Next table entry
             entry_num++;
