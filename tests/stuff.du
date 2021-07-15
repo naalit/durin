@@ -1,21 +1,21 @@
-fun curry1 (a : I1, cont1 : fun 1) = cont1 curry2;
-fun curry2 (b : I1, cont2 : fun 1) = cont2 and_or;
+fun curry1 (a : I1, cont1 : fun 1) = call cont1 (curry2)
+fun curry2 (b : I1, cont2 : fun 1) = call cont2 (and_or)
 
-fun and_or (c : I1, rcont : fun 1) = if a then else;
-fun then () = next b;
-fun else () = next 0i1;
+fun and_or (c : I1, rcont : fun 1) = if a then else
+fun then () = call next (b)
+fun else () = call next (0i1)
 
-fun next (a_and_b : I1) = if a_and_b then2 else2;
-fun then2 () = next2 1i1;
-fun else2 () = next2 c;
+fun next (a_and_b : I1) = if a_and_b then2 else2
+fun then2 () = call next2 (1i1)
+fun else2 () = call next2 (c)
 
-fun next2 (r : I1) = rcont r;
+fun next2 (r : I1) = call rcont (r)
 
-fun curry (cont: fun 1) = cont curry_c;
-fun curry_c (z: fun 0) = z;
-fun do_something (cont: fun 0) = cont;
+fun curry (cont: fun 1) = call cont (curry_c)
+fun curry_c (z: fun 0) = call z ()
+fun do_something (cont: fun 0) = call cont ()
 
 # let f = curry(); do_something(); f();
-fun one (ocont: fun 0) = curry two;
-fun two (f: fun 1) = do_something three;
-fun three () = f ocont;
+fun one (ocont: fun 0) = call curry (two)
+fun two (f: fun 1) = call do_something (three)
+fun three () = call f (ocont)

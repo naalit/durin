@@ -1,3 +1,3 @@
 # Making sure sigma types (dependent product types) work
-val ty = sig { y: Type, _: y };
-fun f (x : ty, g : fun 2) = g (x.0 of ty) (x.1 of ty);
+val ty = sig { Type y, y }
+fun f (x : ty, g : fun 2) = call g (x.0 of ty, x.1 of ty)

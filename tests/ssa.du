@@ -1,2 +1,2 @@
-fun one (f: fun 1, r: fun 1) = f two;
-fun two (i: I32) = r i;
+fun one (f: fun 1, r: fun 1) = call f (two)
+fun two (i: I32) = call r (i)

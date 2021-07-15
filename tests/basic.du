@@ -1,5 +1,5 @@
 
-fun f (x : I32, r : fun 1) = g a;
+fun f (x : I32, r : fun 1) = call g (a)
 
-fun g (y : I32) = r y;
-val a = (x + 2i32);
+fun g (y : I32) = call r (y)
+val a = (x + 2i32)

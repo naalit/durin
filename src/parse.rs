@@ -125,19 +125,21 @@ impl<'a> Parser<'a> {
         let name = self.name();
         match self.names.get(name) {
             Some(&(x, _)) => x,
-            None => {
-                // We implicitly forward-declare variables we can't find (like C), then add their definitions later
-                // If we get to the end of the file and a variable hasn't been defined, we give an error
-                let v = self.module.reserve(Some(name.to_owned()));
-                self.names.insert(name, (v, pos));
-                v
-            }
+            // We implicitly forward-declare variables we can't find (like C), then add their definitions later
+            // If we get to the end of the file and a variable hasn't been defined, we give an error
+            None => self.declare_name(name, pos),
         }
     }
 
+    fn declare_name(&mut self, name: &'a str, pos: usize) -> Val {
+        let v = self.module.reserve(Some(name.to_owned()));
+        self.names.insert(name, (v, pos));
+        v
+    }
+
     /// Basically the same operators as Pika are (will be) supported
-    fn binop(&mut self) -> BinOp {
-        match self.peek().unwrap() {
+    fn binop(&mut self) -> Option<BinOp> {
+        Some(match self.peek()? {
             '=' if self.matches("==") => BinOp::Eq,
             '!' if self.matches("!=") => BinOp::NEq,
             '*' if self.matches("**") => self.error("Exponentiation not supported yet"),
@@ -177,14 +179,12 @@ impl<'a> Parser<'a> {
                     BinOp::Gt
                 }
             }
-            _ => self.error("Expected operator"),
-        }
+            _ => return None,
+        })
     }
 
-    fn expr(&mut self) -> Val {
-        if self.matches("struct") {
-            self.skip_whitespace();
-            self.expect("{");
+    fn atom(&mut self, ty: Option<Val>) -> Val {
+        if self.matches("{") {
             self.skip_whitespace();
 
             let mut v: SmallVec<[Val; 3]> = SmallVec::new();
@@ -200,10 +200,17 @@ impl<'a> Parser<'a> {
             }
 
             self.skip_whitespace();
-            self.expect("::");
-            self.skip_whitespace();
+            let ty = if self.matches("of") {
+                self.skip_whitespace();
 
-            let ty = self.expr();
+                self.atom(None)
+            } else {
+                if let Some(ty) = ty {
+                    ty
+                } else {
+                    self.error("type annotation required here")
+                }
+            };
 
             self.module.add(Node::Product(ty, v), None)
         } else if self.matches("sig") {
@@ -214,13 +221,20 @@ impl<'a> Parser<'a> {
             let mut tys = SmallVec::new();
             let mut names = Vec::new();
             while !self.matches("}") {
-                let name = self.var();
-                self.skip_whitespace();
-                self.expect(":");
-                self.skip_whitespace();
-                names.push(name);
                 tys.push(self.expr());
                 self.skip_whitespace();
+
+                let name = match self.peek().unwrap_or_else(|| self.error("expected '}'")) {
+                    ',' | '}' => self.declare_name("_", self.pos),
+                    _ => {
+                        let pos = self.pos;
+                        let name = self.name();
+                        self.declare_name(name, pos)
+                    }
+                };
+                self.skip_whitespace();
+                names.push(name);
+
                 if self.matches("}") {
                     break;
                 } else {
@@ -235,74 +249,9 @@ impl<'a> Parser<'a> {
             t
         } else if self.matches("(") {
             // A binop
-            let lhs = self.expr();
-            self.skip_whitespace();
-            if self.matches(",") {
-                // Product type
-                let mut v = smallvec![lhs];
-                loop {
-                    self.skip_whitespace();
-                    let next = self.expr();
-                    v.push(next);
-                    self.skip_whitespace();
-                    if self.matches(")") {
-                        break;
-                    } else {
-                        self.expect(",");
-                    }
-                }
-                self.module.add(Node::ProdType(v), None)
-            } else if self.matches("|") {
-                // Sum type
-                let mut v = smallvec![lhs];
-                loop {
-                    self.skip_whitespace();
-                    let next = self.expr();
-                    v.push(next);
-                    self.skip_whitespace();
-                    if self.matches(")") {
-                        break;
-                    } else {
-                        self.expect("|");
-                    }
-                }
-                self.module.add(Node::SumType(v), None)
-            } else if self.matches(".") {
-                // Projection of a product type member
-                self.skip_whitespace();
-                let mut i = String::new();
-                while self.peek().expect("unexpected EOF").is_digit(10) {
-                    i.push(self.next().unwrap());
-                }
-                let i: usize = i.parse().expect("invalid number for ifcase tag");
-                self.skip_whitespace();
-                self.expect("of");
-                self.skip_whitespace();
-                let ty = self.expr();
-                self.skip_whitespace();
-                self.expect(")");
-                self.module.add(Node::Proj(ty, lhs, i), None)
-            } else if self.matches(":") {
-                // Injection into a sum type
-                self.skip_whitespace();
-                let mut i = String::new();
-                while self.peek().expect("unexpected EOF").is_digit(10) {
-                    i.push(self.next().unwrap());
-                }
-                let i: usize = i.parse().expect("invalid number for ifcase tag");
-                self.skip_whitespace();
-                let val = self.expr();
-                self.skip_whitespace();
-                self.expect(")");
-                self.module.add(Node::Inj(lhs, i, val), None)
-            } else {
-                let op = self.binop();
-                self.skip_whitespace();
-                let rhs = self.expr();
-                self.skip_whitespace();
-                self.expect(")");
-                self.module.add(Node::BinOp(op, true, lhs, rhs), None)
-            }
+            let expr = self.expr();
+            self.expect(")");
+            expr
         } else if self.matches("fun") {
             self.skip_whitespace();
 
@@ -337,32 +286,119 @@ impl<'a> Parser<'a> {
             self.module.add(Node::RefTy(ty), None)
         } else if self
             .peek()
-            .expect("unexpected EOF, maybe missing ;")
+            .expect("unexpected EOF, maybe missing close parenthesis")
             .is_digit(10)
             || self.peek().unwrap() == '-'
         {
             let mut s = String::new();
-            while self.peek().unwrap() != 'i' {
-                if self.peek().unwrap().is_digit(10) || self.peek().unwrap() == '-' {
-                    s.push(self.next().unwrap());
-                } else {
-                    self.error("Expected int width suffix: one of i1, i8, i16, i32, i64");
-                }
+            while self.peek().unwrap().is_digit(10) || self.peek().unwrap() == '-' {
+                s.push(self.next().unwrap());
             }
-            self.next();
-            let w = match () {
-                _ if self.matches("64") => Width::W64,
-                _ if self.matches("32") => Width::W32,
-                _ if self.matches("16") => Width::W16,
-                _ if self.matches("8") => Width::W8,
-                _ if self.matches("1") => Width::W1,
-                _ => self.error("Expected int width suffix: one of i1, i8, i16, i32, i64"),
+            // } else {
+            //     self.error("Expected int width suffix: one of i1, i8, i16, i32, i64");
+            // }
+            let w = if self.matches("i") {
+                match () {
+                    _ if self.matches("64") => Width::W64,
+                    _ if self.matches("32") => Width::W32,
+                    _ if self.matches("16") => Width::W16,
+                    _ if self.matches("8") => Width::W8,
+                    _ if self.matches("1") => Width::W1,
+                    _ => self.error("Expected int width suffix: one of i1, i8, i16, i32, i64"),
+                }
+            } else {
+                ty.and_then(|x| {
+                    self.module
+                        .slots()
+                        .node(x)
+                        .and_then(|x| {
+                            if let Node::Const(Constant::IntType(w)) = x {
+                                Some(w)
+                            } else {
+                                None
+                            }
+                        })
+                        .copied()
+                })
+                .unwrap_or_else(|| {
+                    self.error("expected int width suffix: one of i1, i8, i16, i32, i64")
+                })
             };
             use std::str::FromStr;
             let i = i64::from_str(&s).unwrap_or_else(|e| self.error(format!("{}", e)));
             self.module.add(Node::Const(Constant::Int(w, i)), None)
         } else {
             self.var()
+        }
+    }
+
+    fn expr(&mut self) -> Val {
+        // A binop
+        let lhs = self.atom(None);
+        self.skip_whitespace();
+        if self.matches("|") {
+            // Sum type
+            let mut v = smallvec![lhs];
+            loop {
+                self.skip_whitespace();
+                let next = self.atom(None);
+                v.push(next);
+                self.skip_whitespace();
+                if self.matches("|") {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            self.module.add(Node::SumType(v), None)
+        } else if self.matches(".") {
+            // Projection of a product type member
+            self.skip_whitespace();
+            let mut i = String::new();
+            while self.peek().expect("unexpected EOF").is_digit(10) {
+                i.push(self.next().unwrap());
+            }
+            let i: usize = i.parse().expect("invalid number for ifcase tag");
+            self.skip_whitespace();
+            self.expect("of");
+            self.skip_whitespace();
+            let ty = self.atom(None);
+            self.skip_whitespace();
+            self.module.add(Node::Proj(ty, lhs, i), None)
+        } else if self.matches(":") {
+            // Injection into a sum type
+            self.skip_whitespace();
+            let mut i = String::new();
+            while self.peek().expect("unexpected EOF").is_digit(10) {
+                i.push(self.next().unwrap());
+            }
+            let i: usize = i
+                .parse()
+                .unwrap_or_else(|_| self.error("invalid number for ifcase tag"));
+            self.skip_whitespace();
+            let val_ty = self
+                .module
+                .slots()
+                .node(lhs)
+                .and_then(|x| {
+                    if let Node::SumType(v) = x {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                })
+                .and_then(|x| x.get(i))
+                .copied();
+            let val = self.atom(val_ty);
+            self.skip_whitespace();
+            self.module.add(Node::Inj(lhs, i, val), None)
+        } else if let Some(op) = self.binop() {
+            self.skip_whitespace();
+            let rhs = self.atom(None);
+            self.skip_whitespace();
+            self.module.add(Node::BinOp(op, true, lhs, rhs), None)
+        } else {
+            lhs
         }
     }
 
@@ -394,7 +430,6 @@ impl<'a> Parser<'a> {
                 let val2 = self.expr();
                 self.module.redirect(val, val2);
                 self.skip_whitespace();
-                self.expect(";");
                 continue;
             } else if self.matches("extern") {
                 // Parse an extern function declaration
@@ -447,7 +482,6 @@ impl<'a> Parser<'a> {
                 self.skip_whitespace();
                 let ret_ty = self.expr();
                 self.skip_whitespace();
-                self.expect(";");
 
                 self.module
                     .replace(val, Node::ExternFun(name.into(), params, ret_ty));
@@ -521,8 +555,6 @@ impl<'a> Parser<'a> {
                 let felse = self.expr();
                 self.skip_whitespace();
 
-                self.expect(";");
-
                 let callee = self.module.add(Node::IfCase(i, x), None);
                 self.module.replace(
                     val,
@@ -545,8 +577,6 @@ impl<'a> Parser<'a> {
                 let felse = self.expr();
                 self.skip_whitespace();
 
-                self.expect(";");
-
                 let callee = self.module.add(Node::If(x), None);
                 self.module.replace(
                     val,
@@ -558,7 +588,6 @@ impl<'a> Parser<'a> {
                 );
             } else if self.matches("unreachable") {
                 self.skip_whitespace();
-                self.expect(";");
                 let callee = self.module.add(Node::Const(Constant::Unreachable), None);
                 self.module.replace(
                     val,
@@ -570,7 +599,6 @@ impl<'a> Parser<'a> {
                 );
             } else if self.matches("stop") {
                 self.skip_whitespace();
-                self.expect(";");
                 let callee = self.module.add(Node::Const(Constant::Stop), None);
                 self.module.replace(
                     val,
@@ -588,8 +616,6 @@ impl<'a> Parser<'a> {
 
                 let cont = self.expr();
                 self.skip_whitespace();
-
-                self.expect(";");
 
                 let callee = self.module.add(Node::Ref(ty, RefOp::RefNew), None);
                 self.module.replace(
@@ -615,8 +641,6 @@ impl<'a> Parser<'a> {
                 let cont = self.expr();
                 self.skip_whitespace();
 
-                self.expect(";");
-
                 let callee = self.module.add(Node::Ref(ty, RefOp::RefSet(ptr, v)), None);
                 self.module.replace(
                     val,
@@ -638,8 +662,6 @@ impl<'a> Parser<'a> {
                 let cont = self.expr();
                 self.skip_whitespace();
 
-                self.expect(";");
-
                 let callee = self.module.add(Node::Ref(ty, RefOp::RefGet(ptr)), None);
                 self.module.replace(
                     val,
@@ -652,18 +674,25 @@ impl<'a> Parser<'a> {
             } else if self.matches("externcall") {
                 self.skip_whitespace();
 
-                let x = self.expr();
-                self.skip_whitespace();
-                self.expect("->");
+                let ret_ty = self.atom(None);
                 self.skip_whitespace();
 
-                let ret_ty = self.expr();
+                let x = self.atom(None);
                 self.skip_whitespace();
 
                 let mut call_args = SmallVec::new();
-                while !self.matches(";") {
-                    call_args.push(self.expr());
-                    self.skip_whitespace();
+                self.expect("(");
+                if !self.matches(")") {
+                    loop {
+                        call_args.push(self.expr());
+                        self.skip_whitespace();
+                        if !self.matches(")") {
+                            self.expect(",");
+                            self.skip_whitespace();
+                        } else {
+                            break;
+                        }
+                    }
                 }
 
                 let callee = self.module.add(Node::ExternCall(x, ret_ty), None);
@@ -675,14 +704,25 @@ impl<'a> Parser<'a> {
                         call_args,
                     }),
                 )
-            } else {
-                let callee = self.var();
+            } else if self.matches("call") {
+                self.skip_whitespace();
+
+                let callee = self.expr();
                 self.skip_whitespace();
 
                 let mut call_args = SmallVec::new();
-                while !self.matches(";") {
-                    call_args.push(self.expr());
-                    self.skip_whitespace();
+                self.expect("(");
+                if !self.matches(")") {
+                    loop {
+                        call_args.push(self.expr());
+                        self.skip_whitespace();
+                        if !self.matches(")") {
+                            self.expect(",");
+                            self.skip_whitespace();
+                        } else {
+                            break;
+                        }
+                    }
                 }
 
                 self.module.replace(
@@ -693,6 +733,8 @@ impl<'a> Parser<'a> {
                         call_args,
                     }),
                 )
+            } else {
+                self.error("expected instruction (e.g. 'call' or 'stop')");
             }
         }
 

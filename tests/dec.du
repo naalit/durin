@@ -1,8 +1,8 @@
-extern fun print_i32 (x : I32) : sig { };
+extern fun print_i32 (x : I32) : sig { }
 
-fun main (main_cont : fun 1) = loop 1i32 10i32;
+fun main (main_cont : fun 1) = call loop (1i32, 10i32)
 
-fun loop (from : I32, to : I32) = if (from <= to) then else;
-fun then () = externcall print_i32 -> sig {} from loop_next;
-fun else () = main_cont 0i32;
-fun loop_next (_: sig { }) = loop (from + 1i32) to;
+fun loop (from : I32, to : I32) = if (from <= to) then else
+fun then () = externcall sig {} print_i32 (from, loop_next)
+fun else () = call main_cont (0i32)
+fun loop_next (_: sig { }) = call loop (from + 1i32, to)

@@ -76,14 +76,18 @@ impl crate::ir::Module {
             f.as_global_value().set_name("pk$main");
             let ty = f.get_type().print_to_string();
             // Durin might or might not have succeeded in turning `main` into direct style
-            let run = match ty.to_str().unwrap() {
+            let (run, cps) = match ty.to_str().unwrap() {
                 // () -> _ in CPS
-                "void ({}, i8 addrspace(1)*)" => true,
+                "void ({}, i8 addrspace(1)*)" => (true, true),
                 // () -> () in direct style
-                "{} ({})" => true,
+                "{} ({})"
+                // some variations of that
+                | "void ()"
+                | "{} ()"
+                | "void ({})" => (true, false),
                 t => {
                     eprintln!("Warning: main function has type {}, not wrapping it", t);
-                    false
+                    (false, false)
                 }
             };
             if run {
@@ -102,7 +106,7 @@ impl crate::ir::Module {
                         "_void",
                     );
 
-                    if f.get_type().get_return_type().is_none() {
+                    if cps {
                         // CPS
                         // We need a tailcc stop function to pass as `main`'s continuation, as well as the start function
                         let any_ty = cxt.i8_type().gc_ptr().as_basic_type_enum();
@@ -150,7 +154,13 @@ impl crate::ir::Module {
                             .struct_type(&[], false)
                             .get_undef()
                             .as_basic_value_enum();
-                        let call = b.build_call(f, &[unit], "main_call");
+                        let args = [unit];
+                        let args: &[_] = if f.get_type().count_param_types() == 0 {
+                            &[]
+                        } else {
+                            &args
+                        };
+                        let call = b.build_call(f, args, "main_call");
                         call.set_call_convention(TAILCC);
                         call.set_tail_call(true);
                         b.build_return(Some(&cxt.i32_type().const_zero()));
