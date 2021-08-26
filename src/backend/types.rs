@@ -6,6 +6,9 @@ use std::{collections::VecDeque, convert::TryInto};
 /// The number of bytes we're willing to copy around freely on the stack.
 /// If a struct or enum goes above this, we'll heap- or stack-allocate it instead.
 pub const STACK_THRESHOLD: u32 = 16;
+/// The number of bytes we're willing to allocate inline in a sum or product type.
+/// If a member goes above this, it's stored in its own allocation, unless it's explicitly unboxed.
+pub const UNBOX_THRESHOLD: u32 = 256;
 
 pub fn padding(size: u32, align: u32) -> u32 {
     // (-size) & (align - 1)
@@ -27,6 +30,7 @@ pub fn tag_bytes(len: usize) -> u32 {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type<'cxt> {
     Pointer,
+    Unbox(Box<Type<'cxt>>),
     StackStruct(Vec<(Option<Val>, Type<'cxt>)>),
     PtrStruct(Vec<(Option<Val>, Type<'cxt>)>),
     StackEnum(u32, Vec<Type<'cxt>>),
@@ -40,8 +44,17 @@ pub enum Type<'cxt> {
     Type,
 }
 impl<'cxt> Type<'cxt> {
+    /// Returns true if this type responds to explicit unboxing when storing in the heap
+    pub fn can_unbox_ptr(&self) -> bool {
+        matches!(
+            self,
+            Type::Unknown(_) | Type::Unknown2(_) | Type::PtrStruct(_) | Type::PtrEnum(_)
+        )
+    }
+
     pub fn alignment(&self) -> u32 {
         match self {
+            Type::Unbox(x) => x.alignment(),
             Type::StackStruct(v) | Type::PtrStruct(v) => {
                 if v.is_empty() {
                     0
@@ -74,6 +87,7 @@ impl<'cxt> Type<'cxt> {
 
     pub fn stack_size(&self) -> Option<u32> {
         match self {
+            Type::Unbox(x) => x.stack_size(),
             Type::StackStruct(v) => {
                 let mut size = 0;
                 for (_, i) in v {
@@ -134,6 +148,7 @@ impl<'cxt> Type<'cxt> {
 
     pub fn heap_size(&self, cxt: &Cxt<'cxt>, data: &Data) -> IntValue<'cxt> {
         match self {
+            Type::Unbox(x) => x.heap_size(cxt, data),
             Type::StackStruct(v) | Type::PtrStruct(v) => {
                 let mut size = cxt.size_ty().const_zero();
                 for (_, i) in v {
@@ -212,6 +227,7 @@ impl<'cxt> Type<'cxt> {
     /// Whether this value would contain a pointer if allocated on the stack
     fn has_ptr(&self) -> bool {
         match self {
+            Type::Unbox(x) => x.has_ptr(),
             Type::Pointer => true,
             Type::PtrStruct(_) => true,
             Type::PtrEnum(_) => true,
@@ -234,6 +250,7 @@ impl<'cxt> Type<'cxt> {
     /// Whether this value might contain something of unknown size
     pub fn has_unknown(&self) -> bool {
         match self {
+            Type::Unbox(x) => x.has_unknown(),
             Type::PtrStruct(v) => v.iter().any(|(_, x)| x.has_unknown()),
             Type::PtrEnum(v) => v.iter().any(Type::has_unknown),
             Type::Unknown(_) => true,
@@ -244,6 +261,7 @@ impl<'cxt> Type<'cxt> {
 
     pub fn llvm_ty(&self, cxt: &Cxt<'cxt>) -> BasicTypeEnum<'cxt> {
         match self {
+            Type::Unbox(x) => x.llvm_ty(cxt),
             Type::StackStruct(v) => {
                 let v: Vec<_> = v.iter().map(|(_, x)| x.llvm_ty(cxt)).collect();
                 cxt.cxt.struct_type(&v, false).as_basic_type_enum()
@@ -276,9 +294,10 @@ impl<'cxt> Type<'cxt> {
         }
     }
 
-    fn tyinfo(&self, info: &mut TyInfo<'cxt>, cxt: &Cxt<'cxt>, data: &Data) {
+    /// The same as `tyinfo()`, but the root type is always boxed (it doesn't listen to UNBOX_THRESHOLD).
+    /// This is used with explicit unboxing, but also for the root RTTI of a heap allocation.
+    fn tyinfo_unbox(&self, info: &mut TyInfo<'cxt>, cxt: &Cxt<'cxt>, data: &Data) {
         match self {
-            Type::Pointer => info.word(true),
             Type::StackStruct(tys) | Type::PtrStruct(tys) => {
                 for (_, ty) in tys {
                     ty.tyinfo(info, cxt, data);
@@ -308,6 +327,56 @@ impl<'cxt> Type<'cxt> {
                 info.splice(rtti_ptr)
             }
             Type::Unknown2(_) => panic!("Unknown2 not supported"),
+            _ => self.tyinfo(info, cxt, data),
+        }
+    }
+
+    /// Adds this type's info to `info`, assuming this type is the next member in a struct.
+    /// If this type can be boxed and is larger than UNBOX_THRESHOLD, then it will just add a pointer word.
+    fn tyinfo(&self, info: &mut TyInfo<'cxt>, cxt: &Cxt<'cxt>, data: &Data) {
+        match self {
+            Type::Unbox(x) => x.tyinfo_unbox(info, cxt, data),
+            Type::Pointer => info.word(true),
+            Type::StackStruct(tys) | Type::PtrStruct(tys) => {
+                let heap_size = self.heap_size(cxt, data);
+
+                cxt.or_box(heap_size, info, |info| {
+                    for (_, ty) in tys {
+                        ty.tyinfo(info, cxt, data);
+                    }
+                });
+            }
+            Type::StackEnum(_, tys) | Type::PtrEnum(tys) => {
+                // For enums, the tag size happens to always equal alignment
+                let tag_size = self.alignment();
+                let heap_size = self.heap_size(cxt, data);
+
+                cxt.or_box(heap_size, info, |info| {
+                    info.start_variant(tys.len(), tag_size, heap_size, cxt);
+
+                    for ty in tys {
+                        info.next_variant();
+                        ty.tyinfo(info, cxt, data);
+                    }
+
+                    info.end_variant();
+                });
+            }
+            Type::Unknown(v) => {
+                let heap_size = self.heap_size(cxt, data);
+
+                cxt.or_box(heap_size, info, |info| {
+                    let rtti_ptr = unsafe {
+                        cxt.builder.build_in_bounds_gep(
+                            *v,
+                            &[cxt.size_ty().const_int(2, false)],
+                            "rtti_ptr",
+                        )
+                    };
+                    info.splice(rtti_ptr)
+                })
+            }
+            Type::Unknown2(_) => panic!("Unknown2 not supported"),
             Type::Float(t) => match t {
                 crate::ir::FloatType::F32 => info.extra_bytes(4),
                 crate::ir::FloatType::F64 => info.word(false),
@@ -327,9 +396,61 @@ impl<'cxt> Type<'cxt> {
 
     pub fn as_rtti(&self, cxt: &Cxt<'cxt>, data: &Data) -> PointerValue<'cxt> {
         let mut tyinfo = TyInfo::new();
-        self.tyinfo(&mut tyinfo, cxt, data);
+        self.tyinfo_unbox(&mut tyinfo, cxt, data);
         let ty_size = self.heap_size(cxt, data);
         tyinfo.codegen(ty_size, cxt)
+    }
+}
+
+impl<'cxt> Cxt<'cxt> {
+    /// Runs `unbox(info)`, but if `size` is higher than `UNBOX_THRESHOLD`, it just adds a pointer word.
+    /// If `size` isn't known until runtime, it uses RTTI splicing.
+    fn or_box(
+        &self,
+        size: IntValue<'cxt>,
+        info: &mut TyInfo<'cxt>,
+        unbox: impl FnOnce(&mut TyInfo<'cxt>),
+    ) {
+        // If it's bigger than UNBOX_THRESHOLD, skip it
+        let too_big = self.builder.build_int_compare(
+            IntPredicate::UGT,
+            size,
+            self.size_ty().const_int(UNBOX_THRESHOLD.into(), false),
+            "too_big",
+        );
+        match too_big.get_zero_extended_constant() {
+            Some(0) => unbox(info),
+            Some(1) => info.word(true),
+            _ => {
+                let mut info_unbox = TyInfo::new();
+                unbox(&mut info_unbox);
+
+                let mut info_box = TyInfo::new();
+                info_box.word(true);
+
+                let ptr = self
+                    .if_expr(
+                        too_big,
+                        || {
+                            info_box
+                                .codegen(self.size_ty().const_int(8, false), self)
+                                .as_basic_value_enum()
+                        },
+                        || info_unbox.codegen(size, self).as_basic_value_enum(),
+                    )
+                    .into_pointer_value();
+
+                let rtti_ptr = unsafe {
+                    self.builder.build_in_bounds_gep(
+                        ptr,
+                        &[self.size_ty().const_int(2, false)],
+                        "rtti_ptr",
+                    )
+                };
+
+                info.splice(rtti_ptr);
+            }
+        }
     }
 }
 
@@ -857,6 +978,7 @@ impl<'cxt> Cxt<'cxt> {
 
     pub fn as_type(&self, val: Val, data: &Data) -> Type<'cxt> {
         match data.slots.node(val).unwrap() {
+            Node::Unbox(inner) => Type::Unbox(Box::new(self.as_type(*inner, data))),
             Node::FunType(i) => Type::Closure(*i),
             Node::ExternFunType(args, ret) => {
                 let args = args
@@ -949,7 +1071,7 @@ impl<'cxt> Cxt<'cxt> {
                 Constant::TypeType => Type::Type,
                 Constant::IntType(w) => Type::Int(w.bits()),
                 Constant::FloatType(t) => Type::Float(t),
-                Constant::StringTy => Type::Pointer,
+                Constant::StringTy | Constant::BoxTy => Type::Pointer,
                 Constant::Int(_, _)
                 | Constant::Float(_)
                 | Constant::Stop

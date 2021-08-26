@@ -282,8 +282,14 @@ impl<'a> Parser<'a> {
                 .add(Node::Const(Constant::IntType(Width::W16)), None)
         } else if self.matches("ref") {
             self.skip_whitespace();
-            let ty = self.expr();
+            let ty = self.atom(None);
             self.module.add(Node::RefTy(ty), None)
+        } else if self.matches("box") {
+            self.module.add(Node::Const(Constant::BoxTy), None)
+        } else if self.matches("unbox") {
+            self.skip_whitespace();
+            let ty = self.atom(None);
+            self.module.add(Node::Unbox(ty), None)
         } else if self
             .peek()
             .expect("unexpected EOF, maybe missing close parenthesis")

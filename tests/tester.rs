@@ -51,7 +51,7 @@ fn run_file(file: &str, source: &str) {
     let mut m = durin::parse::Parser::new(source).parse();
     let path = format!("{}/test-{}.out", env!("OUT_DIR"), file);
     let path: &std::path::Path = path.as_ref();
-    m.compile_and_link(path, false).unwrap();
+    m.compile_and_link(path, false, false).unwrap();
     assert!(std::process::Command::new(path).status().unwrap().success());
 }
 

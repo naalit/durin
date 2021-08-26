@@ -1,3 +1,3 @@
-# Making sure sigma types (dependent product types) work
-val ty = sig { Type y, y }
+# Sigma types must be boxed
+val ty = sig { Type, box }
 fun f (x : ty, g : fun 2) = call g (x.0 of ty, x.1 of ty)

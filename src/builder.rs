@@ -530,6 +530,10 @@ impl<'m> Builder<'m> {
         self.module.add(Node::Param(cont, 0), None)
     }
 
+    pub fn unbox(&mut self, inner_ty: Val) -> Val {
+        self.module.add(Node::Unbox(inner_ty), None)
+    }
+
     pub fn ref_type(&mut self, inner_ty: Val) -> Val {
         self.module.add(Node::RefTy(inner_ty), None)
     }

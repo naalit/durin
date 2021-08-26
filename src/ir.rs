@@ -543,6 +543,7 @@ pub enum Node {
     ExternFunType(SmallVec<[Val; 3]>, Val),
     ProdType(SmallVec<[Val; 4]>),
     SumType(SmallVec<[Val; 4]>),
+    Unbox(Val),
     /// IfCase(tag, x); then and else are passed to it as arguments
     IfCase(usize, Val),
     /// ExternCall(fun, ret_ty)
@@ -584,6 +585,7 @@ impl Node {
             | Node::Inj(_, _, x)
             | Node::If(x)
             | Node::RefTy(x)
+            | Node::Unbox(x)
             | Node::ExternCall(x, _) => {
                 smallvec![*x]
             }
@@ -623,7 +625,7 @@ impl Node {
             | Node::Proj(a, b, _)
             | Node::ExternCall(a, b) => smallvec![*a, *b],
             Node::FunType(_) | Node::Const(_) => SmallVec::new(),
-            Node::IfCase(_, x) | Node::If(x) | Node::RefTy(x) => {
+            Node::IfCase(_, x) | Node::If(x) | Node::Unbox(x) | Node::RefTy(x) => {
                 smallvec![*x]
             }
             Node::Ref(ty, r) => {
@@ -654,6 +656,7 @@ impl Node {
             | Node::ProdType(_)
             | Node::SumType(_)
             | Node::ExternFunType(_, _)
+            | Node::Unbox(_)
             | Node::RefTy(_) => m.add(Node::Const(Constant::TypeType), None),
             Node::Product(ty, _) => *ty,
             Node::Param(f, i) => match m.slots().node(*f).unwrap() {
@@ -666,6 +669,7 @@ impl Node {
                 Constant::TypeType
                 | Constant::IntType(_)
                 | Constant::FloatType(_)
+                | Constant::BoxTy
                 | Constant::StringTy => m.add(Node::Const(Constant::TypeType), None),
                 Constant::Int(w, _) => m.add(Node::Const(Constant::IntType(*w)), None),
                 Constant::Stop | Constant::Unreachable => m.add(Node::FunType(0), None),
@@ -749,6 +753,7 @@ pub enum Constant {
     Stop,
     Unreachable,
     TypeType,
+    BoxTy,
     IntType(Width),
     Int(Width, i64),
     FloatType(FloatType),
@@ -795,6 +800,7 @@ mod display {
                 Constant::Unreachable => write!(f, "unreachable"),
                 Constant::Stop => write!(f, "stop"),
                 Constant::TypeType => write!(f, "Type"),
+                Constant::BoxTy => write!(f, "box"),
                 Constant::IntType(w) => write!(f, "I{}", w),
                 Constant::Int(w, i) => write!(f, "{}i{}", i, w),
                 Constant::FloatType(t) => write!(f, "{}", t),

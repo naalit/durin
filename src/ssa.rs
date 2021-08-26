@@ -249,7 +249,9 @@ impl<'a> System<'a> for SSA {
                             continue;
                         }
                         match reqs.get(&r) {
-                            _ if can_be_block[&r] => (),
+                            _ if can_be_block[&r] => {
+                                nreqs.extend(&ssa_reqs[&r]);
+                            }
                             Some(v) if v.is_empty() => {
                                 // We won't add it to nreqs, since we know it's good
                             }
@@ -316,7 +318,9 @@ fn try_stack_call(
     slots: &ReadStorage<Slot>,
 ) -> bool {
     if reqs.contains(&callee) {
-        return true;
+        return blocks.contains_key(&callee)
+            || call_args.is_empty()
+            || try_stack_call(*call_args.last().unwrap(), cont, &[], reqs, blocks, slots);
     }
     match slots.node(callee).unwrap() {
         // If we call another function's parameter, we can't be stack enabled.

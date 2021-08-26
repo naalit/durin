@@ -124,7 +124,7 @@ static bool next_block() {
 
 // `size` should include a word for the header
 void* immix_alloc(uint64_t size, uint32_t* header, uint64_t* rsp) {
-    // printf("Calling immix_alloc\n");
+    // printf("Calling immix_alloc of %ld bytes\n", size);
     while (true) {
         // Try this line
         if (local_alloc.ptr && local_alloc.ptr - size >= local_alloc.end) {

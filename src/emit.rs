@@ -104,6 +104,9 @@ impl<'a> Display for PrettyVal<'a> {
                     b.pretty(m)
                 )
             }
+            Node::Unbox(x) => {
+                write!(f, "unbox {}", x.pretty(m),)
+            }
             // Node::Param(a, b) => write!(f, "{}.{}", a.pretty(m), b),
             _ => match m.name(v) {
                 Some(x) => write!(f, "{}", x),

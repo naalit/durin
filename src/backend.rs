@@ -65,7 +65,12 @@ extern "C" {
 }
 
 impl crate::ir::Module {
-    pub fn compile_and_link(&mut self, out_file: &Path, optimize: bool) -> Result<(), String> {
+    pub fn compile_and_link(
+        &mut self,
+        out_file: &Path,
+        optimize: bool,
+        print_ir: bool,
+    ) -> Result<(), String> {
         let backend = Backend::native();
         let module = backend.codegen_module(self);
         let cxt = &backend.cxt;
@@ -200,6 +205,12 @@ impl crate::ir::Module {
                 ) != 0
                 {
                     return Err(format!("Optimization failed"));
+                }
+
+                if print_ir {
+                    Module::parse_bitcode_from_path(module_file.to_str().unwrap(), cxt)
+                        .unwrap()
+                        .print_to_stderr();
                 }
             }
 
@@ -496,10 +507,12 @@ impl<'cxt> Cxt<'cxt> {
 
         self.builder.position_at_end(bthen);
         let pthen = fthen();
+        let bthen = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(bmerge);
 
         self.builder.position_at_end(belse);
         let pelse = felse();
+        let belse = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(bmerge);
 
         self.builder.position_at_end(bmerge);
@@ -563,6 +576,8 @@ impl<'cxt> Cxt<'cxt> {
         data: &Data,
     ) -> PointerValue<'cxt> {
         match ty {
+            Type::Unbox(x) => self.to_any(x, val, data),
+
             // Already a pointer, just do a bitcast to make sure it's the right type
             Type::Pointer
             | Type::PtrStruct(_)
@@ -624,6 +639,8 @@ impl<'cxt> Cxt<'cxt> {
         data: &Data,
     ) -> BasicValueEnum<'cxt> {
         match ty {
+            Type::Unbox(x) => self.from_any(x, ptr, data),
+
             // Already a pointer, just do a bitcast to make sure it's the right type
             Type::Pointer
             | Type::PtrStruct(_)
@@ -680,6 +697,8 @@ impl<'cxt> Cxt<'cxt> {
     /// The inverse of `store`, and also `gen_at`.
     fn load(&self, ty: &Type<'cxt>, from: PointerValue<'cxt>, data: &Data) -> BasicValueEnum<'cxt> {
         match ty {
+            Type::Unbox(x) if !x.can_unbox_ptr() => self.load(x, from, data),
+
             // Actually load
             Type::Pointer
             | Type::StackEnum(_, _)
@@ -733,7 +752,12 @@ impl<'cxt> Cxt<'cxt> {
                 agg.as_basic_value_enum()
             }
 
-            Type::Unknown(_) | Type::Unknown2(_) | Type::PtrStruct(_) | Type::PtrEnum(_) => {
+            Type::Unknown(_)
+            | Type::Unknown2(_)
+            | Type::PtrStruct(_)
+            | Type::PtrEnum(_)
+            | Type::Unbox(_) => {
+                let unbox = matches!(ty, Type::Unbox(_));
                 let size = ty.heap_size(self, data);
                 let fits = self.builder.build_int_compare(
                     IntPredicate::ULT,
@@ -745,29 +769,61 @@ impl<'cxt> Cxt<'cxt> {
                     fits,
                     || {
                         // It's represented by a bitcasted something else on the stack, not just a pointer
-                        // So load it from the pointer
-                        let lty = ty.llvm_ty(self);
+                        // So load it from the pointer, and mark it (`x << 1 | 1`)
+                        let i64_ty = self.cxt.i64_type();
                         let from = self
                             .builder
-                            .build_bitcast(from, lty.gc_ptr(), "casted_load_slot")
+                            .build_bitcast(from, i64_ty.gc_ptr(), "casted_load_slot")
                             .into_pointer_value();
-                        self.builder.build_load(from, "load")
+                        let int = self.builder.build_load(from, "load").into_int_value();
+                        let marked = self.builder.build_left_shift(
+                            int,
+                            i64_ty.const_int(1, false),
+                            "marked_val",
+                        );
+                        let marked =
+                            self.builder
+                                .build_or(marked, i64_ty.const_int(1, false), "marked_val");
+                        self.inttoptr(marked).as_basic_value_enum()
                     },
                     || {
-                        // Reallocate and copy: we don't allow interior pointers besides temporarily
-                        let header = ty.as_rtti(self, data);
-                        let alloc = self.alloc(size, header, "realloc");
-                        let to = unsafe {
-                            self.builder.build_in_bounds_gep(
-                                alloc,
-                                &[self.size_ty().const_int(8, false)],
-                                "to_slot",
+                        // If it's bigger than UNBOX_THRESHOLD, skip it
+                        let too_big = if unbox {
+                            self.cxt.bool_type().const_zero()
+                        } else {
+                            self.builder.build_int_compare(
+                                IntPredicate::UGT,
+                                size,
+                                self.size_ty().const_int(UNBOX_THRESHOLD.into(), false),
+                                "too_big",
                             )
                         };
-                        self.builder
-                            .build_memcpy(to, 8, from, ty.alignment(), size)
-                            .unwrap();
-                        alloc.as_basic_value_enum()
+                        self.if_expr(
+                            too_big,
+                            || {
+                                let from = self
+                                    .builder
+                                    .build_bitcast(from, self.any_ty().gc_ptr(), "casted_load_slot")
+                                    .into_pointer_value();
+                                self.builder.build_load(from, "load_ptr")
+                            },
+                            || {
+                                // Reallocate and copy: we don't allow interior pointers besides temporarily
+                                let header = ty.as_rtti(self, data);
+                                let alloc = self.alloc(size, header, "realloc");
+                                let to = unsafe {
+                                    self.builder.build_in_bounds_gep(
+                                        alloc,
+                                        &[self.size_ty().const_int(8, false)],
+                                        "to_slot",
+                                    )
+                                };
+                                self.builder
+                                    .build_memcpy(to, 8, from, ty.alignment(), size)
+                                    .unwrap();
+                                alloc.as_basic_value_enum()
+                            },
+                        )
                     },
                 )
             }
@@ -784,6 +840,8 @@ impl<'cxt> Cxt<'cxt> {
         data: &Data,
     ) {
         match ty {
+            Type::Unbox(x) if !x.can_unbox_ptr() => self.store(x, from, to, data),
+
             // Store
             Type::Pointer
             | Type::StackEnum(_, _)
@@ -831,7 +889,12 @@ impl<'cxt> Cxt<'cxt> {
                 }
             }
 
-            Type::Unknown(_) | Type::Unknown2(_) | Type::PtrStruct(_) | Type::PtrEnum(_) => {
+            Type::Unknown(_)
+            | Type::Unknown2(_)
+            | Type::PtrStruct(_)
+            | Type::PtrEnum(_)
+            | Type::Unbox(_) => {
+                let unbox = matches!(ty, Type::Unbox(_));
                 let size = ty.heap_size(self, data);
                 let fits = self.builder.build_int_compare(
                     IntPredicate::ULT,
@@ -843,27 +906,59 @@ impl<'cxt> Cxt<'cxt> {
                     fits,
                     || {
                         // It's represented by a bitcasted something else on the stack, not just a pointer
-                        // So just store the pointer
-                        let lty = from.get_type();
-                        let to =
-                            self.builder
-                                .build_pointer_cast(to, lty.gc_ptr(), "casted_store_slot");
-                        self.builder.build_store(to, from);
+                        // So just store the pointer, but make sure to unmark it first
+                        let int = self.ptrtoint(from.into_pointer_value());
+                        let unmarked = self.builder.build_right_shift(
+                            int,
+                            self.size_ty().const_int(1, false),
+                            false,
+                            "unmarked_val",
+                        );
+                        let to = self.builder.build_pointer_cast(
+                            to,
+                            self.size_ty().gc_ptr(),
+                            "casted_store_slot",
+                        );
+                        self.builder.build_store(to, unmarked);
                     },
                     || {
-                        // Copy the data this points to to the new location
-                        let align = ty.alignment().max(1);
-                        // `from` is a pointer to the header
-                        let from = unsafe {
-                            self.builder.build_in_bounds_gep(
-                                from.into_pointer_value(),
-                                &[self.size_ty().const_int(8, false)],
-                                "store_slot",
+                        // If it's bigger than UNBOX_THRESHOLD, skip it
+                        let too_big = if unbox {
+                            self.cxt.bool_type().const_zero()
+                        } else {
+                            self.builder.build_int_compare(
+                                IntPredicate::UGT,
+                                size,
+                                self.size_ty().const_int(UNBOX_THRESHOLD.into(), false),
+                                "too_big",
                             )
                         };
-                        self.builder
-                            .build_memcpy(to, align, from, align, size)
-                            .unwrap();
+                        self.if_stmt(
+                            too_big,
+                            || {
+                                let to = self.builder.build_pointer_cast(
+                                    to,
+                                    self.any_ty().gc_ptr(),
+                                    "casted_store_slot",
+                                );
+                                self.builder.build_store(to, from);
+                            },
+                            || {
+                                // Copy the data this points to to the new location
+                                let align = ty.alignment().max(1);
+                                // `from` is a pointer to the header
+                                let from = unsafe {
+                                    self.builder.build_in_bounds_gep(
+                                        from.into_pointer_value(),
+                                        &[self.size_ty().const_int(8, false)],
+                                        "store_slot",
+                                    )
+                                };
+                                self.builder
+                                    .build_memcpy(to, align, from, align, size)
+                                    .unwrap();
+                            },
+                        )
                     },
                 )
             }
@@ -1576,10 +1671,12 @@ impl<'cxt> Cxt<'cxt> {
             Node::FunType(_)
             | Node::ExternFunType(_, _)
             | Node::RefTy(_)
+            | Node::Unbox(_)
             | Node::ProdType(_)
             | Node::SumType(_)
             | Node::Const(Constant::StringTy)
             | Node::Const(Constant::TypeType)
+            | Node::Const(Constant::BoxTy)
             | Node::Const(Constant::FloatType(_))
             | Node::Const(Constant::IntType(_)) => self
                 .as_type(val, data)
@@ -1633,7 +1730,6 @@ impl<'cxt> Cxt<'cxt> {
 
                             Eq => lop!(build_int_compare IntPredicate::EQ),
                             NEq => lop!(build_int_compare IntPredicate::NE),
-                            // TODO unsigned vs signed
                             Lt => lop!(build_int_compare ? IntPredicate::SLT ; IntPredicate::ULT),
                             Gt => lop!(build_int_compare ? IntPredicate::SGT ; IntPredicate::UGT),
                             Leq => lop!(build_int_compare ? IntPredicate::SLE ; IntPredicate::ULE),
@@ -2213,6 +2309,7 @@ impl<'cxt> Cxt<'cxt> {
             {
                 let mut upvalues = self.upvalues.borrow_mut();
                 for ((val, _ty, _ty2), param) in env.iter().zip(fun.get_params()) {
+                    param.set_name(&val.name_or_num(&names));
                     upvalues.insert(*val, param);
                 }
             }
@@ -2288,6 +2385,7 @@ impl<'cxt> Cxt<'cxt> {
                     self.gen_call(felse, vec![], None, data);
                 // If we're calling ifcase i x, do that instead
                 } else if let Some(Node::IfCase(i, x)) = data.slots.node(bfun.callee).cloned() {
+                    let x = data.slots.unredirect(x);
                     let vty = tys.get(x).unwrap().0;
                     let ty = self.as_type(vty, data);
                     let payload_ty = match vty.get(&data.slots) {
