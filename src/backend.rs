@@ -719,7 +719,7 @@ impl<'cxt> Cxt<'cxt> {
                 let mut ptr = from;
                 let mut size = self.size_ty().const_zero();
                 let mut agg = ty.llvm_ty(self).into_struct_type().get_undef();
-                for (i, (param, ty)) in v.iter().enumerate() {
+                for (i, ty) in v.iter().enumerate() {
                     let align = ty.alignment();
                     let padding = self.padding_llvm(size, align);
                     size = self.builder.build_int_add(size, padding, "padded_size");
@@ -730,9 +730,6 @@ impl<'cxt> Cxt<'cxt> {
 
                     let member = self.load(ty, ptr, data);
                     let isize = ty.heap_size(self, data);
-                    if let Some(param) = param {
-                        self.push_val(*param, member);
-                    }
                     agg = self
                         .builder
                         .build_insert_value(agg, member, i.try_into().unwrap(), "struct_load")
@@ -743,11 +740,6 @@ impl<'cxt> Cxt<'cxt> {
                         self.builder
                             .build_in_bounds_gep(ptr, &[isize], "next_member_slot")
                     };
-                }
-                for (param, _) in v {
-                    if let Some(param) = param {
-                        self.pop_val(*param);
-                    }
                 }
                 agg.as_basic_value_enum()
             }
@@ -861,7 +853,7 @@ impl<'cxt> Cxt<'cxt> {
                 let mut ptr = to;
                 let mut size = self.size_ty().const_zero();
                 let agg = from.into_struct_value();
-                for (i, (param, ty)) in v.iter().enumerate() {
+                for (i, ty) in v.iter().enumerate() {
                     let align = ty.alignment();
                     let padding = self.padding_llvm(size, align);
                     size = self.builder.build_int_add(size, padding, "padded_size");
@@ -874,7 +866,6 @@ impl<'cxt> Cxt<'cxt> {
                         .builder
                         .build_extract_value(agg, i.try_into().unwrap(), "member_to_store")
                         .unwrap();
-                    param.map(|p| self.push_val(p, member));
                     self.store(ty, member, ptr, data);
 
                     let isize = ty.heap_size(self, data);
@@ -883,9 +874,6 @@ impl<'cxt> Cxt<'cxt> {
                         self.builder
                             .build_in_bounds_gep(ptr, &[isize], "next_member_slot")
                     };
-                }
-                for (param, _) in v {
-                    param.map(|p| self.pop_val(p));
                 }
             }
 
@@ -970,41 +958,32 @@ impl<'cxt> Cxt<'cxt> {
             Type::StackStruct(v) | Type::PtrStruct(v) => {
                 let mut size = self.size_ty().const_zero();
                 let mut padding = Vec::new();
-                for (p, i) in v {
+                for i in v {
                     let x = i.heap_size(self, data);
                     let align = i.alignment();
                     if align > 0 {
                         let pad = self.padding_llvm(size, align);
-                        padding.push((p, i, x, Some(pad)));
+                        padding.push((i, x, Some(pad)));
                         size = self.builder.build_int_add(size, pad, "aligned_size");
                     } else {
-                        padding.push((p, i, x, None));
+                        padding.push((i, x, None));
                     }
                     size = self.builder.build_int_add(size, x, "struct_size");
                 }
 
                 let mut next = ptr;
-                for (&val, (param, ty, size, padding)) in values.iter().zip(padding) {
+                for (&val, (ty, size, padding)) in values.iter().zip(padding) {
                     if let Some(padding) = padding {
                         next = unsafe {
                             self.builder
                                 .build_in_bounds_gep(next, &[padding], "member_slot_padded")
                         };
                     }
-                    if let Some(param) = param {
-                        // Is it better to gen it twice, or just store this?
-                        self.push_val(*param, self.gen_value(val, data));
-                    }
                     self.gen_at(val, &ty, next, data);
                     next = unsafe {
                         self.builder
                             .build_in_bounds_gep(next, &[size], "next_member_slot")
                     };
-                }
-                for (p, _) in v {
-                    if let Some(p) = p {
-                        self.pop_val(*p);
-                    }
                 }
             }
             _ => unreachable!(),
@@ -1074,7 +1053,7 @@ impl<'cxt> Cxt<'cxt> {
                             .into_pointer_value();
 
                         let mut size = self.size_ty().const_zero();
-                        for (i, (param, ty)) in v.iter().enumerate() {
+                        for (i, ty) in v.iter().enumerate() {
                             let x = ty.heap_size(self, data);
                             let align = ty.alignment();
                             if align > 0 {
@@ -1094,10 +1073,6 @@ impl<'cxt> Cxt<'cxt> {
                                     .unwrap();
                                 return;
                             } else {
-                                if let Some(param) = param {
-                                    let p = self.load(&ty, ptr2, data);
-                                    self.push_val(*param, p);
-                                }
                                 ptr2 = unsafe {
                                     self.builder
                                         .build_in_bounds_gep(ptr2, &[x], "next_member_slot")
@@ -1193,14 +1168,13 @@ impl<'cxt> Cxt<'cxt> {
 
                 // Store the function pointer + environment in a heap-allocated struct
                 let env_ty = Type::PtrStruct(
-                    std::iter::once((None, Type::Pointer))
+                    std::iter::once(Type::Pointer)
                         .chain(env.iter().map(|(_, _, ty)| {
-                            let ty = if ty.has_unknown() {
+                            if ty.has_unknown() {
                                 Type::Pointer
                             } else {
                                 ty.clone()
-                            };
-                            (None, ty)
+                            }
                         }))
                         .collect(),
                 );
@@ -1305,7 +1279,7 @@ impl<'cxt> Cxt<'cxt> {
                             .into_pointer_value();
 
                         let mut size = self.size_ty().const_zero();
-                        for (i, (param, ty)) in v.iter().enumerate() {
+                        for (i, ty) in v.iter().enumerate() {
                             let x = ty.heap_size(self, data);
                             let align = ty.alignment();
                             if align > 0 {
@@ -1322,9 +1296,6 @@ impl<'cxt> Cxt<'cxt> {
                             if i == *idx {
                                 return Some(self.load(ty, ptr, data));
                             } else {
-                                if let Some(param) = param {
-                                    self.push_val(*param, self.load(ty, ptr, data));
-                                }
                                 ptr = unsafe {
                                     self.builder
                                         .build_in_bounds_gep(ptr, &[x], "next_member_slot")
@@ -1511,23 +1482,15 @@ impl<'cxt> Cxt<'cxt> {
             Node::Product(ty, values) => {
                 let ty = self.as_type(*ty, data);
                 match &ty {
-                    Type::StackStruct(v) => {
+                    Type::StackStruct(_) => {
                         let ty = ty.llvm_ty(self).into_struct_type();
                         let mut agg = ty.get_undef().as_aggregate_value_enum();
-                        for (i, (x, (param, _))) in values.into_iter().zip(v).enumerate() {
+                        for (i, x) in values.into_iter().enumerate() {
                             let x = self.try_gen_value(*x, data)?;
-                            if let Some(param) = param {
-                                self.push_val(*param, x);
-                            }
                             agg = self
                                 .builder
                                 .build_insert_value(agg, x, i as u32, "product")
                                 .unwrap();
-                        }
-                        for (param, _) in v {
-                            if let Some(param) = param {
-                                self.pop_val(*param);
-                            }
                         }
                         agg.as_basic_value_enum()
                     }

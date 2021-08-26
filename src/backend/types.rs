@@ -31,8 +31,8 @@ pub fn tag_bytes(len: usize) -> u32 {
 pub enum Type<'cxt> {
     Pointer,
     Unbox(Box<Type<'cxt>>),
-    StackStruct(Vec<(Option<Val>, Type<'cxt>)>),
-    PtrStruct(Vec<(Option<Val>, Type<'cxt>)>),
+    StackStruct(Vec<Type<'cxt>>),
+    PtrStruct(Vec<Type<'cxt>>),
     StackEnum(u32, Vec<Type<'cxt>>),
     PtrEnum(Vec<Type<'cxt>>),
     Unknown(PointerValue<'cxt>),
@@ -59,7 +59,7 @@ impl<'cxt> Type<'cxt> {
                 if v.is_empty() {
                     0
                 } else {
-                    v[0].1.alignment()
+                    v[0].alignment()
                 }
             }
             Type::StackEnum(bytes, _) => *bytes.min(&8),
@@ -90,7 +90,7 @@ impl<'cxt> Type<'cxt> {
             Type::Unbox(x) => x.stack_size(),
             Type::StackStruct(v) => {
                 let mut size = 0;
-                for (_, i) in v {
+                for i in v {
                     let x = i.stack_size().unwrap_or(8);
                     let align = i.alignment();
                     if align > 0 {
@@ -102,7 +102,7 @@ impl<'cxt> Type<'cxt> {
             }
             Type::PtrStruct(v) => {
                 let mut size = 0;
-                for (_, i) in v {
+                for i in v {
                     let x = i.stack_size()?;
                     let align = i.alignment();
                     if align > 0 {
@@ -151,7 +151,7 @@ impl<'cxt> Type<'cxt> {
             Type::Unbox(x) => x.heap_size(cxt, data),
             Type::StackStruct(v) | Type::PtrStruct(v) => {
                 let mut size = cxt.size_ty().const_zero();
-                for (_, i) in v {
+                for i in v {
                     let x = i.heap_size(cxt, data);
                     let align = i.alignment();
                     if align > 0 {
@@ -251,7 +251,7 @@ impl<'cxt> Type<'cxt> {
     pub fn has_unknown(&self) -> bool {
         match self {
             Type::Unbox(x) => x.has_unknown(),
-            Type::PtrStruct(v) => v.iter().any(|(_, x)| x.has_unknown()),
+            Type::PtrStruct(v) => v.iter().any(Type::has_unknown),
             Type::PtrEnum(v) => v.iter().any(Type::has_unknown),
             Type::Unknown(_) => true,
             Type::Unknown2(_) => true,
@@ -263,7 +263,7 @@ impl<'cxt> Type<'cxt> {
         match self {
             Type::Unbox(x) => x.llvm_ty(cxt),
             Type::StackStruct(v) => {
-                let v: Vec<_> = v.iter().map(|(_, x)| x.llvm_ty(cxt)).collect();
+                let v: Vec<_> = v.iter().map(|x| x.llvm_ty(cxt)).collect();
                 cxt.cxt.struct_type(&v, false).as_basic_type_enum()
             }
             Type::PtrStruct(_) => cxt.any_ty(),
@@ -299,7 +299,7 @@ impl<'cxt> Type<'cxt> {
     fn tyinfo_unbox(&self, info: &mut TyInfo<'cxt>, cxt: &Cxt<'cxt>, data: &Data) {
         match self {
             Type::StackStruct(tys) | Type::PtrStruct(tys) => {
-                for (_, ty) in tys {
+                for ty in tys {
                     ty.tyinfo(info, cxt, data);
                 }
             }
@@ -341,7 +341,7 @@ impl<'cxt> Type<'cxt> {
                 let heap_size = self.heap_size(cxt, data);
 
                 cxt.or_box(heap_size, info, |info| {
-                    for (_, ty) in tys {
+                    for ty in tys {
                         ty.tyinfo(info, cxt, data);
                     }
                 });
@@ -989,20 +989,12 @@ impl<'cxt> Cxt<'cxt> {
                 Type::ExternFun(args, ret)
             }
             Node::ProdType(v) => {
-                let val = data.slots.unredirect(val);
-                let v: Vec<_> = v.iter().enumerate().map(|(i, &x)| {
-                    let ty = self.as_type(x, data);
-                    let param = data.uses.get(val).unwrap().iter().find(|&&u| {
-                        matches!(data.slots.node(u), Some(Node::Param(f, n)) if *f == val && *n as usize == i)
-                            && !data.uses.get(u).unwrap().is_empty()
-                    }).copied();
-                    (param, ty)
-                }).collect();
+                let v: Vec<_> = v.iter().map(|&x| self.as_type(x, data)).collect();
 
                 // It's a StackStruct if the part we would put on the stack is smaller than STACK_THRESHOLD bytes
                 let mut is_static = true;
                 let mut static_size = 0;
-                for (_, i) in &v {
+                for i in &v {
                     // If it has a pointer, it needs to be heap-allocated, because LLVM can't see pointers inside of structs for GC purposes
                     if i.has_ptr() {
                         is_static = false;

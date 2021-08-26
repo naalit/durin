@@ -27,37 +27,9 @@ impl ValExt for Val {
     fn name_or_num(self, n: &ReadStorage<Name>) -> String {
         n.get(self)
             .map(|n| n.0.clone())
-            .unwrap_or_else(|| format!("{}", self.id()))
+            .unwrap_or_else(|| format!("%{}", self.id()))
     }
 }
-
-/*
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Val(usize);
-impl Val {
-    pub fn unredirect(self, m: &Module) -> Val {
-        match m.nodes.get(self.num()) {
-            Some(Slot::Redirect(x)) => x.unredirect(m),
-            _ => self,
-        }
-    }
-
-    pub fn get(self, m: &Module) -> &Node {
-        m.get(self).unwrap()
-    }
-
-    pub fn num(self) -> usize {
-        self.0
-    }
-
-    pub(crate) fn from_num(n: usize) -> Self {
-        Val(n)
-    }
-
-    /// An invalid value that can't have a Node associated with it
-    pub const INVALID: Self = Val(usize::MAX);
-}
-*/
 
 #[derive(Debug, Clone, Eq, PartialEq, Component)]
 pub enum Slot {
@@ -115,8 +87,6 @@ pub trait Slots {
                                 }
                                 // go(m, params[*i as usize], seen, acc);
                             }
-                            // Parameters of sigma types don't count
-                            Node::ProdType(_) => (),
                             _ => unreachable!(),
                         }
                     }
@@ -366,10 +336,8 @@ impl Module {
                     let x = m.unredirect(x);
                     match m.slots().node(x) {
                         None => unreachable!(),
-                        Some(Node::Param(p, _)) => {
-                            !not.contains(p) && matches!(m.slots().node(*p), Some(Node::Fun(_)))
-                        }
-                        Some(Node::Fun(_)) | Some(Node::FunType(_)) | Some(Node::ProdType(_)) => {
+                        Some(Node::Param(p, _)) => !not.contains(p),
+                        Some(Node::Fun(_)) => {
                             if !not.contains(&x) {
                                 // If it calls another function, that function can use its own parameters
                                 not.insert(x);
@@ -409,15 +377,11 @@ impl Module {
             let v = m.unredirect(v);
             match m.slots().node(v).unwrap() {
                 Node::Param(f, i) => {
-                    if seen.contains(f) {
-                    } else {
-                        match m.slots().node(*f).unwrap() {
-                            Node::Fun(Function { params, .. }) => {
-                                acc.insert((v, params[*i as usize]));
-                            }
-                            // Parameters of pi or sigma types don't count
-                            Node::FunType(_) | Node::ProdType(_) => (),
-                            _ => unreachable!(),
+                    if !seen.contains(f) {
+                        if let Node::Fun(Function { params, .. }) = m.slots().node(*f).unwrap() {
+                            acc.insert((v, params[*i as usize]));
+                        } else {
+                            unreachable!()
                         }
                     }
                 }
@@ -448,15 +412,11 @@ impl Module {
             let v = m.unredirect(v);
             match m.slots().node(v).unwrap() {
                 Node::Param(f, _) => {
-                    if seen.contains(f) {
-                    } else {
-                        match m.slots().node(*f).unwrap() {
-                            Node::Fun(Function { .. }) => {
-                                acc.insert(*f);
-                            }
-                            // Parameters of pi or sigma types don't count
-                            Node::FunType(_) | Node::ProdType(_) => (),
-                            _ => unreachable!(),
+                    if !seen.contains(f) {
+                        if let Node::Fun(Function { .. }) = m.slots().node(*f).unwrap() {
+                            acc.insert(*f);
+                        } else {
+                            unreachable!()
                         }
                     }
                 }
@@ -661,8 +621,6 @@ impl Node {
             Node::Product(ty, _) => *ty,
             Node::Param(f, i) => match m.slots().node(*f).unwrap() {
                 Node::Fun(f) => f.params[*i as usize],
-                Node::ProdType(p) => p[*i as usize],
-                Node::ExternFun(_, p, _) => p[*i as usize],
                 _ => unreachable!(),
             },
             Node::Const(c) => match c {

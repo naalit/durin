@@ -35,12 +35,12 @@ impl<'a> Display for PrettyVal<'a> {
             Node::ProdType(params) => {
                 write!(f, "sig {{ ")?;
                 let mut first = true;
-                for (i, ty) in params.iter().enumerate() {
+                for p in params {
                     if !first {
                         write!(f, ", ")?;
                     }
                     first = false;
-                    write!(f, "{}{}", m.param_name(v, i as u8), ty.pretty(m))?;
+                    write!(f, "{}", p.pretty(m))?;
                 }
                 write!(f, " }}")
             }
@@ -57,7 +57,7 @@ impl<'a> Display for PrettyVal<'a> {
                 write!(f, ")")
             }
             Node::Product(ty, v) => {
-                write!(f, "struct {{ ")?;
+                write!(f, "{{ ")?;
                 let mut first = true;
                 for i in v {
                     if !first {
@@ -66,33 +66,13 @@ impl<'a> Display for PrettyVal<'a> {
                     first = false;
                     write!(f, "{}", i.pretty(m))?;
                 }
-                write!(f, " }} :: {}", ty.pretty(m))
+                write!(f, " }} of {}", ty.pretty(m))
             }
             Node::Proj(ty, x, i) => {
                 write!(f, "({}.{} of {})", x.pretty(m), i, ty.pretty(m))
             }
             Node::Inj(t, i, v) => {
                 write!(f, "({}:{} {})", t.pretty(m), i, v.pretty(m))
-            }
-            Node::If(x) => {
-                write!(f, "if {}", x.pretty(m))
-            }
-            Node::IfCase(i, x) => {
-                write!(f, "ifcase {} {}", i, x.pretty(m))
-            }
-            Node::Ref(ty, op) => match op {
-                RefOp::RefNew => write!(f, "refnew {}", ty.pretty(m)),
-                RefOp::RefGet(ptr) => write!(f, "refget {} {}", ty.pretty(m), ptr.pretty(m)),
-                RefOp::RefSet(ptr, val) => write!(
-                    f,
-                    "refset {} {} {}",
-                    ty.pretty(m),
-                    ptr.pretty(m),
-                    val.pretty(m)
-                ),
-            },
-            Node::ExternCall(x, ret_ty) => {
-                write!(f, "externcall {} -> {}", x.pretty(m), ret_ty.pretty(m))
             }
             Node::BinOp(op, signed, a, b) => {
                 write!(
@@ -105,9 +85,8 @@ impl<'a> Display for PrettyVal<'a> {
                 )
             }
             Node::Unbox(x) => {
-                write!(f, "unbox {}", x.pretty(m),)
+                write!(f, "unbox {}", x.pretty(m))
             }
-            // Node::Param(a, b) => write!(f, "{}.{}", a.pretty(m), b),
             _ => match m.name(v) {
                 Some(x) => write!(f, "{}", x),
                 None => write!(f, "%{}", v.id()),
@@ -234,11 +213,74 @@ impl Module {
                             )
                             .unwrap();
                         }
-                        write!(buf, ") = {}", callee.pretty(self)).unwrap();
-                        for v in call_args {
-                            write!(buf, " {}", v.pretty(self)).unwrap();
+                        write!(buf, ") = ").unwrap();
+                        match self.slots().node(*callee).unwrap() {
+                            Node::If(x) => {
+                                write!(buf, "if {}", x.pretty(self)).unwrap();
+                                for v in call_args {
+                                    write!(buf, " {}", v.pretty(self)).unwrap();
+                                }
+                            }
+                            Node::IfCase(i, x) => {
+                                write!(buf, "ifcase {} {}", i, x.pretty(self)).unwrap();
+                                for v in call_args {
+                                    write!(buf, " {}", v.pretty(self)).unwrap();
+                                }
+                            }
+                            Node::Ref(ty, op) => {
+                                match op {
+                                    RefOp::RefNew => write!(buf, "refnew {}", ty.pretty(self)),
+                                    RefOp::RefGet(ptr) => write!(
+                                        buf,
+                                        "refget {} {}",
+                                        ty.pretty(self),
+                                        ptr.pretty(self)
+                                    ),
+                                    RefOp::RefSet(ptr, val) => write!(
+                                        buf,
+                                        "refset {} {} {}",
+                                        ty.pretty(self),
+                                        ptr.pretty(self),
+                                        val.pretty(self)
+                                    ),
+                                }
+                                .unwrap();
+                                for v in call_args {
+                                    write!(buf, " {}", v.pretty(self)).unwrap();
+                                }
+                            }
+                            Node::ExternCall(x, ret_ty) => {
+                                write!(
+                                    buf,
+                                    "externcall {} {}",
+                                    ret_ty.pretty(self),
+                                    x.pretty(self)
+                                )
+                                .unwrap();
+                                let mut first = true;
+                                for v in call_args {
+                                    if !first {
+                                        write!(buf, ", ").unwrap();
+                                    }
+                                    first = false;
+                                    write!(buf, "{}", v.pretty(self)).unwrap();
+                                }
+                                write!(buf, ")").unwrap();
+                            }
+                            _ => {
+                                write!(buf, "call {} (", callee.pretty(self)).unwrap();
+                                let mut first = true;
+                                for v in call_args {
+                                    if !first {
+                                        write!(buf, ", ").unwrap();
+                                    }
+                                    first = false;
+                                    write!(buf, "{}", v.pretty(self)).unwrap();
+                                }
+                                write!(buf, ")").unwrap();
+                            }
                         }
-                        writeln!(buf, ";").unwrap();
+                        writeln!(buf).unwrap();
                     }
                     Node::ExternFun(name, params, ret) => {
                         write!(buf, "extern fun {} (", name).unwrap();
@@ -251,16 +293,16 @@ impl Module {
                             }
                             write!(buf, "{}", i.pretty(self)).unwrap()
                         }
-                        writeln!(buf, "): {};", ret.pretty(self)).unwrap();
+                        writeln!(buf, "): {}", ret.pretty(self)).unwrap();
                     }
                     Node::RefTy(x) => {
-                        writeln!(buf, "val {} = ref {};", self.name_or(val), x.pretty(self),)
+                        writeln!(buf, "val {} = ref {}", self.name_or(val), x.pretty(self),)
                             .unwrap();
                     }
                     _ if !matches!(node, Node::Param(_, _)) && self.name(val).is_some() => {
                         writeln!(
                             buf,
-                            "val {} = {};",
+                            "val {} = {}",
                             self.name_or(val),
                             PrettyVal(self, val, true),
                         )
@@ -271,7 +313,7 @@ impl Module {
                     }
                 },
                 Slot::Redirect(v) => {
-                    writeln!(buf, "val {} = {};", self.name_or(val), v.pretty(self),).unwrap()
+                    writeln!(buf, "val {} = {}", self.name_or(val), v.pretty(self),).unwrap()
                 }
             }
         }

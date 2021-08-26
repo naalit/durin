@@ -219,21 +219,9 @@ impl<'a> Parser<'a> {
             self.skip_whitespace();
 
             let mut tys = SmallVec::new();
-            let mut names = Vec::new();
             while !self.matches("}") {
                 tys.push(self.expr());
                 self.skip_whitespace();
-
-                let name = match self.peek().unwrap_or_else(|| self.error("expected '}'")) {
-                    ',' | '}' => self.declare_name("_", self.pos),
-                    _ => {
-                        let pos = self.pos;
-                        let name = self.name();
-                        self.declare_name(name, pos)
-                    }
-                };
-                self.skip_whitespace();
-                names.push(name);
 
                 if self.matches("}") {
                     break;
@@ -242,11 +230,7 @@ impl<'a> Parser<'a> {
                     self.skip_whitespace();
                 }
             }
-            let t = self.module.add(Node::ProdType(tys), None);
-            for (i, x) in names.into_iter().enumerate() {
-                self.module.replace(x, Node::Param(t, i as u8));
-            }
-            t
+            self.module.add(Node::ProdType(tys), None)
         } else if self.matches("(") {
             // A binop
             let expr = self.expr();
@@ -461,19 +445,16 @@ impl<'a> Parser<'a> {
                 if self.matches("(") {
                     self.skip_whitespace();
                     while !self.matches(")") {
-                        let name = self.name();
-                        self.skip_whitespace();
-                        self.expect(":");
-                        self.skip_whitespace();
-                        let ty = self.expr();
+                        // The names are meaningless, so we discard them
+                        self.name();
                         self.skip_whitespace();
 
-                        let i = params.len();
-                        let val = self
-                            .module
-                            .add(Node::Param(val, i as _), Some(name.to_owned()));
-                        self.names.insert(name, (val, self.pos));
-                        params.push(ty);
+                        self.expect(":");
+                        self.skip_whitespace();
+
+                        params.push(self.expr());
+                        self.skip_whitespace();
+
                         if self.matches(")") {
                             break;
                         } else {

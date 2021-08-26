@@ -163,7 +163,7 @@ impl<'m> Builder<'m> {
     }
 
     /// Starts an empty sigma type
-    pub fn sigma(&mut self) -> Sigma {
+    pub fn sigma_(&mut self) -> Sigma {
         Sigma {
             val: self.module.reserve(None),
             tys: SmallVec::new(),
