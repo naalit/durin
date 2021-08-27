@@ -6,6 +6,8 @@ mod emit;
 pub mod ir;
 pub mod parse;
 pub use inkwell;
+pub mod opt;
+pub mod simplify;
 pub mod ssa;
 use ir::*;
 
