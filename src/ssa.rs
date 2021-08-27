@@ -146,7 +146,7 @@ impl<'a> System<'a> for SSA {
                                 ssa_reqs.get_mut(&i).unwrap().append(&mut ssa_reqs_j);
 
                                 uses.get_mut(&i).unwrap().retain(|&x| x != j);
-                                if let Some(&pj) = parents.get(&j).or(parents.get(&i)) {
+                                if let Some(&pj) = parents.get(&j).or_else(|| parents.get(&i)) {
                                     parents.insert(j, pj);
                                     if parents.get(&i).map_or(true, |x| *x == pj) {
                                         parents.insert(i, pj);
@@ -295,7 +295,7 @@ impl<'a> System<'a> for SSA {
             let is_block = is_block
                 && ssa_reqs[&v]
                     .iter()
-                    .all(|f| reqs.contains_key(f) && !can_be_block[&f]);
+                    .all(|f| reqs.contains_key(f) && !can_be_block[f]);
             let mode = if is_block {
                 FunMode::Block(*parents.get(&v).unwrap())
             } else if reqs.contains_key(&v) {

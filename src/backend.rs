@@ -204,7 +204,7 @@ impl crate::ir::Module {
                     optimize,
                 ) != 0
                 {
-                    return Err(format!("Optimization failed"));
+                    return Err("Optimization failed".to_string());
                 }
 
                 if print_ir {
@@ -296,21 +296,6 @@ impl Backend {
             .unwrap();
         let cxt = inkwell::context::Context::create();
         Backend { cxt, machine }
-    }
-
-    pub fn codegen_and_run(&self, m: &mut crate::ir::Module) -> bool {
-        let m = self.codegen_module(m);
-        let ee = m
-            .create_jit_execution_engine(inkwell::OptimizationLevel::Less)
-            .expect("Failed to create LLVM execution engine");
-        if let Ok(main_fun) = unsafe { ee.get_function::<unsafe extern "C" fn()>("main") } {
-            unsafe {
-                main_fun.call();
-            }
-            true
-        } else {
-            false
-        }
     }
 
     pub fn codegen_module(&self, m: &mut crate::ir::Module) -> inkwell::module::Module {
@@ -658,7 +643,6 @@ impl<'cxt> Cxt<'cxt> {
             Type::Int(bits) if *bits < 64 => {
                 let int_type = self.cxt.custom_width_int_type(*bits);
                 let val = self.ptrtoint(ptr);
-                // TODO check signedness
                 let val = self.builder.build_right_shift(
                     val,
                     val.get_type().const_int(1, false),
@@ -670,7 +654,6 @@ impl<'cxt> Cxt<'cxt> {
             }
             Type::Float(crate::ir::FloatType::F32) => {
                 let val = self.ptrtoint(ptr);
-                // TODO check signedness
                 let val = self.builder.build_right_shift(
                     val,
                     val.get_type().const_int(1, false),
@@ -979,7 +962,7 @@ impl<'cxt> Cxt<'cxt> {
                                 .build_in_bounds_gep(next, &[padding], "member_slot_padded")
                         };
                     }
-                    self.gen_at(val, &ty, next, data);
+                    self.gen_at(val, ty, next, data);
                     next = unsafe {
                         self.builder
                             .build_in_bounds_gep(next, &[size], "next_member_slot")
@@ -2090,7 +2073,6 @@ impl<'cxt> Cxt<'cxt> {
                                 Some(Node::Fun(Function {
                                     callee, call_args, ..
                                 })) if callee == cont => call_args
-                                    .clone()
                                     .into_iter()
                                     .map(|x| data.slots.unredirect(x))
                                     .map(|x| **tys.get(x).unwrap())
@@ -2272,7 +2254,7 @@ impl<'cxt> Cxt<'cxt> {
             {
                 let mut upvalues = self.upvalues.borrow_mut();
                 for ((val, _ty, _ty2), param) in env.iter().zip(fun.get_params()) {
-                    param.set_name(&val.name_or_num(&names));
+                    param.set_name(&val.name_or_num(names));
                     upvalues.insert(*val, param);
                 }
             }
@@ -2324,7 +2306,7 @@ impl<'cxt> Cxt<'cxt> {
 
             // Now actually generate the blocks' code
             for (bval, bfun) in blocks {
-                let (block, _, _) = cblocks.get(&bval).unwrap();
+                let (block, _, _) = cblocks.get(bval).unwrap();
                 self.builder.position_at_end(*block);
 
                 // If we're calling if x, do that

@@ -204,12 +204,10 @@ impl<'a> Parser<'a> {
                 self.skip_whitespace();
 
                 self.atom(None)
+            } else if let Some(ty) = ty {
+                ty
             } else {
-                if let Some(ty) = ty {
-                    ty
-                } else {
-                    self.error("type annotation required here")
-                }
+                self.error("type annotation required here")
             };
 
             self.module.add(Node::Product(ty, v), None)

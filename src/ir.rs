@@ -1,7 +1,7 @@
 use smallvec::*;
 pub use specs::prelude::{Join, World, WorldExt};
 use specs::{prelude::*, Component};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 pub type Val = Entity;
 
@@ -37,23 +37,7 @@ pub enum Slot {
     Redirect(Val),
 }
 impl Slot {
-    pub fn to_option_mut(&mut self) -> Option<&mut Node> {
-        if let Slot::Full(n) = self {
-            Some(n)
-        } else {
-            None
-        }
-    }
-
     pub fn to_option(&self) -> Option<&Node> {
-        if let Slot::Full(n) = self {
-            Some(n)
-        } else {
-            None
-        }
-    }
-
-    pub fn into_option(self) -> Option<Node> {
         if let Slot::Full(n) = self {
             Some(n)
         } else {
@@ -194,23 +178,7 @@ impl Module {
         }
     }
 
-    /// Removes a node from the module. Panics if that node is used by anything.
-    pub fn remove(&mut self, i: Val) {
-        if !self.uses().get(i).map_or(true, |x| x.0.is_empty()) {
-            panic!("Error: cannot delete node with uses!")
-        }
-        self.world.delete_entity(i).unwrap();
-    }
-
     pub fn slots(&self) -> ReadStorage<Slot> {
-        self.world.read_storage()
-    }
-
-    pub fn slots_mut(&self) -> WriteStorage<Slot> {
-        self.world.write_storage()
-    }
-
-    pub fn uses(&self) -> ReadStorage<Uses> {
         self.world.read_storage()
     }
 
@@ -219,13 +187,6 @@ impl Module {
             .read_storage::<Name>()
             .get(i)
             .map(|x| x.0.clone())
-    }
-
-    pub fn set_name(&mut self, i: Val, n: String) {
-        self.world
-            .write_storage::<Name>()
-            .insert(i, Name(n))
-            .unwrap();
     }
 
     // TODO deduplicate constants, or just everything except functions (implicit CSE)
@@ -271,10 +232,7 @@ impl Module {
         // If we use redirect() to give this node a name, transfer that over
         if self.name(to).is_none() {
             if let Some(name) = self.name(from) {
-                self.world
-                    .write_storage()
-                    .insert(to, Name(name.clone()))
-                    .unwrap();
+                self.world.write_storage().insert(to, Name(name)).unwrap();
             }
         }
 
@@ -319,156 +277,6 @@ impl Module {
             Some(Slot::Redirect(x)) => self.unredirect(*x),
             _ => v,
         }
-    }
-
-    pub fn top_level(&self) -> Vec<Val> {
-        (&self.world.entities(), &self.world.read_storage::<Slot>())
-            .join()
-            .filter(move |(x, slot)| {
-                // A node is top-level if it:
-                // 1. is a function (and not a redirect)
-                if !matches!(slot, Slot::Full(Node::Fun(_))) {
-                    return false;
-                }
-
-                // 2. doesn't use parameters from other functions at runtime
-                fn has_param(m: &Module, x: Val, not: &mut HashSet<Val>) -> bool {
-                    let x = m.unredirect(x);
-                    match m.slots().node(x) {
-                        None => unreachable!(),
-                        Some(Node::Param(p, _)) => !not.contains(p),
-                        Some(Node::Fun(_)) => {
-                            if !not.contains(&x) {
-                                // If it calls another function, that function can use its own parameters
-                                not.insert(x);
-                                let b = m
-                                    .slots()
-                                    .node(x)
-                                    .unwrap()
-                                    .runtime_args()
-                                    .iter()
-                                    .any(|x| has_param(m, *x, not)); //has_param(m, x, not);
-                                not.remove(&x);
-                                b
-                            } else {
-                                false
-                            }
-                        }
-                        Some(n) => n.runtime_args().iter().any(|x| has_param(m, *x, not)),
-                    }
-                }
-                !has_param(self, *x, &mut std::iter::once(*x).collect())
-            })
-            .map(|(x, _)| x)
-            .collect()
-    }
-
-    pub fn vals(&self) -> Vec<Val> {
-        self.world
-            .entities()
-            .join()
-            .filter(move |x| self.slots().node(*x).is_some())
-            .collect()
-    }
-
-    /// Returns a list of all foreign parameters this node depends on, with their types.
-    pub fn env(&self, v: Val) -> Vec<(Val, Val)> {
-        fn go(m: &Module, v: Val, seen: &mut HashSet<Val>, acc: &mut HashSet<(Val, Val)>) {
-            let v = m.unredirect(v);
-            match m.slots().node(v).unwrap() {
-                Node::Param(f, i) => {
-                    if !seen.contains(f) {
-                        if let Node::Fun(Function { params, .. }) = m.slots().node(*f).unwrap() {
-                            acc.insert((v, params[*i as usize]));
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                }
-                n @ Node::Fun(_) => {
-                    if !seen.contains(&v) {
-                        seen.insert(v);
-                        for i in n.runtime_args() {
-                            go(m, i, seen, acc)
-                        }
-                        seen.remove(&v);
-                    }
-                }
-                n => {
-                    for i in n.runtime_args() {
-                        go(m, i, seen, acc)
-                    }
-                }
-            }
-        }
-        let mut acc = HashSet::new();
-        go(self, v, &mut HashSet::new(), &mut acc);
-        acc.into_iter().collect()
-    }
-
-    /// Returns all functions that `v` depends on the parameters of, and so must be within, recursively.
-    pub fn dependencies(&self, v: Val) -> Vec<Val> {
-        fn go(m: &Module, v: Val, seen: &mut HashSet<Val>, acc: &mut HashSet<Val>) {
-            let v = m.unredirect(v);
-            match m.slots().node(v).unwrap() {
-                Node::Param(f, _) => {
-                    if !seen.contains(f) {
-                        if let Node::Fun(Function { .. }) = m.slots().node(*f).unwrap() {
-                            acc.insert(*f);
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                }
-                n @ Node::Fun(_) => {
-                    if !seen.contains(&v) {
-                        seen.insert(v);
-                        for i in n.runtime_args() {
-                            go(m, i, seen, acc)
-                        }
-                        seen.remove(&v);
-                    }
-                }
-                n => {
-                    for i in n.runtime_args() {
-                        go(m, i, seen, acc)
-                    }
-                }
-            }
-        }
-        let mut acc = HashSet::new();
-        go(self, v, &mut HashSet::new(), &mut acc);
-        acc.into_iter().collect()
-    }
-
-    /// Returns the scope of each function in this module, i.e. for each function, everything that must be nested directly within it.
-    pub fn top_level_scopes(&self) -> HashMap<Val, Vec<Val>> {
-        let mut top_level = Vec::new();
-        let mut scopes: HashMap<Val, Vec<Val>> = HashMap::new();
-        for i in self.world.entities().join() {
-            // Skip redirects for this
-            if i != self.unredirect(i) {
-                continue;
-            }
-            // Also skip anything but functions
-            if !matches!(self.slots().node(i), Some(Node::Fun(_))) {
-                continue;
-            }
-
-            let deps = self.dependencies(i);
-            if deps.is_empty() {
-                top_level.push(i);
-            } else {
-                for d in deps {
-                    scopes.entry(d).or_insert_with(Vec::new).push(i);
-                }
-            }
-        }
-        // top_level
-        //     .into_iter()
-        //     .map(|x| (x, scopes.remove(&x).unwrap_or_else(Vec::new)))
-        //     .collect()
-        scopes
     }
 }
 

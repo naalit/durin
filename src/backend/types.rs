@@ -287,7 +287,7 @@ impl<'cxt> Type<'cxt> {
             },
             Type::Closure(_) => cxt.any_ty(),
             Type::ExternFun(v, ret) => ret
-                .fn_type(&v, false)
+                .fn_type(v, false)
                 .ptr_type(AddressSpace::Generic)
                 .as_basic_type_enum(),
             Type::Type => cxt.cxt.i32_type().gc_ptr().as_basic_type_enum(),
@@ -532,7 +532,7 @@ impl<'cxt> TyInfo<'cxt> {
         }
     }
 
-    pub fn new() -> Self {
+    fn new() -> Self {
         TyInfo {
             run_words: Vec::new(),
             variant_stack: Vec::new(),

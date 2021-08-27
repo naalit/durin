@@ -1,36 +1,6 @@
 use crate::ir::*;
 use smallvec::*;
 
-pub struct Pi {
-    pub args: SmallVec<[Val; 4]>,
-    tys: SmallVec<[Val; 4]>,
-}
-impl Pi {
-    pub fn add_arg(&mut self, ty: Val, builder: &mut Builder) {
-        self.tys.push(ty);
-        let arg = builder.reserve(None);
-        self.args.push(arg);
-    }
-}
-
-pub struct Sigma {
-    val: Val,
-    tys: SmallVec<[Val; 4]>,
-}
-impl Sigma {
-    /// Returns the argument
-    pub fn add(&mut self, ty: Val, b: &mut Builder) -> Val {
-        let i = self.tys.len() as u8;
-        self.tys.push(ty);
-        b.module.add(Node::Param(self.val, i), None)
-    }
-
-    pub fn finish(self, b: &mut Builder) -> Val {
-        b.module.replace(self.val, Node::ProdType(self.tys));
-        self.val
-    }
-}
-
 /// Takes care of the transformation from direct style to CPS.
 pub struct Builder<'m> {
     module: &'m mut Module,
@@ -66,10 +36,6 @@ impl<'m> Builder<'m> {
         )
     }
 
-    pub fn cont(&self) -> Option<Val> {
-        self.funs.last().and_then(|x| x.3)
-    }
-
     /// Updates `from` to be an alias of `to`
     pub fn redirect(&mut self, from: Val, to: Val) {
         self.module.redirect(from, to);
@@ -90,32 +56,6 @@ impl<'m> Builder<'m> {
         self.block = cont;
         self.params.push(ret_ty);
         self.module.add(Node::Param(cont, 0), None)
-    }
-
-    pub fn call_multi(
-        &mut self,
-        f: Val,
-        args: impl Into<SmallVec<[Val; 3]>>,
-        ret_tys: &[Val],
-    ) -> Vec<Val> {
-        let cont = self.module.reserve(None);
-        let mut args = args.into();
-        args.push(cont);
-        self.module.replace(
-            self.block,
-            Node::Fun(Function {
-                params: self.params.drain(0..).collect(),
-                callee: f,
-                call_args: args,
-            }),
-        );
-        self.block = cont;
-        self.params.extend(ret_tys);
-        ret_tys
-            .iter()
-            .enumerate()
-            .map(|(i, _)| self.module.add(Node::Param(cont, i as u8), None))
-            .collect()
     }
 
     /// Calls a function without adding and passing a continuation frame; leaves the current block in a detached state.
@@ -160,14 +100,6 @@ impl<'m> Builder<'m> {
 
     pub fn cons(&mut self, c: Constant) -> Val {
         self.module.add(Node::Const(c), None)
-    }
-
-    /// Starts an empty sigma type
-    pub fn sigma_(&mut self) -> Sigma {
-        Sigma {
-            val: self.module.reserve(None),
-            tys: SmallVec::new(),
-        }
     }
 
     pub fn binop(&mut self, op: BinOp, signed: bool, a: Val, b: Val) -> Val {
@@ -323,13 +255,6 @@ impl<'m> Builder<'m> {
         self.module.add(Node::Proj(ty, x, i), None)
     }
 
-    pub fn sum_idx(&self, x: Val, i: usize) -> Option<Val> {
-        match self.module.slots().node(x) {
-            Some(Node::SumType(v)) => Some(v[i]),
-            _ => None,
-        }
-    }
-
     pub fn unreachable(&mut self, ty: Val) -> Val {
         let ur = self.cons(Constant::Unreachable);
         self.module.replace(
@@ -345,7 +270,6 @@ impl<'m> Builder<'m> {
         self.module.add(Node::Param(self.block, 0), None)
     }
 
-    /// Shortcut function to create a non-dependent product type
     pub fn prod_type(&mut self, v: impl Into<SmallVec<[Val; 4]>>) -> Val {
         self.module.add(Node::ProdType(v.into()), None)
     }
@@ -455,39 +379,6 @@ impl<'m> Builder<'m> {
                 params: self.params.drain(0..).collect(),
                 callee: cont,
                 call_args: smallvec![ret],
-            }),
-        );
-        self.block = block;
-        self.params = params;
-        fun
-    }
-
-    pub fn pop_fun_multi(&mut self, rets: Vec<(Val, Val)>) -> Val {
-        let (fun, block, params, cont) = self.funs.pop().unwrap();
-        let cont = cont.expect("Called pop_fun_multi() with push_fun_raw()");
-
-        // Add the continuation parameter to the function
-        let cont_ty = self.module.add(Node::FunType(rets.len()), None);
-        let funv = self.module.unredirect(fun);
-        match self.module.world.write_storage::<Slot>().get_mut(funv) {
-            Some(Slot::Full(Node::Fun(f))) => {
-                f.params.push(cont_ty);
-            }
-            // The function returns a value directly, so we'll just add the continuation parameter to the function node we're making now
-            None => {
-                self.params.push(cont_ty);
-            }
-            _ => unreachable!(),
-        }
-
-        // We don't use self.call since we don't add the cont parameter here
-        let vals = rets.iter().map(|&(val, _)| val).collect();
-        self.module.replace(
-            self.block,
-            Node::Fun(Function {
-                params: self.params.drain(0..).collect(),
-                callee: cont,
-                call_args: vals,
             }),
         );
         self.block = block;

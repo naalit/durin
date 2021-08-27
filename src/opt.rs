@@ -7,7 +7,7 @@ impl Module {
             .with(crate::simplify::Simplify, "simplify", &[])
             .build();
         dispatcher.setup(&mut self.world);
-        dispatcher.dispatch(&mut self.world);
+        dispatcher.dispatch(&self.world);
         dispatcher.dispose(&mut self.world);
     }
 }
