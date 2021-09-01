@@ -1,6 +1,12 @@
 use crate::ir::*;
 use smallvec::*;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildState {
+    pub block: Val,
+    params: Vec<Val>,
+}
+
 /// Takes care of the transformation from direct style to CPS.
 pub struct Builder<'m> {
     module: &'m mut Module,
@@ -12,19 +18,28 @@ pub struct Builder<'m> {
     ifs: Vec<(Val, Option<Val>)>,
 }
 impl<'m> Builder<'m> {
-    pub fn new(m: &'m mut Module) -> Self {
-        let block = m.reserve(None);
+    pub fn new(m: &'m mut Module, state: Option<BuildState>) -> Self {
+        let (block, params) = match state {
+            Some(BuildState { block, params }) => (block, params),
+            None => (m.reserve(None), Vec::new()),
+        };
         Builder {
             module: m,
             block,
-            params: Vec::new(),
+            params,
             funs: Vec::new(),
             ifs: Vec::new(),
         }
     }
 
-    // TODO: should this just be a Drop impl?
-    pub fn finish(&mut self) {
+    pub fn state(&self) -> BuildState {
+        BuildState {
+            block: self.block,
+            params: self.params.clone(),
+        }
+    }
+
+    pub fn stop(&mut self) {
         let stop = self.module.add(Node::Const(Constant::Stop), None);
         self.module.replace(
             self.block,

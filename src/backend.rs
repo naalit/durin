@@ -76,9 +76,13 @@ impl crate::ir::Module {
         let cxt = &backend.cxt;
         module.set_triple(&backend.machine.get_triple());
 
-        // Create a wrapper around the program's main function if there is one
-        let do_run = if let Some(f) = module.get_function("main") {
+        // Make sure the existing main function doesn't interfere with the entry point
+        if let Some(f) = module.get_function("main") {
             f.as_global_value().set_name("pk$main");
+        }
+
+        // Create a wrapper around the program's main function if there is one
+        let do_run = if let Some(f) = module.get_function("$__entry") {
             let ty = f.get_type().print_to_string();
             // Durin might or might not have succeeded in turning `main` into direct style
             let (run, cps) = match ty.to_str().unwrap() {
