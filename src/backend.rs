@@ -455,6 +455,51 @@ impl<'cxt> Cxt<'cxt> {
             .build_ptr_to_int(ptr, self.size_ty(), "ptrtoint")
     }
 
+    pub fn to_gc_ptr(&self, p: PointerValue<'cxt>) -> PointerValue<'cxt> {
+        let p = self.builder.build_pointer_cast(p, self.cxt.i8_type().ptr_type(AddressSpace::Generic), "raw_pointer");
+        let fun = if let Some(fun) = self.module.get_function("$_r2gc") {
+            fun
+        } else {
+            use inkwell::attributes::*;
+            let ty = self
+                .any_ty()
+                .fn_type(&[self.cxt.i8_type().ptr_type(AddressSpace::Generic).as_basic_type_enum()], false);
+            let fun = self
+                .module
+                .add_function("$_r2gc", ty, Some(Linkage::Private));
+            fun.add_attribute(
+                AttributeLoc::Function,
+                self.cxt
+                    .create_enum_attribute(Attribute::get_named_enum_kind_id("noinline"), 0),
+            );
+            fun.add_attribute(
+                AttributeLoc::Function,
+                self.cxt.create_string_attribute("inline-late", ""),
+            );
+            fun.add_attribute(
+                AttributeLoc::Function,
+                self.cxt.create_string_attribute("gc-leaf-function", ""),
+            );
+
+            let bb = self.cxt.append_basic_block(fun, "entry");
+            let before = self.builder.get_insert_block().unwrap();
+            self.builder.position_at_end(bb);
+            let ptr = self.builder.build_pointer_cast(
+                fun.get_first_param().unwrap().into_pointer_value(),
+                self.any_ty().into_pointer_type(),
+                "gc_pointer",
+            );
+            self.builder.build_return(Some(&ptr));
+
+            self.builder.position_at_end(before);
+            fun
+        };
+        let call = self
+            .builder
+            .build_call(fun, &[p.as_basic_value_enum()], "to_gc_ptr");
+        call.as_any_value_enum().into_pointer_value()
+    }
+
     pub fn call_raw<F, E>(
         &self,
         f: F,
@@ -604,6 +649,23 @@ impl<'cxt> Cxt<'cxt> {
                 self.inttoptr(val)
             }
 
+            Type::StackStruct(_) | Type::StackEnum(_, _) if ty.stack_size().unwrap() < 8 => {
+                // Bitcast using an alloca and then mark
+                let int_ptr = self.builder.build_alloca(self.size_ty(), "any_ptr");
+                let any_ptr = self.to_gc_ptr(int_ptr);
+                self.store(ty, val, any_ptr, data);
+                let val = self.builder.build_load(int_ptr, "any_val").into_int_value();
+                let val = self.builder.build_left_shift(
+                    val,
+                    val.get_type().const_int(1, false),
+                    "int_shl",
+                );
+                let val =
+                    self.builder
+                        .build_or(val, val.get_type().const_int(1, false), "int_mark");
+                self.inttoptr(val)
+            }
+
             // Allocate and call `store`
             Type::StackStruct(_) | Type::StackEnum(_, _) | Type::Int(_) | Type::Closure(_) | Type::Float(crate::ir::FloatType::F64) => {
                 let size = ty.heap_size(self, data);
@@ -663,6 +725,22 @@ impl<'cxt> Cxt<'cxt> {
                 let val = self.builder.build_int_truncate_or_bit_cast(val, self.cxt.i32_type(), "to_i");
                 self.builder.build_bitcast(val, self.cxt.f32_type(), "to_f32")
                     .as_basic_value_enum()
+            }
+
+            Type::StackStruct(_) | Type::StackEnum(_, _) if ty.stack_size().unwrap() < 8 => {
+                // Bitcast using an alloca and unmark
+                let val = self.ptrtoint(ptr);
+                let val = self.builder.build_right_shift(
+                    val,
+                    val.get_type().const_int(1, false),
+                    true,
+                    "int_unmarked",
+                );
+                let int_ptr = self.builder.build_alloca(self.size_ty(), "any_ptr");
+                self.builder.build_store(int_ptr, val);
+                let any_ptr = self.to_gc_ptr(int_ptr);
+                self.load(ty, any_ptr, data)
+                
             }
 
             // Load from the pointer
@@ -1006,7 +1084,7 @@ impl<'cxt> Cxt<'cxt> {
                                     // If it fits in a word, put it in an alloca so we can still work with a pointer
                                     let ptr =
                                         self.builder.build_alloca(self.size_ty(), "proj_slot");
-                                    let val = self.ptrtoint(ptr);
+                                    let val = self.ptrtoint(val.into_pointer_value());
                                     let val = self.builder.build_right_shift(
                                         val,
                                         self.size_ty().const_int(1, false),
@@ -1014,12 +1092,7 @@ impl<'cxt> Cxt<'cxt> {
                                         "proj_val_unmarked",
                                     );
                                     self.builder.build_store(ptr, val);
-                                    self.builder
-                                        .build_pointer_cast(
-                                            ptr,
-                                            self.any_ty().into_pointer_type(),
-                                            "proj_slot_casted",
-                                        )
+                                    self.to_gc_ptr(ptr)
                                         .as_basic_value_enum()
                                 },
                                 // `val` is a pointer to the header, we need a pointer to the fields
@@ -1233,7 +1306,7 @@ impl<'cxt> Cxt<'cxt> {
                                     // If it fits in a word, put it in an alloca so we can still work with a pointer
                                     let ptr =
                                         self.builder.build_alloca(self.size_ty(), "proj_slot");
-                                    let val = self.ptrtoint(ptr);
+                                    let val = self.ptrtoint(val.into_pointer_value());
                                     let val = self.builder.build_right_shift(
                                         val,
                                         self.size_ty().const_int(1, false),
@@ -1241,12 +1314,7 @@ impl<'cxt> Cxt<'cxt> {
                                         "proj_val_unmarked",
                                     );
                                     self.builder.build_store(ptr, val);
-                                    self.builder
-                                        .build_pointer_cast(
-                                            ptr,
-                                            self.any_ty().into_pointer_type(),
-                                            "proj_slot_casted",
-                                        )
+                                    self.to_gc_ptr(ptr)
                                         .as_basic_value_enum()
                                 },
                                 || unsafe {
