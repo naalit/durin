@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include <assert.h>
 #include <time.h>
+#include <string.h>
 
 // A separate function so it can be a breakpoint
 static void panic_exit() {

@@ -1,7 +1,6 @@
 // Immix block allocator
 #include "common.h"
 #include "immix.h"
-#include <string.h>
 
 void initialize(uint32_t num_start_blocks) {
     if (BLOCK_SIZE % LINE_SIZE)
@@ -123,7 +122,7 @@ static bool next_block() {
 }
 
 // `size` should include a word for the header
-void* immix_alloc(uint64_t size, uint32_t* header, uint64_t* rsp) {
+void* immix_alloc(uint64_t size, uint32_t* header, uint64_t* rsp, uint64_t* rbp) {
     // printf("Calling immix_alloc of %ld bytes\n", size);
     while (true) {
         // Try this line
@@ -145,7 +144,7 @@ void* immix_alloc(uint64_t size, uint32_t* header, uint64_t* rsp) {
             // But make sure it can see the RTTI pointer is live
             push_extra_root(header);
 
-            run_gc(rsp);
+            run_gc(rsp, rbp);
 
             header = pop_extra_root();
 

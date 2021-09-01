@@ -14,11 +14,11 @@ declare void @finalize()
 
 module asm ".globl __LLVM_StackMaps"
 
-declare i8* @llvm.addressofreturnaddress()
-declare i8 addrspace(1)* @immix_alloc(i64 %size, i32 addrspace(1)* %header, i8* %rsp)
+declare i8 addrspace(1)* @immix_alloc(i64 %size, i32 addrspace(1)* %header, i8* %rsp, i8* %rbp)
 define private i8 addrspace(1)* @gc_alloc_slow(i64 %size, i32 addrspace(1)* %header) noinline cold {
-    %rsp = call i8* @llvm.addressofreturnaddress()
-    %alloc = call i8 addrspace(1)* @immix_alloc(i64 %size, i32 addrspace(1)* %header, i8* %rsp)
+    %rsp = call i8* asm "mov %rsp, $0", "=r"()
+    %rbp = call i8* asm "mov %rbp, $0", "=r"()
+    %alloc = call i8 addrspace(1)* @immix_alloc(i64 %size, i32 addrspace(1)* %header, i8* %rsp, i8* %rbp)
     ret i8 addrspace(1)* %alloc
 }
 

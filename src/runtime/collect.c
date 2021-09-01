@@ -45,7 +45,6 @@
 
 #include "common.h"
 #include "immix.h"
-#include <string.h>
 
 static const uint64_t COLOR_MASK = 0b11;
 static const uint64_t COLOR_WHITE = 0;
@@ -348,7 +347,7 @@ static void trace(uint32_t* rtti, uint64_t* object) {
     *iptr = (*iptr & ~COLOR_MASK) | current_black;
 }
 
-static void mark_stack(uint64_t* rsp) {
+static void mark_stack(uint64_t* rsp, uint64_t* rbp) {
     while (true) {
         uint64_t ret_address = *rsp;
         rsp++;
@@ -362,7 +361,7 @@ static void mark_stack(uint64_t* rsp) {
             uint32_t* end = entry->locations + entry->locations_len;
             for (uint32_t* loc = entry->locations; loc < end; ) {
                 uint32_t base_offset = loc[0];
-                uint64_t** base_ptr_ptr = (uint64_t**) rsp + base_offset/8;
+                uint64_t** base_ptr_ptr = (uint64_t**) ((base_offset & 1) ? rbp : rsp) + (base_offset >> 1)/8;
                 uint64_t base_before = *(uint64_t*)base_ptr_ptr;
                 mark(base_ptr_ptr);
                 uint64_t offset = *(uint64_t*)base_ptr_ptr - base_before;
@@ -370,7 +369,8 @@ static void mark_stack(uint64_t* rsp) {
                 uint32_t num_derived = loc[1];
                 for (int d = 0; d < num_derived; d++) {
                     uint32_t derived_offset = loc[2+d];
-                    *(uint64_t*)(rsp + derived_offset/8) += offset;
+                    uint64_t* derived_ptr_ptr = ((derived_offset & 1) ? rbp : rsp) + (derived_offset >> 1)/8;
+                    *derived_ptr_ptr += offset;
                 }
                 loc += 2 + num_derived;
             }
@@ -395,7 +395,7 @@ static uint32_t pause_cursor = 0;
 static uint64_t open_lines;
 static uint64_t full_lines;
 
-static void run_full_gc(uint64_t* rsp, bool major) {
+static void run_full_gc(uint64_t* rsp, uint64_t* rbp, bool major) {
     // printf("Starting %s GC\n", major ? "major" : "minor");
 
     #ifdef REPORT_PAUSES
@@ -411,7 +411,7 @@ static void run_full_gc(uint64_t* rsp, bool major) {
         swap_black();
     }
 
-    mark_stack(rsp);
+    mark_stack(rsp, rbp);
     for (uint32_t i = 0; i < extra_roots.len; i++) {
         uint64_t* root = extra_roots.roots[i];
         mark(&root);
@@ -471,11 +471,11 @@ static void run_full_gc(uint64_t* rsp, bool major) {
     #endif
 }
 
-static void run_gc(uint64_t* rsp) {
+static void run_gc(uint64_t* rsp, uint64_t* rbp) {
     #ifdef GENERATIONAL
-    run_full_gc(rsp, full_lines > open_lines);
+    run_full_gc(rsp, rbp, full_lines > open_lines);
     #else
-    run_full_gc(rsp, true);
+    run_full_gc(rsp, rbp, true);
     #endif
 }
 

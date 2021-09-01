@@ -25,7 +25,7 @@ static bool heap_contains(void* ptr) {
     return ptr >= start && ptr < end;
 }
 
-static void run_gc(uint64_t* rsp);
+static void run_gc(uint64_t* rsp, uint64_t* rbp);
 
 static void reset_line_marks();
 
@@ -46,7 +46,7 @@ _Thread_local struct {
 } local_alloc;
 
 // `size` should include a word for the header
-void* immix_alloc(uint64_t size, uint32_t* header, uint64_t* rsp);
+void* immix_alloc(uint64_t size, uint32_t* header, uint64_t* rsp, uint64_t* rbp);
 
 void initialize(uint32_t num_start_blocks);
 

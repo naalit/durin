@@ -25,6 +25,8 @@ typedef struct StackEntry {
     // uint32_t base_pointer;
     // uint32_t num_derived;
     // uint32_t[num_derived] derived_pointers;
+    // where the most significant 31 bits of the uint32_t describing each pointer are an offset from either `rsp` or `rbp`
+    // depending on the LSB: 1 for `rbp`, 0 for `rsp`
     uint32_t* locations;
     uint32_t locations_len;
     uint32_t next;
@@ -204,8 +206,10 @@ static void gen_stack_table() {
                     int32_t offset = GET(int32_t);
 
                     assert(type == 0x3);
-                    assert(regnum == 7);
-                    base_pointer = offset;
+                    base_pointer = offset << 1;
+                    if (regnum == 6) base_pointer |= 1;
+                    else if (regnum == 7);
+                    else panic("Unknown register %d", regnum);
                     num_pointers = (uint32_t)size / 8;
                 }
                 // Derived pointer
@@ -223,14 +227,18 @@ static void gen_stack_table() {
 
                     assert(type == 0x3);
                     assert((uint32_t)size == num_pointers * 8);
-                    assert(regnum == 7);
-                    derived_pointer = offset;
+                    derived_pointer = offset << 1;
+                    if (regnum == 6) derived_pointer |= 1;
+                    else if (regnum == 7);
+                    else panic("Unknown register %d", regnum);
                 }
                 // Now add to the list
                 for (int p = 0; p < num_pointers; p++) {
                     // First try to find an identical base pointer
-                    uint32_t base_offset = base_pointer + p * 8;
-                    uint32_t derived_offset = derived_pointer + p * 8;
+                    uint32_t base_offset = (base_pointer >> 1) + p * 8;
+                    base_offset = (base_offset << 1) | (base_pointer & 1);
+                    uint32_t derived_offset = (derived_pointer >> 1) + p * 8;
+                    derived_offset = (derived_offset << 1) | (derived_pointer & 1);
                     bool found = false;
                     for (int i = 0; i < cur_offset; ) {
                         uint32_t base_i = locations[i];
