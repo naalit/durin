@@ -111,14 +111,14 @@ impl crate::ir::Module {
                     let num_start_blocks = cxt.i32_type().const_int(8, false);
                     b.build_call(
                         initialize,
-                        &[num_start_blocks.as_basic_value_enum()],
+                        &[num_start_blocks.into()],
                         "_void",
                     );
 
                     if cps {
                         // CPS
                         // We need a tailcc stop function to pass as `main`'s continuation, as well as the start function
-                        let any_ty = cxt.i8_type().gc_ptr().as_basic_type_enum();
+                        let any_ty = cxt.i8_type().gc_ptr().into();
                         let fun2 = module.add_function(
                             "$_stop",
                             cxt.void_type().fn_type(&[any_ty, any_ty], false),
@@ -148,9 +148,9 @@ impl crate::ir::Module {
                         let unit = cxt
                             .struct_type(&[], false)
                             .get_undef()
-                            .as_basic_value_enum();
+                            .into();
                         let call =
-                            b.build_call(f, &[unit, clos.as_basic_value_enum()], "main_call");
+                            b.build_call(f, &[unit, clos.into()], "main_call");
                         call.set_call_convention(TAILCC);
                         b.build_return(Some(&cxt.i32_type().const_zero()));
 
@@ -162,7 +162,7 @@ impl crate::ir::Module {
                         let unit = cxt
                             .struct_type(&[], false)
                             .get_undef()
-                            .as_basic_value_enum();
+                            .into();
                         let args = [unit];
                         let args: &[_] = if f.get_type().count_param_types() == 0 {
                             &[]
@@ -372,7 +372,7 @@ impl<'cxt> Cxt<'cxt> {
         let gc_alloc = self.module.get_function("gc_alloc").unwrap();
         let call = self.builder.build_call(
             gc_alloc,
-            &[size.as_basic_value_enum(), header.as_basic_value_enum()],
+            &[size.into(), header.into()],
             name,
         );
         call.set_call_convention(FASTCC);
@@ -394,7 +394,7 @@ impl<'cxt> Cxt<'cxt> {
             use inkwell::attributes::*;
             let ty = self
                 .any_ty()
-                .fn_type(&[self.cxt.i64_type().as_basic_type_enum()], false);
+                .fn_type(&[self.cxt.i64_type().into()], false);
             let fun = self
                 .module
                 .add_function("$_i2p", ty, Some(Linkage::Private));
@@ -432,7 +432,7 @@ impl<'cxt> Cxt<'cxt> {
         };
         let call = self
             .builder
-            .build_call(fun, &[i.as_basic_value_enum()], "inttoptr");
+            .build_call(fun, &[i.into()], "inttoptr");
         call.as_any_value_enum().into_pointer_value()
     }
 
@@ -467,7 +467,7 @@ impl<'cxt> Cxt<'cxt> {
             use inkwell::attributes::*;
             let ty = self
                 .any_ty()
-                .fn_type(&[self.cxt.i8_type().ptr_type(AddressSpace::Generic).as_basic_type_enum()], false);
+                .fn_type(&[self.cxt.i8_type().ptr_type(AddressSpace::Generic).into()], false);
             let fun = self
                 .module
                 .add_function("$_r2gc", ty, Some(Linkage::Private));
@@ -500,14 +500,14 @@ impl<'cxt> Cxt<'cxt> {
         };
         let call = self
             .builder
-            .build_call(fun, &[p.as_basic_value_enum()], "to_gc_ptr");
+            .build_call(fun, &[p.into()], "to_gc_ptr");
         call.as_any_value_enum().into_pointer_value()
     }
 
     pub fn call_raw<F, E>(
         &self,
         f: F,
-        args: &[BasicValueEnum<'cxt>],
+        args: &[BasicMetadataValueEnum<'cxt>],
         kind: CallKind,
     ) -> CallSiteValue<'cxt>
     where
@@ -1274,7 +1274,7 @@ impl<'cxt> Cxt<'cxt> {
                         let rty = self.as_type(*ret, data).llvm_ty(self);
                         let ptys: Vec<_> = params
                             .iter()
-                            .map(|t| self.as_type(*t, data).llvm_ty(self))
+                            .map(|t| self.as_type(*t, data).llvm_ty(self).into())
                             .collect();
                         let fty = rty.fn_type(&ptys, false);
                         self.module.add_function(name, fty, None)
@@ -1959,7 +1959,7 @@ impl<'cxt> Cxt<'cxt> {
 
             // If we're calling an extern function, do that
             Some(Node::ExternCall(f, ret_ty)) => {
-                let args: Vec<_> = args.into_iter().map(|(v, _)| v).collect();
+                let args: Vec<_> = args.into_iter().map(|(v, _)| v.into()).collect();
                 let f = self.gen_value(*f, data);
                 let call = self.call_raw(f.into_pointer_value(), &args, CallKind::Extern);
 
@@ -1991,11 +1991,11 @@ impl<'cxt> Cxt<'cxt> {
                         let args = args
                             .into_iter()
                             .zip(param_tys)
-                            .map(|((x, from), to)| self.cast(x, &from, to, data))
+                            .map(|((x, from), to)| self.cast(x, &from, to, data).into())
                             .collect::<Vec<_>>();
                         let mut args: Vec<_> = env
                             .iter()
-                            .map(|&(val, _, _)| self.gen_value(val, data))
+                            .map(|&(val, _, _)| self.gen_value(val, data).into())
                             .chain(args)
                             .collect();
 
@@ -2041,7 +2041,7 @@ impl<'cxt> Cxt<'cxt> {
                             if let Some((k, ty)) = cont {
                                 let v = self.gen_value(k, data);
                                 let v = self.cast(v, &ty, param_tys.last().unwrap(), data);
-                                args.push(v);
+                                args.push(v.into());
                             }
                             self.call_raw(*known, &args, CallKind::Tail);
                             self.builder.build_return(None);
@@ -2061,7 +2061,7 @@ impl<'cxt> Cxt<'cxt> {
                                 "store_slot",
                             )
                         };
-                        let fun_ty = vec![self.any_ty(); args.len() + 1];
+                        let fun_ty = vec![self.any_ty().into(); args.len() + 1];
                         let fun_ty = self
                             .cxt
                             .void_type()
@@ -2079,10 +2079,10 @@ impl<'cxt> Cxt<'cxt> {
                         // It could be polymorphic, so we pass all arguments as word-size "any"
                         let mut args: Vec<_> = args
                             .into_iter()
-                            .map(|(val, ty)| self.to_any(&ty, val, data).as_basic_value_enum())
+                            .map(|(val, ty)| self.to_any(&ty, val, data).into())
                             .collect();
                         // The closure environment (which is just the pointer to the closure) is the last argument
-                        args.push(callee.as_basic_value_enum());
+                        args.push(callee.into());
 
                         self.call_raw(fun_ptr, &args, CallKind::Tail);
                         self.builder.build_return(None);
@@ -2170,6 +2170,7 @@ impl<'cxt> Cxt<'cxt> {
                     })
                     .map(|&x| self.as_type(x, data).llvm_ty(self))
                     .collect();
+                let args2: Vec<_> = args.iter().map(|&x| x.into()).collect();
                 let known_ty = if let Some((_, ret_tys)) = &cont {
                     let ret_ty = if ret_tys.len() == 1 {
                         ret_tys[0].llvm_ty(self)
@@ -2177,9 +2178,9 @@ impl<'cxt> Cxt<'cxt> {
                         let v: Vec<_> = ret_tys.iter().map(|x| x.llvm_ty(self)).collect();
                         self.cxt.struct_type(&v, false).as_basic_type_enum()
                     };
-                    ret_ty.fn_type(&args, false)
+                    ret_ty.fn_type(&args2, false)
                 } else {
-                    self.cxt.void_type().fn_type(&args, false)
+                    self.cxt.void_type().fn_type(&args2, false)
                 };
 
                 // Declare the known and unknown versions of the function
@@ -2194,8 +2195,8 @@ impl<'cxt> Cxt<'cxt> {
                 let uargs: Vec<_> = fun
                     .params
                     .iter()
-                    .map(|_| self.any_ty())
-                    .chain(std::iter::once(self.any_ty()))
+                    .map(|_| self.any_ty().into())
+                    .chain(std::iter::once(self.any_ty().into()))
                     .collect();
                 let unknown_ty = self.cxt.void_type().fn_type(&uargs, false);
                 let uname = format!("u${}", &name);

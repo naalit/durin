@@ -287,7 +287,7 @@ impl<'cxt> Type<'cxt> {
             },
             Type::Closure(_) => cxt.any_ty(),
             Type::ExternFun(v, ret) => ret
-                .fn_type(v, false)
+                .fn_type(&v.iter().map(|&x| x.into()).collect::<Vec<_>>(), false)
                 .ptr_type(AddressSpace::Generic)
                 .as_basic_type_enum(),
             Type::Type => cxt.cxt.i32_type().gc_ptr().as_basic_type_enum(),
