@@ -181,7 +181,6 @@ impl crate::ir::Module {
             false
         };
 
-        #[cfg(not(feature = "llvm-13"))]
         module.verify().map_err(|s| s.to_string())?;
 
         // Call out to clang to compile and link it
@@ -218,9 +217,6 @@ impl crate::ir::Module {
                 }
             }
 
-            #[cfg(feature = "llvm-13")]
-            let clang = concat!(env!("LLVM_DIR"), "/bin/clang");
-            #[cfg(not(feature = "llvm-13"))]
             let clang = "clang";
 
             // No need to link if it doesn't have a main function
@@ -382,78 +378,11 @@ impl<'cxt> Cxt<'cxt> {
             .into_pointer_value()
     }
 
-    /// LLVM doesn't understand `inttoptr` to a GC pointer, so we need to wrap it in a `noinline` function which doesn't use GC.
-    #[cfg(not(feature = "llvm-13"))]
-    pub fn inttoptr(&self, i: IntValue<'cxt>) -> PointerValue<'cxt> {
-        let i = self
-            .builder
-            .build_int_z_extend_or_bit_cast(i, self.cxt.i64_type(), "to_i64");
-        let fun = if let Some(fun) = self.module.get_function("$_i2p") {
-            fun
-        } else {
-            use inkwell::attributes::*;
-            let ty = self
-                .any_ty()
-                .fn_type(&[self.cxt.i64_type().into()], false);
-            let fun = self
-                .module
-                .add_function("$_i2p", ty, Some(Linkage::Private));
-            fun.add_attribute(
-                AttributeLoc::Function,
-                self.cxt
-                    .create_enum_attribute(Attribute::get_named_enum_kind_id("noinline"), 0),
-            );
-            fun.add_attribute(
-                AttributeLoc::Function,
-                self.cxt.create_string_attribute("inline-late", ""),
-            );
-            fun.add_attribute(
-                AttributeLoc::Function,
-                self.cxt.create_string_attribute("gc-leaf-function", ""),
-            );
-
-            let bb = self.cxt.append_basic_block(fun, "entry");
-            let before = self.builder.get_insert_block().unwrap();
-            self.builder.position_at_end(bb);
-            let ptr = self.builder.build_int_to_ptr(
-                fun.get_first_param().unwrap().into_int_value(),
-                self.cxt.i8_type().ptr_type(AddressSpace::Generic),
-                "inttoptr",
-            );
-            let ptr = self.builder.build_pointer_cast(
-                ptr,
-                self.any_ty().into_pointer_type(),
-                "inttoptr_gc",
-            );
-            self.builder.build_return(Some(&ptr));
-
-            self.builder.position_at_end(before);
-            fun
-        };
-        let call = self
-            .builder
-            .build_call(fun, &[i.into()], "inttoptr");
-        call.as_any_value_enum().into_pointer_value()
-    }
-
-    #[cfg(feature = "llvm-13")]
     pub fn inttoptr(&self, i: IntValue<'cxt>) -> PointerValue<'cxt> {
         self.builder
             .build_int_to_ptr(i, self.any_ty().into_pointer_type(), "inttoptr")
     }
 
-    #[cfg(not(feature = "llvm-13"))]
-    pub fn ptrtoint(&self, ptr: PointerValue<'cxt>) -> IntValue<'cxt> {
-        let ptr = self.builder.build_pointer_cast(
-            ptr,
-            self.cxt.i8_type().ptr_type(AddressSpace::Generic),
-            "raw_pointer",
-        );
-        self.builder
-            .build_ptr_to_int(ptr, self.size_ty(), "ptrtoint")
-    }
-
-    #[cfg(feature = "llvm-13")]
     pub fn ptrtoint(&self, ptr: PointerValue<'cxt>) -> IntValue<'cxt> {
         self.builder
             .build_ptr_to_int(ptr, self.size_ty(), "ptrtoint")
