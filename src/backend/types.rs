@@ -53,36 +53,45 @@ impl<'cxt> Type<'cxt> {
     }
 
     pub fn alignment(&self) -> u32 {
-        match self {
-            Type::Unbox(x) => x.alignment(),
-            Type::StackStruct(v) | Type::PtrStruct(v) => {
-                if v.is_empty() {
-                    0
-                } else {
-                    v[0].alignment()
-                }
-            }
-            Type::StackEnum(bytes, _) => *bytes.min(&8),
-            Type::PtrEnum(v) => {
-                let mut align = 0;
-                for i in v {
-                    let ialign = i.alignment();
-                    if ialign > align {
-                        align = ialign;
-                    }
-                }
-                let tag = tag_bytes(v.len());
-                tag.max(align)
-            }
-            // Word-alignment for values of unknown type
-            Type::Unknown(_) | Type::Unknown2(_) => 8,
-            Type::Int(bits) => (bits / 8).min(8),
-            Type::Float(t) => match t {
-                crate::ir::FloatType::F32 => 4,
-                crate::ir::FloatType::F64 => 8,
-            },
-            Type::Closure(_) | Type::ExternFun(_, _) | Type::Pointer | Type::Type => 8,
-        }
+        // Alignment less than 8 breaks polymorphism in certain cases
+        // e.g.
+        //   fun f (T: Type, x: T, y: T, r: fun 1) = call r ({ T, x, y } of sig { Type, T, T })
+        //   fun g () = call f (I32, 1, 2, h)
+        //   fun h (x: sig { Type, I32, I32 }) = call print x.2
+        // here f will align x and y to 8 bytes assuming they might be pointers, but h will assume they're aligned to 4 bytes
+        // TODO: it might be possible to use min(runtime_size(), 8), or mark polymorphic instantiations or something
+        8
+
+        // match self {
+        //     Type::Unbox(x) => x.alignment(),
+        //     Type::StackStruct(v) | Type::PtrStruct(v) => {
+        //         if v.is_empty() {
+        //             0
+        //         } else {
+        //             v[0].alignment()
+        //         }
+        //     }
+        //     Type::StackEnum(bytes, _) => *bytes.min(&8),
+        //     Type::PtrEnum(v) => {
+        //         let mut align = 0;
+        //         for i in v {
+        //             let ialign = i.alignment();
+        //             if ialign > align {
+        //                 align = ialign;
+        //             }
+        //         }
+        //         let tag = tag_bytes(v.len());
+        //         tag.max(align)
+        //     }
+        //     // Word-alignment for values of unknown type
+        //     Type::Unknown(_) | Type::Unknown2(_) => 8,
+        //     Type::Int(bits) => (bits / 8).min(8),
+        //     Type::Float(t) => match t {
+        //         crate::ir::FloatType::F32 => 4,
+        //         crate::ir::FloatType::F64 => 8,
+        //     },
+        //     Type::Closure(_) | Type::ExternFun(_, _) | Type::Pointer | Type::Type => 8,
+        // }
     }
 
     pub fn stack_size(&self) -> Option<u32> {
